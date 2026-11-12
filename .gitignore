@@ -1,0 +1,75 @@
+# =============================================================================
+# 1. Credentials & Environment Secrets
+# =============================================================================
+.env
+.env.*
+*.token
+*.key
+
+# =============================================================================
+# 2. Large AI Model Weights & Checkpoints (HuggingFace, GGUF, ONNX)
+# =============================================================================
+models/*.gguf
+models/*.pth
+models/*.onnx
+models/*.tar
+models/paddle/
+models/paddlex/
+!models/.gitkeep
+
+# =============================================================================
+# 4. Runtime User Data, Saves & Replays
+# =============================================================================
+screenshots/
+*.png
+*.jpg
+*.jpeg
+exports/
+
+# Machine-specific user config containing local paths
+mgba_config.json
+config.json
+
+# =============================================================================
+# 6. Python Artifacts & Virtual Environments
+# =============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.venv/
+venv/
+ENV/
+env/
+roms/
+saves/
+replays/
+samples/
+states/
+
+# =============================================================================
+# 7. IDE & OS Metadata
+# =============================================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+ehthumbs.db

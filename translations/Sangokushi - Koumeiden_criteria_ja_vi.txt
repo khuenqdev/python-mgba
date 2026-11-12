@@ -1,0 +1,6 @@
+- Use Sino-Vietnamese (Hán-Việt) terms for historical figures, dynasties, and military ranks to maintain cultural authenticity.
+- Adapt Japanese honorifics (e.g., -sama, -dono) into appropriate Vietnamese forms of address (e.g., ngài, đại nhân) based on social hierarchy.
+- Translate dialogue with a formal, classical tone to reflect the historical setting, avoiding modern colloquialisms.
+- Keep UI labels, menu options, and button text concise, using standard Vietnamese gaming terminology for clarity.
+- Ensure consistent naming conventions for skills, items, and locations throughout the game interface.
+- Verify that translated text fits within original UI space constraints to prevent layout issues.
