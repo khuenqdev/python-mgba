@@ -287,6 +287,7 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
             self._install_libretro_hooks()
             self.emu.load_game(self.rom_path)
             self.load_sram_from_disk()
+            self.cheat_engine.load_default_cheats()
 
             print("\n=======================================================")
             print(f"[ROM IDENTIFICATION] Title: {self.game_title} | Code: {self.game_code}")
@@ -327,9 +328,6 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
         self._last_gui_render_time = time.perf_counter()
 
         while self._is_running:
-            # =================================================================
-            # REAL-TIME IN-MEMORY REWIND LOOP
-            # =================================================================
             if self.is_rewinding:
                 if self.rewind_buffer:
                     saved_fc, comp_bytes = self.rewind_buffer.pop()
@@ -383,11 +381,11 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
                     self.flush_sram_to_disk()
                     self.emu.reset()
                     self.replay_frame_counter = 0
+                    self.cheat_engine.mark_dirty()
                     self.reset_requested = False
 
                 self.cheat_engine.apply_cheats()
 
-                # Process Replay vs Normal Input and compute active button bitmask
                 if self.recorder.is_playing:
                     hud_mode = "PLAYBACK"
                     hud_max_frame = self.recorder.playback_max_frame
@@ -442,7 +440,6 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
                         if effective_states.get(lib_id, False):
                             btn_mask |= (1 << bit_idx)
 
-                # Send Analog Tilt / Gyro Sensor Axes
                 if self.emu:
                     val_x = int(self.tilt_x * 32767)
                     val_y = int(self.tilt_y * 32767)
@@ -467,13 +464,11 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
                     print(f"Core step error: {e}")
                     break
 
-            # Push compressed rewind snapshot outside mutex lock
             rewind_enabled = bool(self.config.get("emulation", "rewind_enabled", True))
             rewind_interval = max(1, int(self.config.get("emulation", "rewind_interval", 10) or 10))
             if rewind_enabled and not self.recorder.is_playing and (frame_counter % rewind_interval == 0):
                 self._push_rewind_snapshot(current_frame_num)
 
-            # Periodic SRAM battery-save persistence (~every 2 seconds)
             if frame_counter > 0 and frame_counter % 120 == 0:
                 self.flush_sram_to_disk()
 
@@ -482,7 +477,6 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
             else:
                 vid_obj, aud_obj = getattr(item, "video", item), getattr(item, "audio", None)
 
-            # Video Processing
             frameskip = self.config.get("video", "frameskip") or 0
             render_this_frame = (frame_counter % (frameskip + 1) == 0) or was_single_step
             frame_counter += 1
@@ -510,7 +504,6 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
                 if should_emit_gui:
                     self.frame_ready.emit(frame_data)
 
-            # Emit Live Input & TAS Frame HUD updates without flooding Qt event queue
             hud_active = (hud_mode != "IDLE") or bool(self.config.get("video", "show_input_overlay", False))
             if hud_active or (hud_mode != self._last_hud_mode):
                 if should_emit_gui or (btn_mask != self._last_hud_mask) or (hud_mode != self._last_hud_mode):
@@ -518,7 +511,6 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
                     self._last_hud_mode = hud_mode
                     self._last_hud_mask = btn_mask
 
-            # Audio Processing
             is_ff = self.fast_forward
             ff_ratio = self.config.get("emulation", "fast_forward_ratio") or 2.0
             fps_target = (59.7275 * ff_ratio) if is_ff else 59.7275
@@ -559,6 +551,7 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
             stream.close()
 
         self.flush_sram_to_disk()
+        self.cheat_engine.save_default_cheats(only_if_exists_or_nonempty=True)
 
         with QMutexLocker(self.mutex):
             if self.emu:

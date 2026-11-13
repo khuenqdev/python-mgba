@@ -1,19 +1,16 @@
-# dev_tools.py
-import os
-import struct
+# memory_inspectors.py
 import datetime
-import numpy as np
 from PIL import Image
 
-from PyQt6.QtWidgets import (QDialog, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QLabel, QPushButton, QComboBox, QSpinBox, 
-                             QTableWidget, QTableWidgetItem, QHeaderView, 
-                             QScrollArea, QFileDialog, QMessageBox, QLineEdit, 
-                             QSplitter, QCheckBox)
+from PyQt6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
+    QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox, QLineEdit
+)
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtCore import Qt
 
-from .dev_common import *
+from .dev_common import export_pil_to_png
+
 
 class FrameInspectorDialog(QDialog):
     def __init__(self, worker, config, parent=None):
@@ -59,7 +56,7 @@ class FrameInspectorDialog(QDialog):
             self.accept()
 
     def update_frame_display(self):
-        frame = getattr(self.worker, 'latest_video_frame', None)
+        frame = getattr(self.worker, "latest_video_frame", None)
         if frame is not None:
             h, w, c = frame.shape
             qimg = QImage(frame.data, w, h, w * c, QImage.Format.Format_RGB888)
@@ -68,9 +65,9 @@ class FrameInspectorDialog(QDialog):
             self.frame_label.setText("No frame available yet. Step 1 frame or unpause.")
 
     def export_png(self):
-        frame = getattr(self.worker, 'latest_video_frame', None)
+        frame = getattr(self.worker, "latest_video_frame", None)
         if frame is not None:
-            img = Image.fromarray(frame, 'RGB')
+            img = Image.fromarray(frame, "RGB")
             export_pil_to_png(self, img, f"frame_inspect_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png", self.config)
 
 
@@ -136,7 +133,8 @@ class MemorySearchDialog(QDialog):
 
     def parse_input_val(self):
         text = self.val_edit.text().strip()
-        if not text: return 0
+        if not text:
+            return 0
         return int(text, 16) if text.startswith("0x") else int(text)
 
     def new_search(self):
@@ -152,21 +150,26 @@ class MemorySearchDialog(QDialog):
 
         limit = len(raw) - size
         for off in range(0, limit, size):
-            val = int.from_bytes(raw[off:off+size], "little")
+            val = int.from_bytes(raw[off:off + size], "little")
             matched = False
-            if cmp_type == "Exact Value" and val == target_val: matched = True
-            elif cmp_type == "Greater Than" and val > target_val: matched = True
-            elif cmp_type == "Less Than" and val < target_val: matched = True
-            
+            if cmp_type == "Exact Value" and val == target_val:
+                matched = True
+            elif cmp_type == "Greater Than" and val > target_val:
+                matched = True
+            elif cmp_type == "Less Than" and val < target_val:
+                matched = True
+
             if matched:
                 self.candidates[off] = val
-                if len(self.candidates) > 5000: break
+                if len(self.candidates) > 5000:
+                    break
 
         self.update_results_table(raw)
 
     def filter_search(self):
         raw = self.worker.get_memory_region("EWRAM")
-        if not raw: return
+        if not raw:
+            return
 
         size = self.get_data_size()
         cmp_type = self.cmp_combo.currentText()
@@ -174,15 +177,21 @@ class MemorySearchDialog(QDialog):
         new_candidates = {}
 
         for off, old_val in self.candidates.items():
-            val = int.from_bytes(raw[off:off+size], "little")
+            val = int.from_bytes(raw[off:off + size], "little")
             matched = False
-            if cmp_type == "Exact Value" and val == target_val: matched = True
-            elif cmp_type == "Greater Than" and val > target_val: matched = True
-            elif cmp_type == "Less Than" and val < target_val: matched = True
-            elif cmp_type == "Changed" and val != old_val: matched = True
-            elif cmp_type == "Unchanged" and val == old_val: matched = True
+            if cmp_type == "Exact Value" and val == target_val:
+                matched = True
+            elif cmp_type == "Greater Than" and val > target_val:
+                matched = True
+            elif cmp_type == "Less Than" and val < target_val:
+                matched = True
+            elif cmp_type == "Changed" and val != old_val:
+                matched = True
+            elif cmp_type == "Unchanged" and val == old_val:
+                matched = True
 
-            if matched: new_candidates[off] = val
+            if matched:
+                new_candidates[off] = val
 
         self.candidates = new_candidates
         self.update_results_table(raw)
@@ -193,7 +202,7 @@ class MemorySearchDialog(QDialog):
         self.status_label.setText(f"Found {len(self.candidates)} matching addresses.")
 
         for row, (off, old_val) in enumerate(list(self.candidates.items())[:200]):
-            curr_val = int.from_bytes(raw_mem[off:off+size], "little")
+            curr_val = int.from_bytes(raw_mem[off:off + size], "little")
             addr_str = f"0x{0x02000000 + off:08X}"
             self.table.setItem(row, 0, QTableWidgetItem(addr_str))
             self.table.setItem(row, 1, QTableWidgetItem(str(old_val)))
@@ -201,18 +210,32 @@ class MemorySearchDialog(QDialog):
 
     def add_selected_as_cheat(self):
         rows = self.table.selectionModel().selectedRows()
-        if not rows: return
-        addr_str = self.table.item(rows[0].row(), 0).text()
-        curr_val = self.table.item(rows[0].row(), 2).text()
-        code_str = f"{int(addr_str, 16):08X} {int(curr_val):08X}"
+        if not rows:
+            return
+        addr = int(self.table.item(rows[0].row(), 0).text(), 16)
+        curr_val = int(self.table.item(rows[0].row(), 2).text())
+        size = self.get_data_size()
+
+        if size == 1:
+            code_str = f"{addr:08X}:{curr_val & 0xFF:02X}"
+        elif size == 2:
+            code_str = f"{addr:08X}:{curr_val & 0xFFFF:04X}"
+        else:
+            code_str = f"{addr:08X}:{curr_val & 0xFFFFFFFF:08X}"
 
         self.worker.cheat_engine.cheats.append({
-            "desc": f"Freeze {addr_str}",
+            "desc": f"Freeze 0x{addr:08X} ({size}B)",
             "code": code_str,
             "type": "Raw",
             "enabled": True
         })
-        QMessageBox.information(self, "Cheat Created", f"Added cheat lock for:\n{code_str}")
+        self.worker.cheat_engine.mark_dirty()
+        self.worker.cheat_engine.save_default_cheats(only_if_exists_or_nonempty=True)
+
+        QMessageBox.information(
+            self, "Cheat Created",
+            f"Added & saved {size}-byte cheat lock:\n{code_str}"
+        )
 
 
 # ==============================================================================
