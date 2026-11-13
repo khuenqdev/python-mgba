@@ -1,6 +1,6 @@
 @echo off
-setlocal enabledelayedexpansion
 cd /d "%~dp0"
+setlocal enabledelayedexpansion
 
 :: 1. Detect Python from local virtual environments or system PATH
 set "PYTHON_EXE="
@@ -37,7 +37,7 @@ if exist ".venv\Scripts\python.exe" (
 )
 
 if "%PYTHON_EXE%"=="" if "%PYTHONW_EXE%"=="" (
-    echo [ERROR] Python was not found in PATH or a local virtual environment (.venv/venv).
+    echo [ERROR] Python was not found in PATH or a local virtual environment [.venv / venv].
     echo Please install Python 3.10+ and ensure PyQt6 is installed.
     echo.
     pause
@@ -45,8 +45,8 @@ if "%PYTHON_EXE%"=="" if "%PYTHONW_EXE%"=="" (
 )
 
 :: 2. Silent execution if requested
-if "%~1"=="--silent" goto :run_silent
-if "%~1"=="-s" goto :run_silent
+if /i "%~1"=="--silent" goto :run_silent
+if /i "%~1"=="-s" goto :run_silent
 
 :: 3. Run in interactive console so any crash / missing library is visible
 echo ========================================================
