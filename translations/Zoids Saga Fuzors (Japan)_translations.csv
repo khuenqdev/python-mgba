@@ -1,8 +1,14 @@
 SourceLang,TargetLang,Category,SpeakerOrig,SpeakerTrans,OriginalText,TranslatedText
-ja,vi,menu,,,はじめから,Bắt đầu mới
-ja,vi,menu,,,つづきから,Tiếp tục
-ja,vi,menu,,,つうしん,Giao tiếp
-ja,vi,menu,,,チャレンジングモード,Chế độ Thử thách
-ja,vi,menu,,,データベース,Cơ sở dữ liệu
-ja,vi,menu,,,チュートリアル,Hướng dẫn
-ja,vi,menu,,,コンフィグ,Cài đặt
+ja,vi,label,,,Configuration,Cấu hình
+ja,vi,menu,,,せんとう,Đấu trường
+ja,vi,menu,,,にゅうりょく,Nhập liệu
+ja,vi,menu,,,オート,Tự động
+ja,vi,menu,,,えんじゅつ,Phép thuật
+ja,vi,menu,,,あり,Có
+ja,vi,menu,,,なし,Không
+ja,vi,menu,,,しゅじんごうの なまえを かえる,Đổi tên nhân vật chính
+ja,vi,menu,,,せんとう メッセージを かえる,Đổi thông điệp chiến đấu
+ja,vi,menu,,,セーブデータを けす,Xóa dữ liệu lưu
+ja,vi,label,,,Information,Thông tin
+ja,vi,dialogue,,,せんとう ほうほうを かえることが できます,Bạn có thể thay đổi phương thức chiến đấu.
+ja,vi,dialogue,,,せんとうちゅうに セレクトボタンでも かえられます,Bạn cũng có thể thay đổi bằng nút Select trong khi chiến đấu.

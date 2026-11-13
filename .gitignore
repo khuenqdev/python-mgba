@@ -64,6 +64,8 @@ samples/
 states/
 models/
 records/
+translations/
+profiles/
 
 # =============================================================================
 # 7. IDE & OS Metadata

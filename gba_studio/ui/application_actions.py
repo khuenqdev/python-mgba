@@ -5,12 +5,24 @@ import html
 from PyQt6.QtWidgets import QFileDialog, QMessageBox
 from PyQt6.QtGui import QAction
 
-from ..tools.ai_translator import TranslationWorker
+from ..tools.ai_translator import (
+    TranslationWorker,
+    TranslationGlossaryDialog,
+    AITranslationConfigDialog,
+)
 from .shader_dialog import ShaderConfigDialog
 from .state_browser import SaveStateBrowserDialog
 
 
 class ApplicationActionsMixin:
+    def open_translation_glossary(self):
+        if not self.current_rom:
+            QMessageBox.information(self, "Notice", "Please load a ROM first to edit its glossary and cache.")
+            return
+        game_code = getattr(self.worker, "game_code", "") if self.worker else ""
+        dlg = TranslationGlossaryDialog(self.current_rom, self.config, game_code=game_code, parent=self)
+        dlg.exec()
+
     def toggle_translation_overlay(self):
         val = self.act_trans_overlay.isChecked()
         self.config.set("ai_translation", "overlay_enabled", val)
@@ -408,7 +420,8 @@ class ApplicationActionsMixin:
         self.trans_worker = TranslationWorker(
             frame_data=self.video_widget.current_frame_data.copy(),
             rom_path=self.current_rom,
-            config=self.config
+            config=self.config,
+            game_code=getattr(self.worker, "game_code", ""),
         )
         self.trans_worker.finished.connect(self.on_ai_translation_finished)
         self.trans_worker.error.connect(lambda err: QMessageBox.warning(self, "AI Translation Error", err))
@@ -485,8 +498,13 @@ class ApplicationActionsMixin:
         self.video_widget.show_osd(msg, 3000)
 
     def open_ai_translation_config(self):
-        dlg = AITranslationConfigDialog(self.config, self)
-        dlg.exec()
+        game_code = getattr(self.worker, "game_code", "") if self.worker else ""
+        dlg = AITranslationConfigDialog(
+            self.config, parent=self, rom_path=self.current_rom or "", game_code=game_code
+        )
+        if dlg.exec():
+            self.act_trans_overlay.setChecked(bool(self.config.get("ai_translation", "overlay_enabled", True)))
+            self.video_widget.update()
 
     def trigger_instant_scene_dump(self):
         if not self.worker or not self.current_rom:

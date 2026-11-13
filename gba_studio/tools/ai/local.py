@@ -1,33 +1,17 @@
-# ai_translator.py
-import os
-import csv
+# local.py
 import json
 import re
-import ssl
-import glob
-import io
-import time
-import base64
-import statistics
 import urllib.request
 import urllib.parse
-import urllib.error
-import numpy as np
-import cv2
-from PIL import Image
 
-from PyQt6.QtCore import QThread, pyqtSignal
-from ...paths import PROJECT_ROOT
-
-# =============================================================================
-# 1. ENVIRONMENT CONFIGURATION & SECURITY (.env LOADER)
-# =============================================================================
 from .engines import LANG_NAMES, get_llama_instance
+
 
 class LocalQwenTranslator:
     @classmethod
     def translate_block(cls, model_path: str, text: str, category: str, speaker: str,
-                        src_lang: str, tgt_lang: str, criteria: str, api_key: str) -> tuple:
+                        src_lang: str, tgt_lang: str, criteria: str, api_key: str,
+                        glossary_text: str = "") -> tuple:
         """Translates a categorized block ('dialogue', 'menu', or 'label') and optional speaker."""
         src_name = LANG_NAMES.get(src_lang, src_lang)
         tgt_name = LANG_NAMES.get(tgt_lang, tgt_lang)
@@ -43,11 +27,12 @@ class LocalQwenTranslator:
                 "Translate naturally with fluent grammar and appropriate character pronouns/register."
             )
 
+        glossary_section = f"\n{glossary_text}" if glossary_text else ""
         user_prompt = f"Speaker: {speaker}\nText: {text}" if speaker else text
         sys_prompt = (
             f"You are an expert retro video game localizer translating {src_name} GBA text to {tgt_name}.\n"
             f"TASK: {role_hint}\n"
-            f"STYLE CRITERIA:\n{criteria}\n"
+            f"STYLE CRITERIA:\n{criteria}{glossary_section}\n"
             + (
                 "Output strictly in format: TranslatedSpeaker | TranslatedText"
                 if speaker else
@@ -128,8 +113,3 @@ def _google_translate_fallback(text: str, src: str, tgt: str) -> str:
             return "".join(part[0] for part in data[0] if part and part[0]).strip()
     except Exception:
         return text
-
-
-# =============================================================================
-# 6. TRANSLATION WORKER THREAD
-# =============================================================================

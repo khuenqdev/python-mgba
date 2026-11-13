@@ -422,6 +422,11 @@ class MenuBuilderMixin:
         clear_panel_act.triggered.connect(self.clear_translation_subtitles)
         translation_menu.addAction(clear_panel_act)
 
+        glossary_act = QAction("Per-Game Glossary & Translation Cache...", self)
+        glossary_act.setShortcut(QKeySequence("Ctrl+Shift+T"))
+        glossary_act.triggered.connect(self.open_translation_glossary)
+        translation_menu.addAction(glossary_act)
+
         ai_cfg_act = QAction("Configure AI Translation...", self)
         ai_cfg_act.triggered.connect(self.open_ai_translation_config)
         translation_menu.addAction(ai_cfg_act)

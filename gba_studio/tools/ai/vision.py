@@ -94,7 +94,7 @@ def get_or_create_game_criteria(rom_path: str, src_lang: str, tgt_lang: str, api
                 data=json.dumps(payload).encode("utf-8"),
                 headers=headers
             )
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with urllib.request.urlopen(req, timeout=8) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 content = data["choices"][0]["message"]["content"]
                 content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
@@ -110,40 +110,42 @@ def get_or_create_game_criteria(rom_path: str, src_lang: str, tgt_lang: str, api
     return UNIVERSAL_GBA_CRITERIA
 
 
-# =============================================================================
-# 4. GROQ MULTIMODAL VISION ENGINE (Semantic Grouping)
-# =============================================================================
+def _items_to_boxes(items: list) -> list:
+    boxes = []
+    for idx, it in enumerate(items):
+        if not isinstance(it, dict):
+            continue
+        cat = str(it.get("type", "dialogue")).lower().strip()
+        if cat not in ("dialogue", "menu", "label"):
+            cat = "dialogue"
+        orig = str(it.get("ja") or it.get("original") or "").strip()
+        trans = str(it.get("tr") or it.get("translated") or "").strip()
+        sp_ja = str(it.get("speaker") or it.get("speaker_ja") or "").strip()
+        sp_tr = str(it.get("speaker_tr") or "").strip()
+
+        if not _has_meaningful_text(orig) or not trans:
+            continue
+
+        boxes.append(TranslatedBox(
+            10, 10 + idx * 20, 220, 18,
+            orig, trans,
+            category=cat,
+            speaker_orig=sp_ja,
+            speaker_trans=sp_tr
+        ))
+    return boxes
+
+
 def _parse_structured_items(content: str) -> list:
-    """Parses structured JSON items into categorized TranslatedBoxes."""
+    """Parses structured JSON items into categorized TranslatedBoxes (with partial JSON recovery)."""
     clean = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
     clean = re.sub(r"^```(?:json)?\s*", "", clean, flags=re.MULTILINE)
     clean = re.sub(r"```\s*$", "", clean, flags=re.MULTILINE).strip()
 
-    boxes = []
     try:
         parsed = json.loads(clean)
         items = parsed.get("items", []) if isinstance(parsed, dict) else (parsed if isinstance(parsed, list) else [])
-        for idx, it in enumerate(items):
-            if not isinstance(it, dict):
-                continue
-            cat = str(it.get("type", "dialogue")).lower().strip()
-            if cat not in ("dialogue", "menu", "label"):
-                cat = "dialogue"
-            orig = str(it.get("ja") or it.get("original") or "").strip()
-            trans = str(it.get("tr") or it.get("translated") or "").strip()
-            sp_ja = str(it.get("speaker") or it.get("speaker_ja") or "").strip()
-            sp_tr = str(it.get("speaker_tr") or "").strip()
-
-            if not _has_meaningful_text(orig) or not trans:
-                continue
-
-            boxes.append(TranslatedBox(
-                10, 10 + idx * 20, 220, 18,
-                orig, trans,
-                category=cat,
-                speaker_orig=sp_ja,
-                speaker_trans=sp_tr
-            ))
+        boxes = _items_to_boxes(items)
         if boxes:
             return boxes
     except Exception:
@@ -151,19 +153,24 @@ def _parse_structured_items(content: str) -> list:
         if match:
             try:
                 items = json.loads(match.group(0))
-                for idx, it in enumerate(items):
-                    cat = str(it.get("type", "dialogue")).lower().strip()
-                    orig = str(it.get("ja") or it.get("original") or "").strip()
-                    trans = str(it.get("tr") or it.get("translated") or "").strip()
-                    sp_ja = str(it.get("speaker") or "").strip()
-                    sp_tr = str(it.get("speaker_tr") or "").strip()
-                    if _has_meaningful_text(orig) and trans:
-                        boxes.append(TranslatedBox(10, 10 + idx * 20, 220, 18, orig, trans, cat, sp_ja, sp_tr))
+                boxes = _items_to_boxes(items)
                 if boxes:
                     return boxes
             except Exception:
                 pass
 
+        # Recover individual completed JSON objects if the array was truncated
+        recovered = []
+        for obj_m in re.finditer(r'\{[^{}]*\}', clean, re.DOTALL):
+            try:
+                recovered.append(json.loads(obj_m.group(0)))
+            except Exception:
+                continue
+        boxes = _items_to_boxes(recovered)
+        if boxes:
+            return boxes
+
+    boxes = []
     for idx, line in enumerate(clean.split("\n")):
         line = line.strip()
         if "->" in line:
@@ -177,7 +184,8 @@ def _parse_structured_items(content: str) -> list:
     return boxes
 
 
-def run_groq_vision(frame_data: np.ndarray, src_lang: str, tgt_lang: str, api_key: str, criteria: str):
+def run_groq_vision(frame_data: np.ndarray, src_lang: str, tgt_lang: str, api_key: str,
+                    criteria: str, glossary_text: str = ""):
     """Executes single-call vision recognition and translation with Groq Vision."""
     global _LAST_GROQ_CALL_TIME
     if not api_key:
@@ -187,7 +195,11 @@ def run_groq_vision(frame_data: np.ndarray, src_lang: str, tgt_lang: str, api_ke
     if elapsed < 2.5:
         time.sleep(2.5 - elapsed)
 
-    pil_img = Image.fromarray(frame_data, 'RGB')
+    # Nearest-neighbor 3x upscale makes 11px pixel-art hiragana and dimmed options crisp for Vision
+    pil_img = Image.fromarray(frame_data, "RGB")
+    if pil_img.width <= 320:
+        pil_img = pil_img.resize((pil_img.width * 3, pil_img.height * 3), Image.Resampling.NEAREST)
+
     buffered = io.BytesIO()
     pil_img.save(buffered, format="PNG", optimize=True)
     b64_img = base64.b64encode(buffered.getvalue()).decode("utf-8")
@@ -196,18 +208,21 @@ def run_groq_vision(frame_data: np.ndarray, src_lang: str, tgt_lang: str, api_ke
     src_name = LANG_NAMES.get(src_lang, src_lang)
     tgt_name = LANG_NAMES.get(tgt_lang, tgt_lang)
 
+    glossary_section = f"\n\n{glossary_text}" if glossary_text else ""
+
     prompt = (
-        f"Analyze this GBA game screen and localize all meaningful {src_name} text into {tgt_name}.\n"
+        f"Analyze the ENTIRE GBA game screen from top to bottom and localize EVERY meaningful {src_name} or UI text block into {tgt_name}.\n"
+        "IMPORTANT: Include ALL panels on screen — main menus, dimmed/grayed-out options, AND bottom 'Information' / help / description boxes!\n\n"
         "Classify each element into ONE of 3 types:\n"
-        "1. \"dialogue\": Speech boxes or story narration scrolls.\n"
+        "1. \"dialogue\": Speech boxes, story narration scrolls, OR help/information/description panels (such as an 'Information' box explaining a setting).\n"
         "   - UNWRAP AND MERGE multi-line sentences inside the same box into ONE complete sentence before translating! Never split a sentence across visual line breaks.\n"
-        "   - If a speaker nameplate appears above/beside the quote (e.g. \"曹操 ソウソウ\"), strip its furigana reading into \"speaker\" (\"曹操\"), put the translated name in \"speaker_tr\" (\"Tào Tháo\"), and do NOT output the speaker as a separate item.\n"
+        "   - If a speaker nameplate appears above/beside a quote (e.g. \"曹操 ソウソウ\"), strip its furigana reading into \"speaker\" (\"曹操\"), put the translated name in \"speaker_tr\" (\"Tào Tháo\"), and do NOT output the speaker as a separate item.\n"
         "   - Strip inline furigana readings attached to Kanji in \"ja\".\n"
-        "2. \"menu\": Selectable menu choices or command lists.\n"
-        "   - Keep every selectable option as a SEPARATE item in top-to-bottom order. Translate as concise UI commands.\n"
-        "3. \"label\": Graphic titles, chapter banners, map locations, or HUD/stat labels.\n"
-        "   - Translate concisely as proper nouns or short UI tags. Ignore decorative dot bubbles like \"....\".\n\n"
-        f"STYLE CRITERIA:\n{criteria}\n\n"
+        "2. \"menu\": Selectable menu choices, setting options, or command lists (including grayed-out or unselected columns).\n"
+        "   - Keep each option as a SEPARATE item in top-to-bottom order. Translate using natural game UI/settings terminology.\n"
+        "3. \"label\": Panel headers (e.g. 'Configuration', 'Information'), chapter banners, map locations, or HUD/button tags.\n"
+        "   - Translate concisely as short UI labels. Ignore decorative dot bubbles like \"....\".\n\n"
+        f"STYLE CRITERIA:\n{criteria}{glossary_section}\n\n"
         "Return a JSON object with key \"items\":\n"
         "{\"items\": [{\"type\": \"dialogue|menu|label\", \"speaker\": \"\", \"speaker_tr\": \"\", \"ja\": \"...\", \"tr\": \"...\"}]}"
     )
@@ -234,7 +249,7 @@ def run_groq_vision(frame_data: np.ndarray, src_lang: str, tgt_lang: str, api_ke
                 "reasoning_effort": "none",
                 "response_format": {"type": "json_object"},
                 "temperature": 0.1,
-                "max_completion_tokens": 450
+                "max_completion_tokens": 1500
             }
 
             req = urllib.request.Request(
@@ -242,7 +257,7 @@ def run_groq_vision(frame_data: np.ndarray, src_lang: str, tgt_lang: str, api_ke
                 data=json.dumps(payload).encode("utf-8"),
                 headers=headers
             )
-            with urllib.request.urlopen(req, timeout=7) as resp:
+            with urllib.request.urlopen(req, timeout=15) as resp:
                 resp_data = json.loads(resp.read().decode("utf-8"))
                 content = resp_data["choices"][0]["message"]["content"].strip()
                 _LAST_GROQ_CALL_TIME = time.time()
@@ -251,7 +266,7 @@ def run_groq_vision(frame_data: np.ndarray, src_lang: str, tgt_lang: str, api_ke
                     return boxes, model_id
         except urllib.error.HTTPError as e:
             try:
-                err_json = e.read().decode('utf-8')
+                err_json = e.read().decode("utf-8")
                 print(f"[Groq Vision on {model_id}] {e}: {err_json}")
             except Exception:
                 print(f"[Groq Vision on {model_id}] {e}")
