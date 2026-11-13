@@ -2,7 +2,7 @@
 import os
 import sys
 
-from PyQt6.QtWidgets import QMainWindow, QTextEdit, QSplitter, QSizePolicy
+from PyQt6.QtWidgets import QMainWindow, QTextEdit, QSplitter, QSizePolicy, QMessageBox
 from PyQt6.QtCore import Qt, QTimer, QEvent
 
 from .controller import ControllerManager
@@ -17,6 +17,8 @@ from .menu_actions import MenuBuilderMixin
 from .application_actions import ApplicationActionsMixin
 from .settings_actions import SettingsActionsMixin
 from .runtime_actions import RuntimeActionsMixin
+
+ROM_DROP_EXTS = {".gba", ".gb", ".gbc", ".sgb", ".zip"}
 
 
 class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, SettingsActionsMixin, RuntimeActionsMixin):
@@ -52,6 +54,7 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
         self._pre_fs_trans_visible = None
 
         self.setWindowTitle("mGBA (PyQt6 Replica)")
+        self.setAcceptDrops(True)
 
         script_dir = str(PROJECT_ROOT)
         self.core_path = os.path.join(script_dir, self.DEFAULT_CORE)
@@ -76,6 +79,7 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
 
         # 2. Separated Sensor & Rumble HUD Panel
         self.sensor_hud = SensorHudWidget()
+        self.sensor_hud.setAcceptDrops(False)
         show_hud_pref = bool(self.config.get("sensors", "show_hud", True))
         self.sensor_hud.setVisible(show_hud_pref)
         self.splitter.addWidget(self.sensor_hud)
@@ -83,6 +87,7 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
         # 3. Translation Subtitle Panel
         self.translation_panel = QTextEdit()
         self.translation_panel.setReadOnly(True)
+        self.translation_panel.setAcceptDrops(False)
         self.translation_panel.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.translation_panel.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         self.translation_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -98,7 +103,7 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
                 line-height: 1.4;
             }
         """)
-        self.translation_panel.setPlaceholderText("Press [T] to translate screen with AI...")
+        self.translation_panel.setPlaceholderText("Press [T] to translate screen with AI... (or drag & drop ROM / State / Shader / Replay here)")
         self.splitter.addWidget(self.translation_panel)
 
         self.splitter.setStretchFactor(0, 8)
@@ -143,6 +148,107 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
         self.update_recent_menu()
         self.video_widget.setFocus()
 
+    # =========================================================================
+    # DRAG-AND-DROP SUPPORT
+    # =========================================================================
+    def _classify_dropped_file(self, path: str) -> str | None:
+        if not path or not os.path.isfile(path):
+            return None
+        lower = path.lower()
+        ext = os.path.splitext(lower)[1]
+
+        if ext in ROM_DROP_EXTS:
+            return "rom"
+        if ext == ".state" or (ext.startswith(".ss") and ext[3:].isdigit()):
+            return "state"
+        if ext == ".glslp":
+            return "shader_preset"
+        if ext == ".glsl":
+            return "shader_pass"
+        if lower.endswith(".replay.json") or ext == ".json":
+            return "replay"
+        if ext == ".cht":
+            return "cheat"
+        return None
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                if url.isLocalFile() and self._classify_dropped_file(url.toLocalFile()):
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+
+    def dropEvent(self, event):
+        if not event.mimeData().hasUrls():
+            event.ignore()
+            return
+
+        for url in event.mimeData().urls():
+            if not url.isLocalFile():
+                continue
+            path = url.toLocalFile()
+            kind = self._classify_dropped_file(path)
+            if not kind:
+                continue
+
+            event.acceptProposedAction()
+            self.activateWindow()
+            self.video_widget.setFocus()
+
+            if kind == "rom":
+                self.load_rom_file(path)
+            elif kind == "state":
+                if self.worker:
+                    ok = self.worker.load_state(path)
+                    self.video_widget.show_osd(
+                        f"Loaded State: {os.path.basename(path)}" if ok else "Failed to load state!"
+                    )
+                else:
+                    QMessageBox.information(self, "Notice", "Load a ROM first before dropping a save state.")
+            elif kind == "shader_preset":
+                if self.shader_manager.load_preset_file(path):
+                    self.shader_manager.enabled = True
+                    self.act_shader_toggle.setChecked(True)
+                    self.config.set("shaders", "enabled", True)
+                    self.config.save()
+                    self.video_widget.update()
+                    self.video_widget.show_osd(f"Shader Preset: {os.path.basename(path)}")
+                else:
+                    self.video_widget.show_osd("Failed to load shader preset")
+            elif kind == "shader_pass":
+                if self.shader_manager.load_glsl_file(path, prepend=False):
+                    self.shader_manager.enabled = True
+                    self.act_shader_toggle.setChecked(True)
+                    self.config.set("shaders", "enabled", True)
+                    self.config.save()
+                    self.video_widget.update()
+                    self.video_widget.show_osd(f"Appended Shader: {os.path.basename(path)}")
+                else:
+                    self.video_widget.show_osd("Failed to compile shader")
+            elif kind == "replay":
+                if self.worker:
+                    if self.worker.start_replay_session(path):
+                        self.video_widget.show_osd(f"▶ REPLAYING: {os.path.basename(path)}", 3000)
+                    else:
+                        QMessageBox.warning(
+                            self, "Replay Error",
+                            "Failed to load replay. Ensure the corresponding .state file exists."
+                        )
+                else:
+                    QMessageBox.information(self, "Notice", "Load a ROM first before dropping a replay file.")
+            elif kind == "cheat":
+                if self.worker:
+                    if self.worker.cheat_engine.load_cht_file(path):
+                        self.video_widget.show_osd(f"Loaded Cheats: {os.path.basename(path)}")
+                    else:
+                        self.video_widget.show_osd("Failed to load cheat file")
+                else:
+                    QMessageBox.information(self, "Notice", "Load a ROM first before dropping a cheat file.")
+            return
+
+        event.ignore()
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if not self.isMaximized() and not self.isMinimized() and not self.isFullScreen():
@@ -186,7 +292,6 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
         self.video_widget.show_osd(f"Loaded: {title} [{code}]", 2500)
 
     def keyPressEvent(self, event):
-        # Fullscreen hotkeys (active even if no ROM is loaded or menubar is hidden)
         if (
             event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
             and (event.modifiers() & Qt.KeyboardModifier.AltModifier)
@@ -202,7 +307,6 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
         if not self.worker:
             return
 
-        # Hold-to-Rewind hotkey (Space or Backtick, unless explicitly bound to a GBA button)
         if (
             event.key() in (Qt.Key.Key_Space, Qt.Key.Key_QuoteLeft)
             and event.key() not in self.keymap

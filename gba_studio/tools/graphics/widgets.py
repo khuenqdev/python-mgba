@@ -1,27 +1,19 @@
-# graphic_editor.py
-import os
-import struct
-import datetime
-from collections import deque
-import numpy as np
-from PIL import Image
-
-from PyQt6.QtWidgets import (QDialog, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QLabel, QPushButton, QComboBox, QCheckBox, 
-                             QTableWidget, QTableWidgetItem, QHeaderView,
-                             QScrollArea, QFileDialog, QMessageBox, QSpinBox, 
-                             QGroupBox, QColorDialog, QTabWidget)
-from PyQt6.QtGui import QImage, QPixmap, QPainter, QColor, QPen
+# widgets.py
+from PyQt6.QtWidgets import QWidget
+from PyQt6.QtGui import QImage, QPainter, QColor, QPen
 from PyQt6.QtCore import Qt
+
 
 class ZoomedCanvas(QWidget):
     """Enlarged pixel editor for the currently active tile or sprite."""
+
     def __init__(self, editor, parent=None):
         super().__init__(parent)
         self.editor = editor
         self.setMouseTracking(True)
         self.drag_start_pos = None
         self.temp_draw_pos = None
+        self._painting_stroke = False
 
     def get_zoom(self):
         w, _ = self.editor.get_active_dimensions()
@@ -44,6 +36,8 @@ class ZoomedCanvas(QWidget):
                 self.drag_start_pos = (x, y)
                 t = self.editor.current_tool
                 if t in ["pencil", "eraser"]:
+                    self.editor.begin_stroke()
+                    self._painting_stroke = True
                     self.editor.apply_brush(x, y, erase=(t == "eraser"))
                 elif t == "eyedropper":
                     self.editor.pick_color(x, y)
@@ -61,24 +55,37 @@ class ZoomedCanvas(QWidget):
             if event.buttons() & Qt.MouseButton.LeftButton:
                 t = self.editor.current_tool
                 if t in ["pencil", "eraser"]:
+                    if not self._painting_stroke:
+                        self.editor.begin_stroke()
+                        self._painting_stroke = True
                     self.editor.apply_brush(x, y, erase=(t == "eraser"))
                 elif t in ["line", "rect_stroke", "rect_fill", "ellipse_stroke", "ellipse_fill"]:
                     self.temp_draw_pos = (x, y)
                 self.update()
 
     def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton and self.drag_start_pos:
-            z = self.get_zoom()
-            w, h = self.editor.get_active_dimensions()
-            x = max(0, min(w - 1, int(event.position().x() // z)))
-            y = max(0, min(h - 1, int(event.position().y() // z)))
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self._painting_stroke:
+                self._painting_stroke = False
+                self.editor.commit_stroke()
 
-            t = self.editor.current_tool
-            if t == "line": self.editor.apply_line(self.drag_start_pos[0], self.drag_start_pos[1], x, y)
-            elif t == "rect_stroke": self.editor.apply_rect(self.drag_start_pos[0], self.drag_start_pos[1], x, y, fill=False)
-            elif t == "rect_fill": self.editor.apply_rect(self.drag_start_pos[0], self.drag_start_pos[1], x, y, fill=True)
-            elif t == "ellipse_stroke": self.editor.apply_ellipse(self.drag_start_pos[0], self.drag_start_pos[1], x, y, fill=False)
-            elif t == "ellipse_fill": self.editor.apply_ellipse(self.drag_start_pos[0], self.drag_start_pos[1], x, y, fill=True)
+            if self.drag_start_pos:
+                z = self.get_zoom()
+                w, h = self.editor.get_active_dimensions()
+                x = max(0, min(w - 1, int(event.position().x() // z)))
+                y = max(0, min(h - 1, int(event.position().y() // z)))
+
+                t = self.editor.current_tool
+                if t == "line":
+                    self.editor.apply_line(self.drag_start_pos[0], self.drag_start_pos[1], x, y)
+                elif t == "rect_stroke":
+                    self.editor.apply_rect(self.drag_start_pos[0], self.drag_start_pos[1], x, y, fill=False)
+                elif t == "rect_fill":
+                    self.editor.apply_rect(self.drag_start_pos[0], self.drag_start_pos[1], x, y, fill=True)
+                elif t == "ellipse_stroke":
+                    self.editor.apply_ellipse(self.drag_start_pos[0], self.drag_start_pos[1], x, y, fill=False)
+                elif t == "ellipse_fill":
+                    self.editor.apply_ellipse(self.drag_start_pos[0], self.drag_start_pos[1], x, y, fill=True)
 
             self.drag_start_pos = None
             self.temp_draw_pos = None
@@ -110,37 +117,45 @@ class ZoomedCanvas(QWidget):
             x2, y2 = self.temp_draw_pos[0] * z, self.temp_draw_pos[1] * z
             t = self.editor.current_tool
 
-            if t == "line": painter.drawLine(x1, y1, x2, y2)
+            if t == "line":
+                painter.drawLine(x1, y1, x2, y2)
             elif t in ["rect_stroke", "rect_fill"]:
                 rx, ry, rw, rh = min(x1, x2), min(y1, y2), abs(x2 - x1) + z, abs(y2 - y1) + z
-                if t == "rect_fill": painter.fillRect(rx, ry, rw, rh, QColor(255, 255, 0, 100))
+                if t == "rect_fill":
+                    painter.fillRect(rx, ry, rw, rh, QColor(255, 255, 0, 100))
                 painter.drawRect(rx, ry, rw, rh)
             elif t in ["ellipse_stroke", "ellipse_fill"]:
                 rx, ry, rw, rh = min(x1, x2), min(y1, y2), abs(x2 - x1) + z, abs(y2 - y1) + z
-                if t == "ellipse_fill": painter.setBrush(QColor(255, 255, 0, 100))
+                if t == "ellipse_fill":
+                    painter.setBrush(QColor(255, 255, 0, 100))
                 painter.drawEllipse(rx, ry, rw, rh)
 
         # 4. Grids
         if self.editor.show_pixel_grid and z >= 6:
             painter.setPen(QPen(QColor(255, 255, 255, 40), 1))
-            for x in range(0, self.width(), z): painter.drawLine(x, 0, x, self.height())
-            for y in range(0, self.height(), z): painter.drawLine(0, y, self.width(), y)
+            for x in range(0, self.width(), z):
+                painter.drawLine(x, 0, x, self.height())
+            for y in range(0, self.height(), z):
+                painter.drawLine(0, y, self.width(), y)
 
         if self.editor.show_tile_grid:
             painter.setPen(QPen(QColor(255, 255, 0, 90), 1))
             tz = 8 * z
-            for x in range(0, self.width(), tz): painter.drawLine(x, 0, x, self.height())
-            for y in range(0, self.height(), tz): painter.drawLine(0, y, self.width(), y)
+            for x in range(0, self.width(), tz):
+                painter.drawLine(x, 0, x, self.height())
+            for y in range(0, self.height(), tz):
+                painter.drawLine(0, y, self.width(), y)
 
         painter.end()
 
 
 class TilesetGridWidget(QWidget):
     """YY-CHR Style Pattern Table with full 32-tile width to fit all VRAM glyphs."""
+
     def __init__(self, editor, parent=None):
         super().__init__(parent)
         self.editor = editor
-        self.tiles_per_row = 32 # 32 tiles per row = 256 pixels wide
+        self.tiles_per_row = 32
         self.zoom = 2
         self.update_dimensions()
 
@@ -173,5 +188,3 @@ class TilesetGridWidget(QWidget):
         painter.setPen(QPen(QColor(255, 255, 0), 2))
         painter.drawRect(sx, sy, 8 * self.zoom, 8 * self.zoom)
         painter.end()
-
-

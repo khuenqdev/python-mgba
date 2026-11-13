@@ -1,25 +1,22 @@
-# graphic_editor.py
-import os
+# editor.py
 import struct
-import datetime
-from collections import deque
 import numpy as np
-from PIL import Image
 
-from PyQt6.QtWidgets import (QDialog, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QLabel, QPushButton, QComboBox, QCheckBox, 
-                             QTableWidget, QTableWidgetItem, QHeaderView,
-                             QScrollArea, QFileDialog, QMessageBox, QSpinBox, 
-                             QGroupBox, QColorDialog, QTabWidget)
-from PyQt6.QtGui import QImage, QPixmap, QPainter, QColor, QPen
+from PyQt6.QtWidgets import (
+    QDialog, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QComboBox, QCheckBox, QTableWidget, QHeaderView, QScrollArea,
+    QMessageBox, QSpinBox, QGroupBox, QTabWidget
+)
+from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtCore import Qt
 
-from .patches import *
+from .patches import bgr555_to_rgb
 from .widgets import ZoomedCanvas, TilesetGridWidget
 
 from .editor_controls import EditorControlsMixin
 from .drawing_tools import DrawingToolsMixin
 from .rom_export import RomExportMixin
+
 
 class GraphicEditorDialog(QDialog, EditorControlsMixin, DrawingToolsMixin, RomExportMixin):
     SPRITE_SIZES = {
@@ -45,7 +42,7 @@ class GraphicEditorDialog(QDialog, EditorControlsMixin, DrawingToolsMixin, RomEx
         self.brush_size = 1
         self.selected_color_idx = 1
         self.selected_pal_bank = 0
-        self.selected_cbb = 0 # 0-5, or 6 for entire VRAM
+        self.selected_cbb = 0  # 0-5, or 6 for entire VRAM
         self.is_8bpp = False
         self.selected_tile_idx = 0
         self.selected_sprite_idx = 0
@@ -60,9 +57,22 @@ class GraphicEditorDialog(QDialog, EditorControlsMixin, DrawingToolsMixin, RomEx
         self.palette_colors = []
         self.modified_vram_offsets = set()
 
+        # Stroke-batched Undo / Redo State
+        self.undo_stack = []
+        self.redo_stack = []
+        self._stroke_depth = 0
+        self._active_stroke_changes = {}
+
         self._load_memory()
         self._init_ui()
+        self._bind_shortcuts()
         self.select_tile(0)
+        self.update_undo_redo_ui()
+
+    def _bind_shortcuts(self):
+        QShortcut(QKeySequence("Ctrl+Z"), self, activated=self.undo)
+        QShortcut(QKeySequence("Ctrl+Y"), self, activated=self.redo)
+        QShortcut(QKeySequence("Ctrl+Shift+Z"), self, activated=self.redo)
 
     def _load_memory(self):
         vram = self.worker.get_memory_region("VRAM") if self.worker else None
@@ -79,16 +89,24 @@ class GraphicEditorDialog(QDialog, EditorControlsMixin, DrawingToolsMixin, RomEx
             words = struct.unpack("<512H", self.pram_copy[:1024])
             self.palette_colors = [bgr555_to_rgb(w) for w in words]
         else:
-            frame = getattr(self.worker, 'latest_video_frame', None)
+            frame = getattr(self.worker, "latest_video_frame", None)
             if frame is not None:
                 flat = frame.reshape(-1, 3)
                 unique = np.unique(flat, axis=0)
                 self.palette_colors = [(int(c[0]), int(c[1]), int(c[2])) for c in unique[:512]]
-            while len(self.palette_colors) < 512: self.palette_colors.append((0, 0, 0))
+            while len(self.palette_colors) < 512:
+                self.palette_colors.append((0, 0, 0))
 
     def refresh_from_emulator(self):
         """Pulls the latest live VRAM from the emulator while keeping existing window open."""
         self._load_memory()
+        self.modified_vram_offsets.clear()
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self._stroke_depth = 0
+        self._active_stroke_changes.clear()
+        self.update_undo_redo_ui()
+
         self.tileset_grid.update_dimensions()
         self.tileset_grid.update()
         self.zoom_canvas.update()
@@ -107,6 +125,18 @@ class GraphicEditorDialog(QDialog, EditorControlsMixin, DrawingToolsMixin, RomEx
 
         tool_box = QGroupBox("Drawing Tools")
         tb_layout = QVBoxLayout(tool_box)
+
+        hist_row = QHBoxLayout()
+        self.btn_undo = QPushButton("↩️ Undo (Ctrl+Z)")
+        self.btn_undo.setEnabled(False)
+        self.btn_undo.clicked.connect(self.undo)
+        hist_row.addWidget(self.btn_undo)
+
+        self.btn_redo = QPushButton("↪️ Redo (Ctrl+Y)")
+        self.btn_redo.setEnabled(False)
+        self.btn_redo.clicked.connect(self.redo)
+        hist_row.addWidget(self.btn_redo)
+        tb_layout.addLayout(hist_row)
 
         r1 = QHBoxLayout()
         self.btn_pencil = QPushButton("✏️ Pencil")
@@ -168,7 +198,7 @@ class GraphicEditorDialog(QDialog, EditorControlsMixin, DrawingToolsMixin, RomEx
         # Palette Picker
         pal_box = QGroupBox("Palette & Color Picker")
         pb_layout = QVBoxLayout(pal_box)
-        
+
         bank_row = QHBoxLayout()
         bank_row.addWidget(QLabel("Bank (0-15):"))
         self.bank_spin = QSpinBox()
@@ -201,7 +231,7 @@ class GraphicEditorDialog(QDialog, EditorControlsMixin, DrawingToolsMixin, RomEx
         # Save Actions
         export_box = QGroupBox("Save & Patching")
         eb_layout = QVBoxLayout(export_box)
-        
+
         btn_refresh = QPushButton("🔄 Refresh Live VRAM")
         btn_refresh.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold; padding: 5px;")
         btn_refresh.clicked.connect(self.refresh_from_emulator)
@@ -233,10 +263,9 @@ class GraphicEditorDialog(QDialog, EditorControlsMixin, DrawingToolsMixin, RomEx
 
         self.tab_widget = QTabWidget()
 
-        # Tab 1: Tileset Pattern Table
         tab_tiles = QWidget()
         tab_tiles_layout = QVBoxLayout(tab_tiles)
-        
+
         cbb_row = QHBoxLayout()
         cbb_row.addWidget(QLabel("Select Region:"))
         self.cbb_combo = QComboBox()
@@ -261,10 +290,9 @@ class GraphicEditorDialog(QDialog, EditorControlsMixin, DrawingToolsMixin, RomEx
         tab_tiles_layout.addWidget(scroll_tileset)
         self.tab_widget.addTab(tab_tiles, "🧩 Background & Object Tiles (VRAM)")
 
-        # Tab 2: Sprites / OAM Table
         tab_sprites = QWidget()
         tab_sprites_layout = QVBoxLayout(tab_sprites)
-        
+
         self.sprite_table = QTableWidget(128, 7)
         self.sprite_table.setHorizontalHeaderLabels(["ID", "X", "Y", "Size", "Tile", "Pal", "Flip"])
         self.sprite_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
@@ -299,7 +327,7 @@ class GraphicEditorDialog(QDialog, EditorControlsMixin, DrawingToolsMixin, RomEx
         main_layout.addWidget(right_panel)
 
         # ======================================================================
-        # 4. Populate Data & Connect Signals safely
+        # 4. Populate Data & Connect Signals
         # ======================================================================
         self._build_swatches()
         self.populate_sprite_table()
@@ -333,6 +361,6 @@ class GraphicEditorDialog(QDialog, EditorControlsMixin, DrawingToolsMixin, RomEx
         """Flushes the full modified VRAM buffer to the live core and unpauses."""
         if self.worker and self.vram_copy:
             self.worker.write_memory_region("VRAM", 0, bytes(self.vram_copy))
-        if self.worker and hasattr(self, 'was_paused'):
+        if self.worker and hasattr(self, "was_paused"):
             self.worker.is_paused = self.was_paused
         event.accept()

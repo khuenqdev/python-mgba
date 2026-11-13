@@ -1,23 +1,113 @@
-# graphic_editor.py
-import os
+# editor_controls.py
 import struct
-import datetime
-from collections import deque
-import numpy as np
-from PIL import Image
 
-from PyQt6.QtWidgets import (QDialog, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QLabel, QPushButton, QComboBox, QCheckBox, 
-                             QTableWidget, QTableWidgetItem, QHeaderView,
-                             QScrollArea, QFileDialog, QMessageBox, QSpinBox, 
-                             QGroupBox, QColorDialog, QTabWidget)
-from PyQt6.QtGui import QImage, QPixmap, QPainter, QColor, QPen
-from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import QPushButton, QTableWidgetItem, QColorDialog
+from PyQt6.QtGui import QColor
 
-from .patches import *
-from .widgets import ZoomedCanvas, TilesetGridWidget
+from .patches import rgb_to_bgr555
+
 
 class EditorControlsMixin:
+    def begin_stroke(self):
+        if self._stroke_depth == 0:
+            self._active_stroke_changes = {}
+        self._stroke_depth += 1
+
+    def commit_stroke(self):
+        if self._stroke_depth <= 0:
+            return
+        self._stroke_depth -= 1
+        if self._stroke_depth == 0 and self._active_stroke_changes:
+            batch = [
+                (off, old_b, new_b)
+                for off, (old_b, new_b) in self._active_stroke_changes.items()
+                if old_b != new_b
+            ]
+            self._active_stroke_changes.clear()
+            if batch:
+                self.undo_stack.append(batch)
+                self.redo_stack.clear()
+                self.update_undo_redo_ui()
+
+    def update_undo_redo_ui(self):
+        if hasattr(self, "btn_undo") and self.btn_undo is not None:
+            self.btn_undo.setEnabled(len(self.undo_stack) > 0)
+            self.btn_undo.setText(
+                f"↩️ Undo ({len(self.undo_stack)})" if self.undo_stack else "↩️ Undo (Ctrl+Z)"
+            )
+        if hasattr(self, "btn_redo") and self.btn_redo is not None:
+            self.btn_redo.setEnabled(len(self.redo_stack) > 0)
+            self.btn_redo.setText(
+                f"↪️ Redo ({len(self.redo_stack)})" if self.redo_stack else "↪️ Redo (Ctrl+Y)"
+            )
+
+    def undo(self):
+        if not self.undo_stack:
+            return
+        batch = self.undo_stack.pop()
+        for offset, old_val, _ in batch:
+            if offset < len(self.vram_copy):
+                self.vram_copy[offset] = old_val
+                if self.original_vram and old_val == self.original_vram[offset]:
+                    self.modified_vram_offsets.discard(offset)
+                else:
+                    self.modified_vram_offsets.add(offset)
+                if self.worker:
+                    self.worker.write_memory_region("VRAM", offset, bytes([old_val]))
+
+        self.redo_stack.append(batch)
+        self.update_undo_redo_ui()
+        if hasattr(self, "zoom_canvas") and self.zoom_canvas is not None:
+            self.zoom_canvas.update()
+        if hasattr(self, "tileset_grid") and self.tileset_grid is not None:
+            self.tileset_grid.update()
+
+    def redo(self):
+        if not self.redo_stack:
+            return
+        batch = self.redo_stack.pop()
+        for offset, _, new_val in batch:
+            if offset < len(self.vram_copy):
+                self.vram_copy[offset] = new_val
+                if self.original_vram and new_val == self.original_vram[offset]:
+                    self.modified_vram_offsets.discard(offset)
+                else:
+                    self.modified_vram_offsets.add(offset)
+                if self.worker:
+                    self.worker.write_memory_region("VRAM", offset, bytes([new_val]))
+
+        self.undo_stack.append(batch)
+        self.update_undo_redo_ui()
+        if hasattr(self, "zoom_canvas") and self.zoom_canvas is not None:
+            self.zoom_canvas.update()
+        if hasattr(self, "tileset_grid") and self.tileset_grid is not None:
+            self.tileset_grid.update()
+
+    def _record_vram_byte_write(self, offset: int, new_val: int):
+        old_val = self.vram_copy[offset]
+        if old_val == new_val:
+            return
+
+        self.vram_copy[offset] = new_val
+        if self.original_vram and new_val == self.original_vram[offset]:
+            self.modified_vram_offsets.discard(offset)
+        else:
+            self.modified_vram_offsets.add(offset)
+
+        if self.worker:
+            self.worker.write_memory_region("VRAM", offset, bytes([new_val]))
+
+        if self._stroke_depth > 0:
+            if offset not in self._active_stroke_changes:
+                self._active_stroke_changes[offset] = (old_val, new_val)
+            else:
+                first_old, _ = self._active_stroke_changes[offset]
+                self._active_stroke_changes[offset] = (first_old, new_val)
+        else:
+            self.undo_stack.append([(offset, old_val, new_val)])
+            self.redo_stack.clear()
+            self.update_undo_redo_ui()
+
     def on_bpp_toggled(self, checked: bool):
         self.is_8bpp = checked
         self.tileset_grid.update_dimensions()
@@ -26,7 +116,7 @@ class EditorControlsMixin:
 
     def get_current_total_tiles(self) -> int:
         bpp_mult = 64 if self.is_8bpp else 32
-        if self.selected_cbb == 6: # Entire 96 KB VRAM
+        if self.selected_cbb == 6:  # Entire 96 KB VRAM
             return len(self.vram_copy) // bpp_mult
         return 0x4000 // bpp_mult
 
@@ -69,32 +159,33 @@ class EditorControlsMixin:
     def select_tile(self, tile_idx: int):
         max_t = self.get_current_total_tiles()
         self.selected_tile_idx = max(0, min(max_t - 1, tile_idx))
-        
+
         bpp_mult = 64 if self.is_8bpp else 32
         base_offset = 0 if self.selected_cbb == 6 else (self.selected_cbb * 0x4000)
         addr = 0x06000000 + base_offset + (self.selected_tile_idx * bpp_mult)
-        
-        if hasattr(self, 'info_label') and self.info_label is not None:
+
+        if hasattr(self, "info_label") and self.info_label is not None:
             self.info_label.setText(
                 f"Mode: {'8bpp' if self.is_8bpp else '4bpp'} Tileset\n"
                 f"Tile: 0x{self.selected_tile_idx:03X} ({self.selected_tile_idx})\n"
                 f"Addr: 0x{addr:08X}\n"
                 f"Bank: {self.selected_pal_bank}"
             )
-        if hasattr(self, 'zoom_canvas') and self.zoom_canvas is not None:
+        if hasattr(self, "zoom_canvas") and self.zoom_canvas is not None:
             self.zoom_canvas.sizeHint()
             self.zoom_canvas.update()
 
     def populate_sprite_table(self):
-        words = struct.unpack("<512H", self.oam_copy[:1024]) if len(self.oam_copy) >= 1024 else [0]*512
+        words = struct.unpack("<512H", self.oam_copy[:1024]) if len(self.oam_copy) >= 1024 else [0] * 512
         for i in range(128):
-            a0, a1, a2 = words[i*4], words[i*4+1], words[i*4+2]
+            a0, a1, a2 = words[i * 4], words[i * 4 + 1], words[i * 4 + 2]
             y = a0 & 0xFF
             shape = (a0 >> 14) & 0x3
             x = a1 & 0x1FF
-            if x >= 240: x -= 512
+            if x >= 240:
+                x -= 512
             size_idx = (a1 >> 14) & 0x3
-            dim = self.SPRITE_SIZES.get(shape, [(8, 8)]*4)[size_idx]
+            dim = self.SPRITE_SIZES.get(shape, [(8, 8)] * 4)[size_idx]
             tile = a2 & 0x3FF
             pal = (a2 >> 12) & 0xF
             h_flip = bool(a1 & (1 << 12))
@@ -109,14 +200,15 @@ class EditorControlsMixin:
 
     def on_sprite_table_selected(self):
         rows = self.sprite_table.selectionModel().selectedRows()
-        if not rows: return
+        if not rows:
+            return
         self.selected_sprite_idx = rows[0].row()
-        
+
         words = struct.unpack("<512H", self.oam_copy[:1024])
-        a0, a1, a2 = words[self.selected_sprite_idx*4], words[self.selected_sprite_idx*4+1], words[self.selected_sprite_idx*4+2]
+        a0, a1, a2 = words[self.selected_sprite_idx * 4], words[self.selected_sprite_idx * 4 + 1], words[self.selected_sprite_idx * 4 + 2]
         shape = (a0 >> 14) & 0x3
         size_idx = (a1 >> 14) & 0x3
-        w, h = self.SPRITE_SIZES.get(shape, [(8, 8)]*4)[size_idx]
+        w, h = self.SPRITE_SIZES.get(shape, [(8, 8)] * 4)[size_idx]
         start_tile = a2 & 0x3FF
         pal = (a2 >> 12) & 0xF
 
@@ -129,7 +221,7 @@ class EditorControlsMixin:
         self._build_swatches()
 
         addr = 0x06010000 + (start_tile * 32)
-        if hasattr(self, 'info_label') and self.info_label is not None:
+        if hasattr(self, "info_label") and self.info_label is not None:
             self.info_label.setText(
                 f"Mode: Sprite #{self.selected_sprite_idx:03d}\n"
                 f"Size: {w}x{h}\n"
@@ -137,28 +229,25 @@ class EditorControlsMixin:
                 f"Addr: 0x{addr:08X}\n"
                 f"Bank: {pal}"
             )
-        if hasattr(self, 'zoom_canvas') and self.zoom_canvas is not None:
+        if hasattr(self, "zoom_canvas") and self.zoom_canvas is not None:
             self.zoom_canvas.sizeHint()
             self.zoom_canvas.update()
 
     def get_active_dimensions(self) -> tuple:
         if self.mode == "sprites":
             words = struct.unpack("<512H", self.oam_copy[:1024])
-            a0, a1 = words[self.selected_sprite_idx*4], words[self.selected_sprite_idx*4+1]
+            a0, a1 = words[self.selected_sprite_idx * 4], words[self.selected_sprite_idx * 4 + 1]
             shape = (a0 >> 14) & 0x3
             size_idx = (a1 >> 14) & 0x3
-            return self.SPRITE_SIZES.get(shape, [(8, 8)]*4)[size_idx]
+            return self.SPRITE_SIZES.get(shape, [(8, 8)] * 4)[size_idx]
         return (8, 8)
 
     def get_pixel_index(self, px: int, py: int) -> int:
-        bpp_mult = 64 if self.is_8bpp else 32
         base_offset = 0 if self.selected_cbb == 6 else (self.selected_cbb * 0x4000)
 
         if self.mode == "sprites":
-            tx = px // 8
-            ty = py // 8
-            lx = px % 8
-            ly = py % 8
+            tx, ty = px // 8, py // 8
+            lx, ly = px % 8, py % 8
             tile_offset_idx = self.selected_tile_idx + (ty * 32) + tx
             offset = 0x10000 + (tile_offset_idx * 32) + (ly * 4) + (lx // 2)
             if offset < len(self.vram_copy):
@@ -177,56 +266,51 @@ class EditorControlsMixin:
         return 0
 
     def set_pixel_index(self, px: int, py: int, c_idx: int):
-        bpp_mult = 64 if self.is_8bpp else 32
         base_offset = 0 if self.selected_cbb == 6 else (self.selected_cbb * 0x4000)
 
         if self.mode == "sprites":
-            tx = px // 8
-            ty = py // 8
-            lx = px % 8
-            ly = py % 8
+            tx, ty = px // 8, py // 8
+            lx, ly = px % 8, py % 8
             tile_offset_idx = self.selected_tile_idx + (ty * 32) + tx
             offset = 0x10000 + (tile_offset_idx * 32) + (ly * 4) + (lx // 2)
             if offset < len(self.vram_copy):
                 old = self.vram_copy[offset]
                 new = (old & 0xF0) | (c_idx & 0x0F) if (lx % 2 == 0) else (old & 0x0F) | ((c_idx & 0x0F) << 4)
-                self.vram_copy[offset] = new
-                self.modified_vram_offsets.add(offset)
-                if self.worker: self.worker.write_memory_region("VRAM", offset, bytes([new]))
+                self._record_vram_byte_write(offset, new)
         else:
             if not self.is_8bpp:
                 offset = base_offset + (self.selected_tile_idx * 32) + (py * 4) + (px // 2)
                 if offset < len(self.vram_copy):
                     old = self.vram_copy[offset]
                     new = (old & 0xF0) | (c_idx & 0x0F) if (px % 2 == 0) else (old & 0x0F) | ((c_idx & 0x0F) << 4)
-                    self.vram_copy[offset] = new
-                    self.modified_vram_offsets.add(offset)
-                    if self.worker: self.worker.write_memory_region("VRAM", offset, bytes([new]))
+                    self._record_vram_byte_write(offset, new)
             else:
                 offset = base_offset + (self.selected_tile_idx * 64) + (py * 8) + px
                 if offset < len(self.vram_copy):
-                    self.vram_copy[offset] = c_idx & 0xFF
-                    self.modified_vram_offsets.add(offset)
-                    if self.worker: self.worker.write_memory_region("VRAM", offset, bytes([c_idx & 0xFF]))
+                    self._record_vram_byte_write(offset, c_idx & 0xFF)
 
     def get_color_for_index(self, c_idx: int) -> tuple:
         if self.is_8bpp:
             return self.palette_colors[c_idx % len(self.palette_colors)]
         is_obj = (self.selected_cbb in [4, 5] or self.mode == "sprites")
         flat_idx = (self.selected_pal_bank * 16 + c_idx)
-        if is_obj: flat_idx += 256
+        if is_obj:
+            flat_idx += 256
         return self.palette_colors[flat_idx % len(self.palette_colors)]
 
     def on_pal_bank_changed(self, bank: int):
         self.selected_pal_bank = bank
         self._build_swatches()
-        if hasattr(self, 'zoom_canvas') and self.zoom_canvas is not None: self.zoom_canvas.update()
-        if hasattr(self, 'tileset_grid') and self.tileset_grid is not None: self.tileset_grid.update()
+        if hasattr(self, "zoom_canvas") and self.zoom_canvas is not None:
+            self.zoom_canvas.update()
+        if hasattr(self, "tileset_grid") and self.tileset_grid is not None:
+            self.tileset_grid.update()
 
     def _build_swatches(self):
         for i in reversed(range(self.swatch_layout.count())):
             w = self.swatch_layout.itemAt(i).widget()
-            if w: w.setParent(None)
+            if w:
+                w.setParent(None)
 
         for c_idx in range(16):
             rgb = self.get_color_for_index(c_idx)
@@ -248,14 +332,15 @@ class EditorControlsMixin:
             new_rgb = (int(chosen.red()), int(chosen.green()), int(chosen.blue()))
             is_obj = (self.selected_cbb in [4, 5] or self.mode == "sprites")
             flat_idx = (self.selected_pal_bank * 16 + self.selected_color_idx)
-            if is_obj: flat_idx += 256
+            if is_obj:
+                flat_idx += 256
             self.palette_colors[flat_idx % len(self.palette_colors)] = new_rgb
-            
+
             bgr555 = rgb_to_bgr555(*new_rgb)
             pram_offset = flat_idx * 2
 
             if self.pram_copy and pram_offset + 2 <= len(self.pram_copy):
-                self.pram_copy[pram_offset:pram_offset+2] = bgr555.to_bytes(2, "little")
+                self.pram_copy[pram_offset:pram_offset + 2] = bgr555.to_bytes(2, "little")
 
             if self.worker:
                 self.worker.write_memory_region("PRAM", pram_offset, bgr555.to_bytes(2, "little"))
@@ -263,4 +348,3 @@ class EditorControlsMixin:
             self._build_swatches()
             self.zoom_canvas.update()
             self.tileset_grid.update()
-
