@@ -1,34 +1,16 @@
-# gui.py
-import os
-import sys
-import html
+# video_widget.py
 import math
-import datetime
 import numpy as np
 
-from PyQt6.QtWidgets import (QMainWindow, QWidget, QFileDialog, QMessageBox, 
-                             QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
-                             QComboBox, QPushButton, QTextEdit, QSplitter, 
-                             QFrame, QSizePolicy)
-from PyQt6.QtGui import (QImage, QPainter, QAction, QActionGroup, QKeySequence, 
-                         QColor, QFont, QPen, QBrush)
-from PyQt6.QtCore import Qt, QTimer, QPoint, QRect, QEvent, QSize
+from PyQt6.QtWidgets import QSizePolicy
+from PyQt6.QtGui import QPainter, QColor, QFont, QPen
+from PyQt6.QtCore import Qt, QTimer, QPoint, QSize
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
-from PyQt6.QtOpenGL import QOpenGLTexture
-
-from ..core.core_worker import EmulatorWorker
-from .controller import ControllerManager, ControllerConfigDialog, LIBRETRO_BTNS, QT_KEY_MAP
-from ..tools.dev_tools import (PaletteViewerDialog, SpriteViewerDialog, TileViewerDialog,
-                               MapViewerDialog, FrameInspectorDialog, MemoryViewerDialog,
-                               MemorySearchDialog, IORegisterViewerDialog)
-from ..tools.ai_translator import TranslationWorker
-from .shader_manager import RetroArchShaderManager
-from .shader_dialog import ShaderConfigDialog
-from ..paths import PROJECT_ROOT
 
 
 class VideoGLWidget(QOpenGLWidget):
     """Hardware-accelerated OpenGL rendering surface with RetroArch shader pipeline."""
+
     def __init__(self, shader_manager, parent=None):
         super().__init__(parent)
         self.sm = shader_manager
@@ -64,11 +46,9 @@ class VideoGLWidget(QOpenGLWidget):
     def initializeGL(self):
         from OpenGL import GL
 
-        # Clear any pre-existing GL errors
         while GL.glGetError() != GL.GL_NO_ERROR:
             pass
 
-        # Create clean 240x160 RGB OpenGL texture
         self.tex_id = int(GL.glGenTextures(1))
         GL.glBindTexture(GL.GL_TEXTURE_2D, self.tex_id)
         GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_NEAREST)
@@ -77,10 +57,9 @@ class VideoGLWidget(QOpenGLWidget):
         GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
         GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
         GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGB8, 240, 160, 0, GL.GL_RGB, GL.GL_UNSIGNED_BYTE, None)
-        GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 4)  # Always restore default alignment for Qt QPainter
+        GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 4)
         GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
 
-        # Initialize Shader Manager VBO/VAO & compile shaders
         self.sm.set_gl_widget(self)
         self.sm.init_gl()
 
@@ -89,31 +68,44 @@ class VideoGLWidget(QOpenGLWidget):
         self._need_texture_update = True
         self.update()
 
+    def _get_viewport_transform(self) -> tuple[float, float, float]:
+        """Returns (logical_scale, offset_x, offset_y) matching the GL viewport."""
+        dpr = self.devicePixelRatioF() or 1.0
+        phys_w = max(1, int(self.width() * dpr))
+        phys_h = max(1, int(self.height() * dpr))
+
+        integer_scaling = bool(self.sm.config.get("video", "integer_scaling", False)) if self.sm and self.sm.config else False
+        if integer_scaling and phys_w >= 240 and phys_h >= 160:
+            phys_scale = float(max(1, min(phys_w // 240, phys_h // 160)))
+        else:
+            phys_scale = min(phys_w / 240.0, phys_h / 160.0)
+
+        scale = phys_scale / dpr
+        ox = (self.width() - (240.0 * scale)) / 2.0
+        oy = (self.height() - (160.0 * scale)) / 2.0
+        return scale, ox, oy
+
     def paintGL(self):
         from OpenGL import GL
 
-        # 1. Zero-copy pixel upload to GPU VRAM
         if self._need_texture_update and self.current_frame_data is not None and self.tex_id is not None:
             h, w, _ = self.current_frame_data.shape
             buf = np.ascontiguousarray(self.current_frame_data, dtype=np.uint8)
             GL.glBindTexture(GL.GL_TEXTURE_2D, self.tex_id)
             GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
             GL.glTexSubImage2D(GL.GL_TEXTURE_2D, 0, 0, 0, w, h, GL.GL_RGB, GL.GL_UNSIGNED_BYTE, buf)
-            GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 4)  # Restore default 4-byte alignment for Qt font glyphs
+            GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 4)
             GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
             self._need_texture_update = False
 
-        # 2. Calculate High-DPI aware viewport size
-        dpr = self.devicePixelRatioF()
+        dpr = self.devicePixelRatioF() or 1.0
         phys_w = max(1, int(self.width() * dpr))
         phys_h = max(1, int(self.height() * dpr))
         default_fbo = self.defaultFramebufferObject()
 
-        # 3. Render through RetroArch Shader Chain
         if self.tex_id is not None:
             self.sm.render(self.tex_id, 240, 160, phys_w, phys_h, default_fbo)
 
-        # 4. Restore default widget FBO, viewport, and unpack alignment cleanly before QPainter overlay
         GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, default_fbo)
         GL.glViewport(0, 0, phys_w, phys_h)
         GL.glUseProgram(0)
@@ -124,9 +116,7 @@ class VideoGLWidget(QOpenGLWidget):
         # Pixel Ruler Overlay
         if self.ruler_enabled:
             img_w, img_h = 240, 160
-            scale = min(self.width() / img_w, self.height() / img_h)
-            ox = (self.width() - img_w * scale) / 2
-            oy = (self.height() - img_h * scale) / 2
+            scale, ox, oy = self._get_viewport_transform()
 
             if self.hover_pos:
                 hx, hy = self.hover_pos
@@ -166,9 +156,11 @@ class VideoGLWidget(QOpenGLWidget):
         if self.osd_text:
             painter.setPen(QPen(QColor(0, 255, 0)))
             painter.setFont(QFont("Arial", 14, QFont.Weight.Bold))
-            painter.drawText(self.rect().adjusted(10, 10, -10, -10), 
-                             Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight, 
-                             self.osd_text)
+            painter.drawText(
+                self.rect().adjusted(10, 10, -10, -10),
+                Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight,
+                self.osd_text
+            )
 
         painter.end()
 
@@ -183,10 +175,8 @@ class VideoGLWidget(QOpenGLWidget):
 
     def get_gba_coords(self, pos) -> tuple:
         img_w, img_h = 240, 160
-        scale = min(self.width() / img_w, self.height() / img_h)
-        offset_x = (self.width() - (img_w * scale)) / 2
-        offset_y = (self.height() - (img_h * scale)) / 2
-        
+        scale, offset_x, offset_y = self._get_viewport_transform()
+
         gba_x = int((pos.x() - offset_x) / scale)
         gba_y = int((pos.y() - offset_y) / scale)
         return max(0, min(img_w - 1, gba_x)), max(0, min(img_h - 1, gba_y))
@@ -195,7 +185,7 @@ class VideoGLWidget(QOpenGLWidget):
         self.setFocus()
         if event.button() in [Qt.MouseButton.RightButton, Qt.MouseButton.MiddleButton]:
             parent_win = self.window()
-            if hasattr(parent_win, 'config') and parent_win.config.get("sensors", "mouse_gyro"):
+            if hasattr(parent_win, "config") and parent_win.config.get("sensors", "mouse_gyro"):
                 self.mouse_gyro_active = True
                 self.gyro_drag_center = QPoint(self.width() // 2, self.height() // 2)
                 self._update_mouse_gyro(event.position().toPoint())
@@ -231,14 +221,14 @@ class VideoGLWidget(QOpenGLWidget):
             self.update()
 
     def _update_mouse_gyro(self, pos: QPoint):
-        if not self.gyro_drag_center: return
+        if not self.gyro_drag_center:
+            return
         dx = pos.x() - self.gyro_drag_center.x()
         dy = pos.y() - self.gyro_drag_center.y()
-        if dx == 0 and dy == 0: return
+        if dx == 0 and dy == 0:
+            return
 
         angle = math.degrees(math.atan2(dx, -dy))
         parent_win = self.window()
-        if hasattr(parent_win, 'worker') and parent_win.worker:
+        if hasattr(parent_win, "worker") and parent_win.worker:
             parent_win.worker.set_gyro_angle(angle)
-
-

@@ -1,31 +1,14 @@
-# gui.py
+# main_window.py
 import os
 import sys
-import html
-import math
-import datetime
-import numpy as np
 
-from PyQt6.QtWidgets import (QMainWindow, QWidget, QFileDialog, QMessageBox, 
-                             QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
-                             QComboBox, QPushButton, QTextEdit, QSplitter, 
-                             QFrame, QSizePolicy)
-from PyQt6.QtGui import (QImage, QPainter, QAction, QActionGroup, QKeySequence, 
-                         QColor, QFont, QPen, QBrush)
-from PyQt6.QtCore import Qt, QTimer, QPoint, QRect, QEvent, QSize
-from PyQt6.QtOpenGLWidgets import QOpenGLWidget
-from PyQt6.QtOpenGL import QOpenGLTexture
+from PyQt6.QtWidgets import QMainWindow, QTextEdit, QSplitter, QSizePolicy
+from PyQt6.QtCore import Qt, QTimer, QEvent
 
-from ..core.core_worker import EmulatorWorker
-from .controller import ControllerManager, ControllerConfigDialog, LIBRETRO_BTNS, QT_KEY_MAP
-from ..tools.dev_tools import (PaletteViewerDialog, SpriteViewerDialog, TileViewerDialog,
-                               MapViewerDialog, FrameInspectorDialog, MemoryViewerDialog,
-                               MemorySearchDialog, IORegisterViewerDialog)
-from ..tools.ai_translator import TranslationWorker
+from .controller import ControllerManager
+from ..tools.dev_tools import MemoryViewerDialog
 from .shader_manager import RetroArchShaderManager
-from .shader_dialog import ShaderConfigDialog
 from ..paths import PROJECT_ROOT
-
 
 from .video_widget import VideoGLWidget
 from .sensor_hud import SensorHudWidget
@@ -35,10 +18,11 @@ from .application_actions import ApplicationActionsMixin
 from .settings_actions import SettingsActionsMixin
 from .runtime_actions import RuntimeActionsMixin
 
+
 class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, SettingsActionsMixin, RuntimeActionsMixin):
-    if sys.platform.startswith('win'):
+    if sys.platform.startswith("win"):
         DEFAULT_CORE = "mgba_libretro.dll"
-    elif sys.platform.startswith('linux'):
+    elif sys.platform.startswith("linux"):
         DEFAULT_CORE = "mgba_libretro.so"
     else:
         DEFAULT_CORE = "mgba_libretro.dylib"
@@ -48,8 +32,8 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
         self.config = config
         self.worker = None
         self.current_rom = None
-        
-        # Restore active scale factor
+        self.source_rom = None
+
         saved_scale = self.config.get("video", "scale")
         try:
             self.scale_factor = max(1, min(6, int(saved_scale))) if saved_scale is not None else 3
@@ -57,12 +41,18 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
             self.scale_factor = 3
 
         self.current_slot = self.config.get("emulation", "state_slot") or 1
-        self.active_tool_window = None 
+        self.active_tool_window = None
         self.trans_worker = None
         self._auto_paused = False
-        
+
+        # Fullscreen restoration cache
+        self._pre_fs_geometry = None
+        self._pre_fs_splitter = None
+        self._pre_fs_hud_visible = None
+        self._pre_fs_trans_visible = None
+
         self.setWindowTitle("mGBA (PyQt6 Replica)")
-        
+
         script_dir = str(PROJECT_ROOT)
         self.core_path = os.path.join(script_dir, self.DEFAULT_CORE)
 
@@ -147,7 +137,7 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
             self.splitter.setSizes([default_vid_h, default_hud_h, default_panel_h])
 
         self.setCentralWidget(self.splitter)
-        
+
         self._create_menus()
         self._sync_ui_with_config()
         self.update_recent_menu()
@@ -155,29 +145,31 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if not self.isMaximized() and not self.isMinimized():
+        if not self.isMaximized() and not self.isMinimized() and not self.isFullScreen():
             self.config.set("video", "window_width", self.width())
             self.config.set("video", "window_height", self.height())
-            if hasattr(self, 'splitter'):
+            if hasattr(self, "splitter"):
                 self.config.set("video", "splitter_sizes", self.splitter.sizes())
 
     def on_splitter_moved(self, pos, index):
-        if not self.isMaximized() and not self.isMinimized():
+        if not self.isMaximized() and not self.isMinimized() and not self.isFullScreen():
             self.config.set("video", "splitter_sizes", self.splitter.sizes())
 
     def changeEvent(self, event):
         if event.type() == QEvent.Type.ActivationChange:
             pause_enabled = bool(self.config.get("emulation", "pause_on_unfocus", True))
             if not self.isActiveWindow():
-                if pause_enabled and self.worker and hasattr(self, 'is_running') and self.is_running and not self.worker.is_paused:
+                if self.worker and getattr(self.worker, "is_rewinding", False):
+                    self.worker.set_rewinding(False)
+                if pause_enabled and self.worker and hasattr(self, "is_running") and self.is_running and not self.worker.is_paused:
                     self._auto_paused = True
                     self.worker.is_paused = True
                     self.pause_action.setChecked(True)
                     self.video_widget.show_osd("⏸ Auto-Paused (Window Inactive)", 1500)
             else:
-                if getattr(self, '_auto_paused', False):
+                if getattr(self, "_auto_paused", False):
                     self._auto_paused = False
-                    if self.worker and hasattr(self, 'is_running') and self.is_running:
+                    if self.worker and hasattr(self, "is_running") and self.is_running:
                         self.worker.is_paused = False
                         self.pause_action.setChecked(False)
                         self.video_widget.show_osd("▶ Resumed", 1000)
@@ -194,7 +186,32 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
         self.video_widget.show_osd(f"Loaded: {title} [{code}]", 2500)
 
     def keyPressEvent(self, event):
+        # Fullscreen hotkeys (active even if no ROM is loaded or menubar is hidden)
+        if (
+            event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+            and (event.modifiers() & Qt.KeyboardModifier.AltModifier)
+            and not event.isAutoRepeat()
+        ) or (event.key() == Qt.Key.Key_F11 and not event.isAutoRepeat()):
+            self.toggle_fullscreen()
+            return
+
+        if event.key() == Qt.Key.Key_Escape and self.isFullScreen() and not event.isAutoRepeat():
+            self.toggle_fullscreen()
+            return
+
         if not self.worker:
+            return
+
+        # Hold-to-Rewind hotkey (Space or Backtick, unless explicitly bound to a GBA button)
+        if (
+            event.key() in (Qt.Key.Key_Space, Qt.Key.Key_QuoteLeft)
+            and event.key() not in self.keymap
+            and event.key() not in self.autofire_keymap
+            and not event.isAutoRepeat()
+        ):
+            self.worker.set_rewinding(True)
+            if bool(self.config.get("emulation", "rewind_enabled", True)):
+                self.video_widget.show_osd("⏪ Rewinding...", 1500)
             return
 
         if event.key() in [Qt.Key.Key_Equal, Qt.Key.Key_Plus] and not event.isAutoRepeat():
@@ -241,9 +258,10 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
             self.trigger_ai_translation()
             return
 
-        if ((event.key() == Qt.Key.Key_D and 
-             event.modifiers() == (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)) 
-            or event.key() == Qt.Key.Key_F11):
+        if (
+            event.key() == Qt.Key.Key_D
+            and event.modifiers() == (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)
+        ):
             self.trigger_instant_scene_dump()
             return
 
@@ -296,6 +314,17 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
         if not self.worker:
             return
 
+        if (
+            event.key() in (Qt.Key.Key_Space, Qt.Key.Key_QuoteLeft)
+            and event.key() not in self.keymap
+            and event.key() not in self.autofire_keymap
+            and not event.isAutoRepeat()
+        ):
+            if self.worker.is_rewinding:
+                self.worker.set_rewinding(False)
+                self.video_widget.show_osd("⏸ Paused" if self.worker.is_paused else "▶ Resumed", 1000)
+            return
+
         if event.key() == Qt.Key.Key_Tab and not event.isAutoRepeat():
             self.ff_action.setChecked(False)
             self.toggle_ff()
@@ -312,19 +341,24 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
 
     def closeEvent(self, event):
         self.is_running = False
-        if hasattr(self, 'gamepad_timer'):
+        if hasattr(self, "gamepad_timer"):
             self.gamepad_timer.stop()
         if self.worker:
+            self.worker.set_rewinding(False)
             self.worker.stop()
             self.worker.wait()
-            
-        if not self.isMaximized() and not self.isMinimized():
+
+        if not self.isMaximized() and not self.isMinimized() and not self.isFullScreen():
             self.config.set("video", "window_width", self.width())
             self.config.set("video", "window_height", self.height())
-            if hasattr(self, 'splitter'):
+            if hasattr(self, "splitter"):
                 self.config.set("video", "splitter_sizes", self.splitter.sizes())
+            self.config.set("sensors", "show_hud", self.sensor_hud.isVisible())
+        elif self._pre_fs_hud_visible is not None:
+            self.config.set("sensors", "show_hud", self._pre_fs_hud_visible)
+
         self.config.set("video", "scale", self.scale_factor)
-        self.config.set("sensors", "show_hud", self.sensor_hud.isVisible())
         self.config.set("shaders", "enabled", self.shader_manager.enabled)
+        self.shader_manager.save_chain_to_config()
         self.config.save()
         event.accept()

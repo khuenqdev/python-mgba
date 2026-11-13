@@ -18,7 +18,10 @@ DEFAULT_CONFIG = {
         "skip_bios": True,
         "fast_forward_ratio": 2.0,
         "state_slot": 1,
-        "pause_on_unfocus": True
+        "pause_on_unfocus": True,
+        "rewind_enabled": True,
+        "rewind_buffer_size": 300,
+        "rewind_interval": 10
     },
     "sensors": {
         "solar_level": 5,
@@ -32,10 +35,16 @@ DEFAULT_CONFIG = {
     "video": {
         "frameskip": 0,
         "interframe_blending": False,
+        "integer_scaling": False,
         "scale": 3,
         "window_width": 720,
         "window_height": 649,
         "splitter_sizes": [480, 34, 135]
+    },
+    "shaders": {
+        "enabled": False,
+        "preset": "gba_color",
+        "chain": []
     },
     "ai_translation": {
         "source_lang": "ja",
@@ -124,13 +133,13 @@ class EmulatorConfig:
 
     def _update_dict(self, base, new):
         for k, v in new.items():
-            if isinstance(v, dict) and k in base:
+            if isinstance(v, dict) and k in base and isinstance(base[k], dict):
                 self._update_dict(base[k], v)
             else:
                 base[k] = v
 
     def save(self):
-        for path_name, path_val in self.settings.get("paths", {}).items():
+        for _, path_val in self.settings.get("paths", {}).items():
             os.makedirs(path_val, exist_ok=True)
 
         try:
@@ -163,7 +172,8 @@ class EmulatorConfig:
         return [f for f in recent if os.path.exists(f)]
 
     def add_recent_file(self, filepath: str):
-        if not filepath: return
+        if not filepath:
+            return
         filepath = os.path.abspath(filepath)
         recent = self.settings.get("recent_files", [])
         if filepath in recent:

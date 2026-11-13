@@ -1,17 +1,17 @@
 # core_worker.py
 import os
-import sys
 import time
-import math
+import zlib
 import ctypes
+from collections import deque
 import numpy as np
 
 try:
-    from PyQt6.QtCore import QThread, pyqtSignal, QRecursiveMutex as QMutexClass, QMutexLocker, QTimer
+    from PyQt6.QtCore import QThread, pyqtSignal, QRecursiveMutex as QMutexClass, QMutexLocker
 except ImportError:
-    from PyQt6.QtCore import QThread, pyqtSignal, QMutex as QMutexClass, QMutexLocker, QTimer
+    from PyQt6.QtCore import QThread, pyqtSignal, QMutex as QMutexClass, QMutexLocker
 
-from pdretro import Emulator, MemoryRegion
+from pdretro import Emulator
 from .cheats import CheatEngine
 from .audio_dsp import AudioDSP
 from .session_recorder import SessionRecorder, ID_TO_BTN
@@ -47,21 +47,24 @@ from .sensor_controls import SensorControlsMixin
 from .state_storage import StateStorageMixin
 from .replay_control import ReplayControlMixin
 
+
 class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayControlMixin):
     frame_ready = pyqtSignal(np.ndarray)
     error_occurred = pyqtSignal(str)
     stopped = pyqtSignal()
     replay_finished = pyqtSignal()
+    rewind_status = pyqtSignal(str)
     rumble_triggered = pyqtSignal(float, float, int)
     solar_changed = pyqtSignal(int)
     tilt_changed = pyqtSignal(float, float, float)
     game_identified = pyqtSignal(str, str, str)
 
-    def __init__(self, core_path: str, rom_path: str, config):
+    def __init__(self, core_path: str, rom_path: str, config, save_base_name: str = None):
         super().__init__()
         self.core_path = os.path.abspath(core_path)
         self.rom_path = os.path.abspath(rom_path) if rom_path else ""
         self.config = config
+        self.save_base_name = save_base_name
 
         self.emu = None
         self._is_running = False
@@ -69,6 +72,12 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
         self.is_paused = False
         self.step_requested = False
         self.reset_requested = False
+
+        # Rewind State
+        buf_max = max(30, int(self.config.get("emulation", "rewind_buffer_size", 300) or 300))
+        self.rewind_buffer = deque(maxlen=buf_max)
+        self.is_rewinding = False
+        self._notified_rewind_empty = False
 
         self.mutex = QMutexClass()
         self.cheat_engine = CheatEngine(self)
@@ -80,6 +89,7 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
         self.latest_video_frame = None
         self.previous_frame = None
         self._last_gui_render_time = 0.0
+        self._last_sram_digest = None
 
         self.standard_buttons = {}
         self.autofire_buttons = {"a": False, "b": False, "l": False, "r": False}
@@ -97,13 +107,14 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
         self._active_rumble_low = 0.0
         self._active_rumble_high = 0.0
 
+        saves_path = (self.config.get("paths", "saves") or "saves").encode("utf-8", errors="ignore")
         self._c_str_cache = {
             b"mgba_force_gbp": b"ON",
             b"mgba_use_bios": b"OFF",
             b"mgba_skip_bios": b"ON",
             b"mgba_gb_model": b"Autodetect",
             b"mgba_solar_sensor_level": str(self.solar_level).encode("ascii"),
-            b"saves_dir": b"saves",
+            b"saves_dir": saves_path,
             b"current_dir": b"."
         }
 
@@ -224,8 +235,29 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
             print(f"[CORE HOOK WARNING] Failed to attach native environment hooks: {e}")
 
     def update_audio_settings(self):
-        if hasattr(self, 'dsp') and self.dsp:
+        if hasattr(self, "dsp") and self.dsp:
             self.dsp.update_settings()
+
+    def set_rewinding(self, active: bool):
+        if active and not bool(self.config.get("emulation", "rewind_enabled", True)):
+            self.rewind_status.emit("Rewind is disabled in settings")
+            return
+        self.is_rewinding = bool(active)
+        if active:
+            self._notified_rewind_empty = False
+
+    def _push_rewind_snapshot(self, frame_idx: int):
+        raw_state = self.serialize_state_bytes()
+        if raw_state:
+            compressed = zlib.compress(raw_state, level=1)
+            self.rewind_buffer.append((frame_idx, compressed))
+
+    def _extract_video_array(self, vid_obj) -> np.ndarray:
+        if hasattr(vid_obj, "to_rgb"):
+            return vid_obj.to_rgb()
+        elif hasattr(vid_obj, "data"):
+            return np.array(vid_obj.data, copy=False)
+        return np.array(vid_obj, copy=False)
 
     def run(self):
         skip_bios = bool(self.config.get("emulation", "skip_bios"))
@@ -236,12 +268,13 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
             self.emu = Emulator(self.core_path)
             self._install_libretro_hooks()
             self.emu.load_game(self.rom_path)
+            self.load_sram_from_disk()
 
-            print(f"\n=======================================================")
+            print("\n=======================================================")
             print(f"[ROM IDENTIFICATION] Title: {self.game_title} | Code: {self.game_code}")
             print(f"[ROM IDENTIFICATION] Hardware Profile: {self.rumble_type}")
-            print(f"[RUMBLE CONFIG] Native Libretro Emulation Active")
-            print(f"=======================================================\n")
+            print("[RUMBLE CONFIG] Native Libretro Emulation Active")
+            print("=======================================================\n")
 
             self.game_identified.emit(self.game_title, self.game_code, self.rumble_type)
 
@@ -252,20 +285,20 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
         self._is_running = True
         stream = None
 
-        if not self.config.get("audio", "mute"):
-            sample_rate = 44100
-            try:
-                if hasattr(self.emu, 'av_info'):
-                    sample_rate = int(self.emu.av_info.sample_rate)
-                import sounddevice as sd
-                stream = sd.OutputStream(samplerate=sample_rate, channels=2, dtype='int16', latency='low')
-                stream.start()
-            except ImportError:
-                self.error_occurred.emit("sounddevice module missing. Audio output disabled.")
-            except Exception as e:
-                self.error_occurred.emit(f"Audio init failed: {e}")
+        # Always initialize the output stream so toggling Audio -> Mute works live mid-game
+        sample_rate = 44100
+        try:
+            if hasattr(self.emu, "av_info"):
+                sample_rate = int(self.emu.av_info.sample_rate)
+            import sounddevice as sd
+            stream = sd.OutputStream(samplerate=sample_rate, channels=2, dtype="int16", latency="low")
+            stream.start()
+        except ImportError:
+            self.error_occurred.emit("sounddevice module missing. Audio output disabled.")
+        except Exception as e:
+            self.error_occurred.emit(f"Audio init failed: {e}")
 
-        gen_source = getattr(self.emu, 'frames', getattr(self.emu, 'video_frames', None))
+        gen_source = getattr(self.emu, "frames", getattr(self.emu, "video_frames", None))
         if not gen_source:
             self.error_occurred.emit("Frame generator not found in core.")
             return
@@ -277,6 +310,40 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
         self._last_gui_render_time = time.perf_counter()
 
         while self._is_running:
+            # =================================================================
+            # REAL-TIME IN-MEMORY REWIND LOOP
+            # =================================================================
+            if self.is_rewinding:
+                if self.rewind_buffer:
+                    saved_fc, comp_bytes = self.rewind_buffer.pop()
+                    try:
+                        raw_state = zlib.decompress(comp_bytes)
+                        if self.unserialize_state_bytes(raw_state):
+                            with QMutexLocker(self.mutex):
+                                self.replay_frame_counter = saved_fc
+                                self.previous_frame = None
+                                for btn_id in list(self.standard_buttons.keys()):
+                                    if self.emu and hasattr(self.emu, "set_button"):
+                                        self.emu.set_button(0, btn_id, False)
+                                item = next(generator)
+
+                            vid_obj = item[0] if isinstance(item, tuple) else getattr(item, "video", item)
+                            frame_data = self._extract_video_array(vid_obj)
+                            self.latest_video_frame = frame_data
+                            self.frame_ready.emit(frame_data)
+                    except Exception as e:
+                        print(f"[REWIND WARNING] Step failed: {e}")
+
+                    time.sleep(0.065)
+                else:
+                    if not self._notified_rewind_empty:
+                        self.rewind_status.emit("⏪ Rewind: Start of Buffer")
+                        self._notified_rewind_empty = True
+                    time.sleep(0.03)
+
+                next_time = time.perf_counter()
+                continue
+
             if self.is_paused and not self.step_requested:
                 time.sleep(0.02)
                 next_time = time.perf_counter()
@@ -286,8 +353,13 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
             if was_single_step:
                 self.step_requested = False
 
+            # Capture snapshot right before reset so users can rewind out of an accidental reset
+            if self.reset_requested and bool(self.config.get("emulation", "rewind_enabled", True)):
+                self._push_rewind_snapshot(self.replay_frame_counter)
+
             with QMutexLocker(self.mutex):
-                if self.reset_requested and hasattr(self.emu, 'reset'):
+                if self.reset_requested and hasattr(self.emu, "reset"):
+                    self.flush_sram_to_disk()
                     self.emu.reset()
                     self.replay_frame_counter = 0
                     self.reset_requested = False
@@ -300,7 +372,7 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
 
                     for libretro_id, btn_name in ID_TO_BTN.items():
                         is_down = (btn_name in pressed_btns)
-                        if self.emu and hasattr(self.emu, 'set_button'):
+                        if self.emu and hasattr(self.emu, "set_button"):
                             self.emu.set_button(0, libretro_id, is_down)
 
                     if should_pause:
@@ -325,10 +397,10 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
 
                         if is_af_held:
                             desired = autofire_pulse or std_held
-                            if self.emu and hasattr(self.emu, 'set_button'):
+                            if self.emu and hasattr(self.emu, "set_button"):
                                 self.emu.set_button(0, libretro_id, desired)
                         else:
-                            if self.emu and hasattr(self.emu, 'set_button'):
+                            if self.emu and hasattr(self.emu, "set_button"):
                                 self.emu.set_button(0, libretro_id, std_held)
 
                 # Send Analog Tilt / Gyro Sensor Axes
@@ -336,13 +408,14 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
                     val_x = int(self.tilt_x * 32767)
                     val_y = int(self.tilt_y * 32767)
                     for stick_id in [0, 1]:
-                        for meth in ['set_analog', 'set_analog_axis', 'set_axis']:
+                        for meth in ["set_analog", "set_analog_axis", "set_axis"]:
                             if hasattr(self.emu, meth):
                                 try:
                                     getattr(self.emu, meth)(0, stick_id, 0, val_x)
                                     getattr(self.emu, meth)(0, stick_id, 1, val_y)
                                     break
-                                except Exception: pass
+                                except Exception:
+                                    pass
 
                 self.replay_frame_counter += 1
 
@@ -354,10 +427,20 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
                     print(f"Core step error: {e}")
                     break
 
+            # Push compressed rewind snapshot outside mutex lock
+            rewind_enabled = bool(self.config.get("emulation", "rewind_enabled", True))
+            rewind_interval = max(1, int(self.config.get("emulation", "rewind_interval", 10) or 10))
+            if rewind_enabled and not self.recorder.is_playing and (frame_counter % rewind_interval == 0):
+                self._push_rewind_snapshot(self.replay_frame_counter)
+
+            # Periodic SRAM battery-save persistence (~every 2 seconds)
+            if frame_counter > 0 and frame_counter % 120 == 0:
+                self.flush_sram_to_disk()
+
             if isinstance(item, tuple):
                 vid_obj, aud_obj = item[0], item[1] if len(item) > 1 else None
             else:
-                vid_obj, aud_obj = getattr(item, 'video', item), getattr(item, 'audio', None)
+                vid_obj, aud_obj = getattr(item, "video", item), getattr(item, "audio", None)
 
             # Video Processing
             frameskip = self.config.get("video", "frameskip") or 0
@@ -365,10 +448,7 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
             frame_counter += 1
 
             if render_this_frame:
-                if hasattr(vid_obj, 'to_rgb'): frame_data = vid_obj.to_rgb()
-                elif hasattr(vid_obj, 'data'): frame_data = np.array(vid_obj.data, copy=False)
-                else: frame_data = np.array(vid_obj, copy=False)
-
+                frame_data = self._extract_video_array(vid_obj)
                 self.latest_video_frame = frame_data
 
                 if self.config.get("video", "interframe_blending") and not was_single_step:
@@ -379,11 +459,6 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
                     else:
                         self.previous_frame = frame_data.copy()
 
-                # =============================================================
-                # FAST-FORWARD GUI EVENT QUEUE THROTTLING
-                # Caps display updates to ~60 FPS during fast forward so Qt's
-                # event loop is never saturated and the UI never freezes.
-                # =============================================================
                 now_ts = time.perf_counter()
                 should_emit_gui = True
                 if self.fast_forward and not was_single_step:
@@ -404,7 +479,7 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
 
             raw_audio = None
             if aud_obj is not None:
-                raw_audio = getattr(aud_obj, 'data', aud_obj)
+                raw_audio = getattr(aud_obj, "data", aud_obj)
 
             if raw_audio is not None and len(raw_audio) > 0:
                 try:
@@ -419,11 +494,6 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
                 except Exception:
                     pass
 
-            # =============================================================
-            # CLOCK PACING FOR NORMAL & FAST-FORWARD SPEED
-            # Caps emulation speed to fps_target precisely, eliminating 
-            # uncontrolled 1000+ FPS spinlocks that cause "Not Responding".
-            # =============================================================
             if not played_audio:
                 now = time.perf_counter()
                 sleep_time = next_time - now
@@ -440,10 +510,15 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
             stream.stop()
             stream.close()
 
+        # Flush final SRAM changes before tearing down the core
+        self.flush_sram_to_disk()
+
         with QMutexLocker(self.mutex):
             if self.emu:
-                if hasattr(self.emu, 'close'): self.emu.close()
-                elif hasattr(self.emu, 'unload_game'): self.emu.unload_game()
+                if hasattr(self.emu, "close"):
+                    self.emu.close()
+                elif hasattr(self.emu, "unload_game"):
+                    self.emu.unload_game()
                 self.emu = None
 
         self.stopped.emit()
@@ -451,7 +526,7 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
     def set_input(self, button_id: int, pressed: bool, port: int = 0):
         with QMutexLocker(self.mutex):
             self.standard_buttons[button_id] = pressed
-            if self.emu and hasattr(self.emu, 'set_button'):
+            if self.emu and hasattr(self.emu, "set_button"):
                 self.emu.set_button(port, button_id, pressed)
 
     def set_autofire(self, btn_name: str, pressed: bool):

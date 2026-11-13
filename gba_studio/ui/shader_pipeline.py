@@ -1,20 +1,34 @@
-# shader_manager.py
+# shader_pipeline.py
 import os
-import re
 import ctypes
 import configparser
 import numpy as np
 from OpenGL import GL
 
-from PyQt6.QtOpenGL import (QOpenGLShader, QOpenGLShaderProgram, 
-                            QOpenGLFramebufferObject, QOpenGLFramebufferObjectFormat)
-from PyQt6.QtGui import QMatrix4x4, QOpenGLContext
+from PyQt6.QtOpenGL import QOpenGLFramebufferObject, QOpenGLFramebufferObjectFormat
+from PyQt6.QtGui import QMatrix4x4
 
-from .shader_presets import *
-from .shader_types import ShaderParameter, ShaderPass
+from .shader_presets import (
+    STOCK_SHADER_GLSL,
+    GBA_COLOR_LCD_GLSL,
+    CRT_EASYMODE_GLSL,
+    SCANLINES_CLASSIC_GLSL,
+    SHARP_BILINEAR_GLSL,
+)
+from .shader_types import ShaderPass
+
+BUILTIN_SHADER_REGISTRY = {
+    "gba_color": ("GBA Color & LCD Grid", GBA_COLOR_LCD_GLSL),
+    "crt": ("CRT-Easymode", CRT_EASYMODE_GLSL),
+    "scanlines": ("Scanlines Classic", SCANLINES_CLASSIC_GLSL),
+    "sharp": ("Sharp Bilinear", SHARP_BILINEAR_GLSL),
+    "stock": ("Stock Passthrough", STOCK_SHADER_GLSL),
+}
+
 
 class RetroArchShaderManager:
     """Multi-pass RetroArch GLSL shader pipeline & preset processor."""
+
     def __init__(self, config):
         self.config = config
         self.passes = []
@@ -22,7 +36,7 @@ class RetroArchShaderManager:
         self.frame_count = 0
         self.widget = None
 
-        self.stock_pass = ShaderPass("Stock Passthrough", STOCK_SHADER_GLSL)
+        self.stock_pass = ShaderPass("Stock Passthrough", STOCK_SHADER_GLSL, builtin_id="stock")
         self.stock_pass.filter_linear = False
 
         # Native OpenGL integer handles (avoids PyQt6 QOpenGLBuffer SIP __len__ SystemError)
@@ -76,24 +90,93 @@ class RetroArchShaderManager:
         self.compile_all()
 
     def init_default_preset(self):
-        preset_name = self.config.get("shaders", "preset") or "gba_color"
-        self.load_preset_by_name(preset_name, compile_now=False)
+        if not self.load_chain_from_config(compile_now=False):
+            preset_name = self.config.get("shaders", "preset") or "gba_color"
+            self.load_preset_by_name(preset_name, compile_now=False, save_to_config=False)
 
-    def load_preset_by_name(self, name: str, compile_now: bool = True):
+    def save_chain_to_config(self):
+        """Persists current shader pass stack and parameter slider values into mgba_config.json."""
+        chain_data = []
+        for p in self.passes:
+            chain_data.append({
+                "name": p.name,
+                "builtin_id": p.builtin_id,
+                "filepath": p.filepath,
+                "filter_linear": bool(p.filter_linear),
+                "scale_type": p.scale_type,
+                "scale_factor": float(p.scale_factor),
+                "params": {k: float(v.current_val) for k, v in p.parameters.items()},
+            })
+        self.config.set("shaders", "chain", chain_data)
+
+    def load_chain_from_config(self, compile_now: bool = True) -> bool:
+        """Restores saved custom shader passes and parameter values from mgba_config.json."""
+        chain_data = self.config.get("shaders", "chain")
+        if not isinstance(chain_data, list) or not chain_data:
+            return False
+
+        restored = []
+        for entry in chain_data:
+            if not isinstance(entry, dict):
+                continue
+
+            builtin_id = str(entry.get("builtin_id") or "")
+            filepath = str(entry.get("filepath") or "")
+            p = None
+
+            if builtin_id in BUILTIN_SHADER_REGISTRY:
+                default_name, src = BUILTIN_SHADER_REGISTRY[builtin_id]
+                p = ShaderPass(entry.get("name") or default_name, src, filepath=filepath, builtin_id=builtin_id)
+            elif filepath and os.path.exists(filepath):
+                try:
+                    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+                        src = f.read()
+                    default_name = os.path.splitext(os.path.basename(filepath))[0]
+                    p = ShaderPass(entry.get("name") or default_name, src, filepath=filepath)
+                except Exception:
+                    p = None
+
+            if p is None:
+                continue
+
+            p.filter_linear = bool(entry.get("filter_linear", True))
+            p.scale_type = str(entry.get("scale_type", "viewport")).lower()
+            try:
+                p.scale_factor = float(entry.get("scale_factor", 1.0))
+            except (ValueError, TypeError):
+                p.scale_factor = 1.0
+
+            saved_params = entry.get("params", {})
+            if isinstance(saved_params, dict):
+                for k, val in saved_params.items():
+                    if k in p.parameters:
+                        try:
+                            param = p.parameters[k]
+                            param.current_val = max(param.min_val, min(param.max_val, float(val)))
+                        except (ValueError, TypeError):
+                            pass
+
+            restored.append(p)
+
+        if not restored:
+            return False
+
+        self.passes = restored
+        if compile_now:
+            self.compile_all()
+        return True
+
+    def load_preset_by_name(self, name: str, compile_now: bool = True, save_to_config: bool = True):
         self.passes.clear()
-        if name == "gba_color":
-            self.passes.append(ShaderPass("GBA Color & LCD Grid", GBA_COLOR_LCD_GLSL))
-        elif name == "crt":
-            self.passes.append(ShaderPass("CRT-Easymode", CRT_EASYMODE_GLSL))
-        elif name == "scanlines":
-            self.passes.append(ShaderPass("Scanlines Classic", SCANLINES_CLASSIC_GLSL))
-        elif name == "sharp":
-            self.passes.append(ShaderPass("Sharp Bilinear", SHARP_BILINEAR_GLSL))
-        else:
-            self.passes.append(ShaderPass("Stock Passthrough", STOCK_SHADER_GLSL))
+        label, src = BUILTIN_SHADER_REGISTRY.get(name, ("Stock Passthrough", STOCK_SHADER_GLSL))
+        pid = name if name in BUILTIN_SHADER_REGISTRY else "stock"
+        self.passes.append(ShaderPass(label, src, builtin_id=pid))
 
         if compile_now:
             self.compile_all()
+        if save_to_config:
+            self.config.set("shaders", "preset", pid)
+            self.save_chain_to_config()
 
     def compile_all(self):
         if self.widget is not None:
@@ -101,32 +184,36 @@ class RetroArchShaderManager:
         for p in self.passes:
             p.compile()
 
-    def prepend_shader(self, name: str, source: str, filepath: str = ""):
+    def prepend_shader(self, name: str, source: str, filepath: str = "", builtin_id: str = ""):
         if self.widget is not None:
             self.widget.makeCurrent()
-        p = ShaderPass(name, source, filepath)
+        p = ShaderPass(name, source, filepath=filepath, builtin_id=builtin_id)
         if p.compile():
             self.passes.insert(0, p)
+            self.save_chain_to_config()
             return True
         return False
 
-    def append_shader(self, name: str, source: str, filepath: str = ""):
+    def append_shader(self, name: str, source: str, filepath: str = "", builtin_id: str = ""):
         if self.widget is not None:
             self.widget.makeCurrent()
-        p = ShaderPass(name, source, filepath)
+        p = ShaderPass(name, source, filepath=filepath, builtin_id=builtin_id)
         if p.compile():
             self.passes.append(p)
+            self.save_chain_to_config()
             return True
         return False
 
     def remove_pass(self, index: int):
         if 0 <= index < len(self.passes):
             del self.passes[index]
+            self.save_chain_to_config()
 
     def move_pass(self, index: int, up: bool):
         target = index - 1 if up else index + 1
         if 0 <= target < len(self.passes):
             self.passes[index], self.passes[target] = self.passes[target], self.passes[index]
+            self.save_chain_to_config()
 
     def load_glsl_file(self, filepath: str, prepend: bool = False) -> bool:
         if not os.path.exists(filepath):
@@ -136,18 +223,18 @@ class RetroArchShaderManager:
 
         name = os.path.splitext(os.path.basename(filepath))[0]
         if prepend:
-            return self.prepend_shader(name, src, filepath)
+            return self.prepend_shader(name, src, filepath=filepath)
         else:
-            return self.append_shader(name, src, filepath)
+            return self.append_shader(name, src, filepath=filepath)
 
     def load_preset_file(self, filepath: str) -> bool:
         if not os.path.exists(filepath):
             return False
 
         base_dir = os.path.dirname(os.path.abspath(filepath))
-        cfg = configparser.ConfigParser(strict=False, inline_comment_prefixes=('#', ';'))
+        cfg = configparser.ConfigParser(strict=False, inline_comment_prefixes=("#", ";"))
         try:
-            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
                 content = "[root]\n" + f.read()
             cfg.read_string(content)
         except Exception as e:
@@ -173,7 +260,7 @@ class RetroArchShaderManager:
             with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
                 src = f.read()
 
-            p = ShaderPass(os.path.splitext(os.path.basename(full_path))[0], src, full_path)
+            p = ShaderPass(os.path.splitext(os.path.basename(full_path))[0], src, filepath=full_path)
             p.filter_linear = root.get(f"filter_linear{i}", "true").lower() == "true"
             p.scale_type = root.get(f"scale_type{i}", "viewport").lower()
             p.scale_factor = float(root.get(f"scale{i}", "1.0"))
@@ -186,10 +273,12 @@ class RetroArchShaderManager:
                 if p_name in root:
                     try:
                         param.current_val = float(root.get(p_name))
-                    except ValueError: pass
+                    except ValueError:
+                        pass
 
         if new_passes:
             self.passes = new_passes
+            self.save_chain_to_config()
             return True
         return False
 
@@ -276,8 +365,12 @@ class RetroArchShaderManager:
             GL.glClearColor(0.0, 0.0, 0.0, 1.0)
             GL.glClear(GL.GL_COLOR_BUFFER_BIT)
 
-            # Aspect-ratio-preserving 3:2 viewport on final screen output
-            scale = min(out_w / 240.0, out_h / 160.0)
+            integer_scaling = bool(self.config.get("video", "integer_scaling", False))
+            if integer_scaling and out_w >= 240 and out_h >= 160:
+                scale = float(max(1, min(out_w // 240, out_h // 160)))
+            else:
+                scale = min(out_w / 240.0, out_h / 160.0)
+
             vp_w = max(1, int(240.0 * scale))
             vp_h = max(1, int(160.0 * scale))
             vp_x = (out_w - vp_w) // 2
@@ -286,7 +379,8 @@ class RetroArchShaderManager:
 
         prog = shader_pass.program
         if prog is None:
-            if fbo is not None: fbo.release()
+            if fbo is not None:
+                fbo.release()
             return
 
         if self.vao_id is not None:

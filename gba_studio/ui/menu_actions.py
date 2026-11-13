@@ -1,34 +1,12 @@
-# gui.py
-import os
-import sys
-import html
-import math
-import datetime
-import numpy as np
+# menu_actions.py
+from PyQt6.QtGui import QAction, QActionGroup, QKeySequence
 
-from PyQt6.QtWidgets import (QMainWindow, QWidget, QFileDialog, QMessageBox, 
-                             QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
-                             QComboBox, QPushButton, QTextEdit, QSplitter, 
-                             QFrame, QSizePolicy)
-from PyQt6.QtGui import (QImage, QPainter, QAction, QActionGroup, QKeySequence, 
-                         QColor, QFont, QPen, QBrush)
-from PyQt6.QtCore import Qt, QTimer, QPoint, QRect, QEvent, QSize
-from PyQt6.QtOpenGLWidgets import QOpenGLWidget
-from PyQt6.QtOpenGL import QOpenGLTexture
+from ..tools.dev_tools import (
+    PaletteViewerDialog, SpriteViewerDialog, TileViewerDialog,
+    MapViewerDialog, FrameInspectorDialog, MemoryViewerDialog,
+    MemorySearchDialog, IORegisterViewerDialog
+)
 
-from ..core.core_worker import EmulatorWorker
-from .controller import ControllerManager, ControllerConfigDialog, LIBRETRO_BTNS, QT_KEY_MAP
-from ..tools.dev_tools import (PaletteViewerDialog, SpriteViewerDialog, TileViewerDialog,
-                               MapViewerDialog, FrameInspectorDialog, MemoryViewerDialog,
-                               MemorySearchDialog, IORegisterViewerDialog)
-from ..tools.ai_translator import TranslationWorker
-from .shader_manager import RetroArchShaderManager
-from .shader_dialog import ShaderConfigDialog
-from ..paths import PROJECT_ROOT
-
-
-from .video_widget import VideoGLWidget
-from .sensor_hud import SensorHudWidget
 
 class MenuBuilderMixin:
     def _create_menus(self):
@@ -36,7 +14,7 @@ class MenuBuilderMixin:
 
         # 1. FILE MENU
         file_menu = menubar.addMenu("File")
-        
+
         load_action = QAction("Load ROM...", self)
         load_action.setShortcut(QKeySequence("Ctrl+O"))
         load_action.triggered.connect(self.load_rom)
@@ -52,7 +30,7 @@ class MenuBuilderMixin:
         load_file_act = QAction("Load State from File...", self)
         load_file_act.triggered.connect(self.load_state_from_file)
         file_menu.addAction(load_file_act)
-        
+
         file_menu.addSeparator()
 
         exit_action = QAction("Exit", self)
@@ -61,7 +39,7 @@ class MenuBuilderMixin:
 
         # 2. EMULATION MENU
         emu_menu = menubar.addMenu("Emulation")
-        
+
         self.pause_action = QAction("Pause", self, checkable=True)
         self.pause_action.setShortcut(QKeySequence("Ctrl+P"))
         self.pause_action.triggered.connect(self.toggle_pause)
@@ -81,7 +59,14 @@ class MenuBuilderMixin:
         reset_action.setShortcut(QKeySequence("Ctrl+R"))
         reset_action.triggered.connect(self.reset_emulation)
         emu_menu.addAction(reset_action)
-        
+
+        emu_menu.addSeparator()
+
+        self.rewind_enabled_action = QAction("Enable Rewind Buffer (Hold: Space or `)", self, checkable=True)
+        self.rewind_enabled_action.setChecked(bool(self.config.get("emulation", "rewind_enabled", True)))
+        self.rewind_enabled_action.triggered.connect(self.toggle_rewind_enabled)
+        emu_menu.addAction(self.rewind_enabled_action)
+
         emu_menu.addSeparator()
 
         self.skip_bios_action = QAction("Skip BIOS Intro", self, checkable=True)
@@ -123,7 +108,7 @@ class MenuBuilderMixin:
         self.ff_group = QActionGroup(self)
         self.ff_group.setExclusive(True)
         self.ff_actions = {}
-        
+
         speeds = [1.5, 2.0, 3.0, 4.0, 8.0, 10.0]
         for spd in speeds:
             spd_act = QAction(f"{spd}x", self, checkable=True)
@@ -144,7 +129,7 @@ class MenuBuilderMixin:
 
         emu_menu.addSeparator()
         replay_menu = emu_menu.addMenu("Gameplay Replay & Recording")
-        
+
         self.act_record_session = QAction("⏺ Start Recording Session...", self)
         self.act_record_session.setShortcut(QKeySequence("Ctrl+Shift+R"))
         self.act_record_session.triggered.connect(self.toggle_session_recording)
@@ -174,7 +159,10 @@ class MenuBuilderMixin:
         self.solar_actions = {}
 
         for lvl in range(11):
-            act = QAction(f"Sun Level {lvl}" + (" (Maximum)" if lvl == 10 else (" (Dark)" if lvl == 0 else "")), self, checkable=True)
+            act = QAction(
+                f"Sun Level {lvl}" + (" (Maximum)" if lvl == 10 else (" (Dark)" if lvl == 0 else "")),
+                self, checkable=True
+            )
             act.triggered.connect(lambda checked, l=lvl: self.set_solar_level(l))
             self.solar_group.addAction(act)
             solar_menu.addAction(act)
@@ -261,12 +249,23 @@ class MenuBuilderMixin:
             vol_menu.addAction(act)
             self.vol_actions[vol] = act
 
-        # 5. VIDEO MENU (Shaders, Geometry Scaling, Filters)
+        # 5. VIDEO MENU (Shaders, Fullscreen, Geometry Scaling, Filters)
         video_menu = menubar.addMenu("Video")
+
+        self.fullscreen_action = QAction("Fullscreen (Alt+Enter / F11)", self, checkable=True)
+        self.fullscreen_action.triggered.connect(self.toggle_fullscreen)
+        video_menu.addAction(self.fullscreen_action)
+
+        self.integer_scale_action = QAction("Integer Scaling Only", self, checkable=True)
+        self.integer_scale_action.setChecked(bool(self.config.get("video", "integer_scaling", False)))
+        self.integer_scale_action.triggered.connect(self.toggle_integer_scaling)
+        video_menu.addAction(self.integer_scale_action)
+
+        video_menu.addSeparator()
 
         # RetroArch Shaders Submenu
         shader_menu = video_menu.addMenu("RetroArch Shaders")
-        
+
         self.act_shader_toggle = QAction("Enable Shaders", self, checkable=True)
         self.act_shader_toggle.setChecked(self.shader_manager.enabled)
         self.act_shader_toggle.triggered.connect(self.toggle_shaders)
@@ -316,10 +315,10 @@ class MenuBuilderMixin:
         screenshot_action.setShortcut(QKeySequence("F12"))
         screenshot_action.triggered.connect(self.take_screenshot)
         video_menu.addAction(screenshot_action)
-        
+
         video_menu.addSeparator()
 
-        # Scale Factor Menu with Exclusive Selection & Clean 3:2 Geometric Resizing
+        # Scale Factor Menu
         scale_menu = video_menu.addMenu("Window Scale")
         self.scale_group = QActionGroup(self)
         self.scale_group.setExclusive(True)
@@ -358,7 +357,7 @@ class MenuBuilderMixin:
 
         # 7. TRANSLATION MENU
         translation_menu = menubar.addMenu("Translation")
-        
+
         ai_trans_act = QAction("⚡ Translate Screen with AI (Hotkey: T)", self)
         ai_trans_act.setShortcut(QKeySequence("T"))
         ai_trans_act.triggered.connect(self.trigger_ai_translation)
@@ -381,9 +380,9 @@ class MenuBuilderMixin:
         font_tools_act = QAction("Font Studio & TTF Generator...", self)
         font_tools_act.triggered.connect(self.open_font_tools)
         translation_menu.addAction(font_tools_act)
-        
+
         translation_menu.addSeparator()
-        
+
         self.ruler_action = QAction("Screen Pixel Ruler Overlay", self, checkable=True)
         self.ruler_action.triggered.connect(self.toggle_pixel_ruler)
         translation_menu.addAction(self.ruler_action)
@@ -405,8 +404,7 @@ class MenuBuilderMixin:
         tools_menu.addSeparator()
         tools_menu.addAction("Configure Controls & Motion Feedback...", self.open_controller_config)
         tools_menu.addSeparator()
-        
+
         reset_settings_act = QAction("Reset Settings to Default...", self)
         reset_settings_act.triggered.connect(self.reset_settings_to_default)
         tools_menu.addAction(reset_settings_act)
-

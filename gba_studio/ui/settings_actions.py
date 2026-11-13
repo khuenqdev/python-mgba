@@ -1,39 +1,14 @@
-# gui.py
-import os
-import sys
-import html
-import math
-import datetime
-import numpy as np
+# settings_actions.py
+from PyQt6.QtWidgets import QMessageBox
 
-from PyQt6.QtWidgets import (QMainWindow, QWidget, QFileDialog, QMessageBox, 
-                             QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
-                             QComboBox, QPushButton, QTextEdit, QSplitter, 
-                             QFrame, QSizePolicy)
-from PyQt6.QtGui import (QImage, QPainter, QAction, QActionGroup, QKeySequence, 
-                         QColor, QFont, QPen, QBrush)
-from PyQt6.QtCore import Qt, QTimer, QPoint, QRect, QEvent, QSize
-from PyQt6.QtOpenGLWidgets import QOpenGLWidget
-from PyQt6.QtOpenGL import QOpenGLTexture
+from .controller import ControllerConfigDialog
+from ..tools.dev_tools import MemoryViewerDialog
 
-from ..core.core_worker import EmulatorWorker
-from .controller import ControllerManager, ControllerConfigDialog, LIBRETRO_BTNS, QT_KEY_MAP
-from ..tools.dev_tools import (PaletteViewerDialog, SpriteViewerDialog, TileViewerDialog,
-                               MapViewerDialog, FrameInspectorDialog, MemoryViewerDialog,
-                               MemorySearchDialog, IORegisterViewerDialog)
-from ..tools.ai_translator import TranslationWorker
-from .shader_manager import RetroArchShaderManager
-from .shader_dialog import ShaderConfigDialog
-from ..paths import PROJECT_ROOT
-
-
-from .video_widget import VideoGLWidget
-from .sensor_hud import SensorHudWidget
 
 class SettingsActionsMixin:
     def _sync_ui_with_config(self):
         self.mute_action.setChecked(bool(self.config.get("audio", "mute")))
-        
+
         lpf = str(self.config.get("audio", "low_pass_filter") or "medium").lower()
         if lpf in self.lpf_actions:
             self.lpf_actions[lpf].setChecked(True)
@@ -51,8 +26,11 @@ class SettingsActionsMixin:
         self.vol_actions[closest_vol].setChecked(True)
 
         self.skip_bios_action.setChecked(bool(self.config.get("emulation", "skip_bios")))
+        self.rewind_enabled_action.setChecked(bool(self.config.get("emulation", "rewind_enabled", True)))
         self.blend_action.setChecked(bool(self.config.get("video", "interframe_blending")))
+        self.integer_scale_action.setChecked(bool(self.config.get("video", "integer_scaling", False)))
         self.pause_unfocus_action.setChecked(bool(self.config.get("emulation", "pause_on_unfocus", True)))
+        self.act_shader_toggle.setChecked(bool(self.config.get("shaders", "enabled", False)))
 
         self.current_slot = int(self.config.get("emulation", "state_slot") or 1)
         if self.current_slot in self.slot_actions:
@@ -115,19 +93,22 @@ class SettingsActionsMixin:
         self.config.set("audio", "mute", self.mute_action.isChecked())
         if self.worker:
             self.worker.update_audio_settings()
-        self.video_widget.show_osd("Audio settings applied")
+        self.video_widget.show_osd("Audio Muted" if self.mute_action.isChecked() else "Audio Unmuted")
 
     def reset_settings_to_default(self):
         confirm = QMessageBox.question(
             self, "Reset Settings",
-            "Are you sure you want to reset all settings, controls, sensors, and audio options back to default?",
+            "Are you sure you want to reset all settings, controls, sensors, shaders, and audio options back to default?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No
         )
         if confirm == QMessageBox.StandardButton.Yes:
             self.config.reset_to_defaults()
+            self.shader_manager.enabled = False
+            self.shader_manager.load_preset_by_name("gba_color", compile_now=True, save_to_config=False)
             self._sync_ui_with_config()
             self.update_recent_menu()
+            self.video_widget.update()
             if self.worker:
                 self.worker.update_audio_settings()
             self.video_widget.show_osd("Settings Reset to Default")

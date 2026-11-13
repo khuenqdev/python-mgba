@@ -5,16 +5,16 @@ Condenses the emulator codebase into a single AI-friendly context document.
 """
 
 import os
-import sys
 import argparse
 from datetime import datetime
 from pathlib import Path
 
-# Directories to skip completely (large assets, caches, virtualenvs)
+# Directories to skip completely (large assets, caches, virtualenvs, third-party shaders)
 DEFAULT_IGNORE_DIRS = {
     ".git", "__pycache__", ".venv", "venv", "env", "ENV",
     "models", "screenshots", "exports", "replays", "states",
-    "saves", "translations", "build", "dist", ".idea", ".vscode"
+    "saves", "translations", "shaders", "roms", "cheats",
+    "samples", "build", "dist", ".idea", ".vscode"
 }
 
 # Binary, asset, and large model extensions to ignore
@@ -30,86 +30,118 @@ DEFAULT_IGNORE_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".ico", ".wav", ".mp3", ".ogg"
 }
 
-# Files that should never be bundled (sensitive secrets, self, output)
+# Files that should never be bundled (sensitive secrets, self, generated lists)
 DEFAULT_IGNORE_FILES = {
     ".env", ".env.local", ".env.production",
-    "bundle_codebase.py"
+    "bundle_codebase.py",
+    "codebase_structure.txt",
+    "codebase_files.txt",
 }
 
 # File extensions prioritized for inclusion
 VALID_TEXT_EXTENSIONS = {
-    ".py", ".json", ".txt", ".md", ".yml", ".yaml", ".ini", ".cfg", ".toml", ".gitignore", ".sh", ".bat", ".ps1"
+    ".py", ".json", ".txt", ".md", ".yml", ".yaml",
+    ".ini", ".cfg", ".toml", ".sh", ".bat", ".ps1"
 }
 
+EXACT_TEXT_FILENAMES = {".gitignore", ".env.sample", "LICENSE"}
 
-def is_binary_file(filepath: Path) -> bool:
-    """Quick heuristic check to ensure binary content is never written into text context."""
+
+def is_binary_file(filepath: Path, sample_size: int = 8192) -> bool:
+    """
+    Detect binary files using raw bytes instead of the OS locale encoding,
+    so UTF-8/Japanese/Vietnamese text in .py files is never falsely rejected on Windows.
+    """
     try:
-        with open(filepath, "tr") as check_file:
-            check_file.read(1024)
+        with open(filepath, "rb") as check_file:
+            chunk = check_file.read(sample_size)
+        if not chunk:
             return False
-    except UnicodeDecodeError:
-        return True
-    except Exception:
+        if b"\x00" in chunk:
+            return True
+
+        # Check for non-text ASCII control bytes (excluding \a, \b, \t, \n, \f, \r, ESC)
+        control_chars = set(range(0, 32)) - {7, 8, 9, 10, 12, 13, 27}
+        non_text = sum(1 for b in chunk if b in control_chars)
+        return (non_text / len(chunk)) > 0.10
+    except OSError:
         return True
 
 
 def build_tree_structure(root_dir: Path, collected_files: list[Path]) -> str:
-    """Builds a visual directory tree showing only bundled files."""
-    tree_lines = [f"{root_dir.resolve().name}/"]
-    rel_paths = sorted([f.relative_to(root_dir) for f in collected_files])
+    """Builds a properly nested visual directory tree showing only bundled files."""
+    tree: dict = {}
+    for f in collected_files:
+        parts = f.relative_to(root_dir).parts
+        node = tree
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node[parts[-1]] = None
 
-    for p in rel_paths:
-        parts = p.parts
-        indent = "  " * len(parts)
-        tree_lines.append(f"{indent}├── {parts[-1]}")
+    lines = [f"{root_dir.resolve().name}/"]
 
-    return "\n".join(tree_lines)
+    def _render(node: dict, prefix: str = "") -> None:
+        # Directories first, then files (case-insensitive)
+        items = sorted(node.items(), key=lambda kv: (kv[1] is None, kv[0].lower()))
+        for idx, (name, child) in enumerate(items):
+            is_last = idx == len(items) - 1
+            connector = "└── " if is_last else "├── "
+            if child is not None:
+                lines.append(f"{prefix}{connector}{name}/")
+                extension = "    " if is_last else "│   "
+                _render(child, prefix + extension)
+            else:
+                lines.append(f"{prefix}{connector}{name}")
+
+    _render(tree)
+    return "\n".join(lines)
 
 
 def bundle_project(root_dir: Path, output_file: Path, max_file_size_kb: int = 500):
     root_dir = root_dir.resolve()
+    output_resolved = output_file.resolve()
     collected_files: list[Path] = []
+    skipped_files: list[tuple[Path, str]] = []
 
     # 1. Walk directory and filter eligible text files
     for root, dirs, files in os.walk(root_dir):
-        # In-place modify dirs to skip ignored folders recursively
-        dirs[:] = [d for d in dirs if d not in DEFAULT_IGNORE_DIRS]
+        dirs[:] = sorted(d for d in dirs if d not in DEFAULT_IGNORE_DIRS)
 
-        for file_name in files:
+        for file_name in sorted(files):
             file_path = Path(root) / file_name
 
-            # Skip self, output file, and secret files
-            if file_name in DEFAULT_IGNORE_FILES or file_path.resolve() == output_file.resolve():
+            # Skip self, output file, and secret/generated files
+            if file_name in DEFAULT_IGNORE_FILES or file_path.resolve() == output_resolved:
                 continue
 
-            # Skip by extension
             ext = file_path.suffix.lower()
             if ext in DEFAULT_IGNORE_EXTENSIONS:
                 continue
 
-            # Target source code and config extensions (or files like .gitignore)
-            if ext not in VALID_TEXT_EXTENSIONS and file_name != ".gitignore":
+            if ext not in VALID_TEXT_EXTENSIONS and file_name not in EXACT_TEXT_FILENAMES:
                 continue
 
-            # Skip oversized files (> 500 KB)
+            # Skip oversized files
             try:
-                if file_path.stat().st_size > (max_file_size_kb * 1024):
+                size_bytes = file_path.stat().st_size
+                if size_bytes > (max_file_size_kb * 1024):
+                    skipped_files.append((file_path.relative_to(root_dir), f"exceeds {max_file_size_kb} KB ({size_bytes / 1024:.1f} KB)"))
                     continue
-            except OSError:
+            except OSError as e:
+                skipped_files.append((file_path.relative_to(root_dir), f"stat error: {e}"))
                 continue
 
-            # Final check against binary content
+            # Safe binary check
             if is_binary_file(file_path):
+                skipped_files.append((file_path.relative_to(root_dir), "detected as binary"))
                 continue
 
             collected_files.append(file_path)
 
-    collected_files.sort(key=lambda p: (str(p.parent), p.name))
+    collected_files.sort(key=lambda p: p.relative_to(root_dir).as_posix().lower())
 
     # 2. Write formatted AI Context document
     total_lines = 0
-    file_stats = []
 
     with open(output_file, "w", encoding="utf-8") as out:
         out.write("=" * 80 + "\n")
@@ -141,7 +173,6 @@ def bundle_project(root_dir: Path, output_file: Path, max_file_size_kb: int = 50
                     content = inf.read()
                     line_count = len(content.splitlines())
                     total_lines += line_count
-                    file_stats.append((str(rel), line_count))
 
                     out.write(f"--- START OF FILE {rel} ---\n\n")
                     out.write(content.rstrip() + "\n\n")
@@ -149,7 +180,7 @@ def bundle_project(root_dir: Path, output_file: Path, max_file_size_kb: int = 50
             except Exception as e:
                 out.write(f"# [Error reading {rel}: {e}]\n\n")
 
-    return collected_files, total_lines
+    return collected_files, skipped_files, total_lines
 
 
 def main():
@@ -163,14 +194,21 @@ def main():
     output_path = Path(args.output).resolve()
 
     print(f"[*] Scanning codebase in: {root_path.resolve()}...")
-    files, total_lines = bundle_project(root_path, output_path, args.max_size)
+    files, skipped, total_lines = bundle_project(root_path, output_path, args.max_size)
 
+    py_count = sum(1 for f in files if f.suffix.lower() == ".py")
     file_size_kb = output_path.stat().st_size / 1024
+
     print("\n[+] Bundling complete!")
     print(f"    - Output: {output_path}")
-    print(f"    - Files included: {len(files)}")
+    print(f"    - Files included: {len(files)} ({py_count} Python files)")
     print(f"    - Total lines of code: {total_lines:,}")
     print(f"    - Bundle size: {file_size_kb:.1f} KB")
+
+    if skipped:
+        print(f"\n[!] Skipped {len(skipped)} eligible text file(s):")
+        for path, reason in skipped:
+            print(f"    - {path} ({reason})")
 
 
 if __name__ == "__main__":

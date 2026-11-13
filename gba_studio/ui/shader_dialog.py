@@ -1,11 +1,12 @@
 # shader_dialog.py
 import os
-from PyQt6.QtWidgets import (QDialog, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QLabel, QPushButton, QComboBox, QCheckBox, 
-                             QTableWidget, QTableWidgetItem, QHeaderView, 
-                             QScrollArea, QFileDialog, QMessageBox, QDoubleSpinBox, 
-                             QSlider, QGroupBox, QMenu, QSplitter)
-from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import (
+    QDialog, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QComboBox, QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView,
+    QScrollArea, QFileDialog, QMessageBox, QDoubleSpinBox, QSlider,
+    QGroupBox, QMenu, QSplitter
+)
+from PyQt6.QtCore import Qt, QTimer
 
 BUILTIN_SHADERS = [
     ("GBA Color & LCD Grid", "gba_color"),
@@ -18,6 +19,7 @@ BUILTIN_SHADERS = [
 
 class ShaderConfigDialog(QDialog):
     """RetroArch-style shader pass chain manager and real-time parameter tuner."""
+
     def __init__(self, shader_manager, video_widget, config, parent=None):
         super().__init__(parent)
         self.sm = shader_manager
@@ -26,6 +28,11 @@ class ShaderConfigDialog(QDialog):
 
         self.setWindowTitle("RetroArch Shaders & Parameter Studio")
         self.resize(880, 560)
+
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(250)
+        self._save_timer.timeout.connect(self.sm.save_chain_to_config)
 
         self._init_ui()
         self.refresh_passes_table()
@@ -160,6 +167,7 @@ class ShaderConfigDialog(QDialog):
     def on_filter_changed(self, pass_idx: int, is_linear: bool):
         if 0 <= pass_idx < len(self.sm.passes):
             self.sm.passes[pass_idx].filter_linear = is_linear
+            self.sm.save_chain_to_config()
             if self.vw:
                 self.vw.update()
 
@@ -172,11 +180,11 @@ class ShaderConfigDialog(QDialog):
             else:
                 p.scale_type = "source"
                 p.scale_factor = float(combo_idx)
+            self.sm.save_chain_to_config()
             if self.vw:
                 self.vw.update()
 
     def refresh_parameters_ui(self):
-        # Clear previous parameter widgets
         while self.layout_params.count():
             item = self.layout_params.takeAt(0)
             widget = item.widget()
@@ -192,7 +200,7 @@ class ShaderConfigDialog(QDialog):
             grp = QGroupBox(f"Pass {pass_idx}: {p.name}")
             grp_layout = QVBoxLayout(grp)
 
-            for p_name, param in p.parameters.items():
+            for _, param in p.parameters.items():
                 row = QHBoxLayout()
 
                 lbl = QLabel(param.desc or param.name)
@@ -200,12 +208,10 @@ class ShaderConfigDialog(QDialog):
                 lbl.setMinimumWidth(130)
                 row.addWidget(lbl)
 
-                # Slider
                 steps = max(1, int(round((param.max_val - param.min_val) / param.step_val)))
                 slider = QSlider(Qt.Orientation.Horizontal)
                 slider.setRange(0, steps)
 
-                # Value SpinBox
                 spin = QDoubleSpinBox()
                 spin.setRange(param.min_val, param.max_val)
                 spin.setSingleStep(param.step_val)
@@ -213,11 +219,9 @@ class ShaderConfigDialog(QDialog):
                 spin.setDecimals(3)
                 spin.setFixedWidth(75)
 
-                # Set current slider position
                 cur_step = int(round((param.current_val - param.min_val) / param.step_val))
                 slider.setValue(max(0, min(steps, cur_step)))
 
-                # Connect signals for real-time live preview
                 def make_handlers(target_param, s_widget, sp_widget, st_count):
                     def on_slider(val):
                         new_val = target_param.min_val + (val * target_param.step_val)
@@ -225,6 +229,7 @@ class ShaderConfigDialog(QDialog):
                         sp_widget.blockSignals(True)
                         sp_widget.setValue(new_val)
                         sp_widget.blockSignals(False)
+                        self._save_timer.start()
                         if self.vw:
                             self.vw.update()
 
@@ -234,6 +239,7 @@ class ShaderConfigDialog(QDialog):
                         s_widget.blockSignals(True)
                         s_widget.setValue(max(0, min(st_count, step_idx)))
                         s_widget.blockSignals(False)
+                        self._save_timer.start()
                         if self.vw:
                             self.vw.update()
 
@@ -269,22 +275,12 @@ class ShaderConfigDialog(QDialog):
         menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
 
     def add_builtin_shader(self, preset_id: str, prepend: bool):
-        from .shader_presets import (GBA_COLOR_LCD_GLSL, CRT_EASYMODE_GLSL,
-                                    SCANLINES_CLASSIC_GLSL, SHARP_BILINEAR_GLSL, 
-                                    STOCK_SHADER_GLSL)
-        shader_map = {
-            "gba_color": ("GBA Color & LCD Grid", GBA_COLOR_LCD_GLSL),
-            "crt": ("CRT-Easymode", CRT_EASYMODE_GLSL),
-            "scanlines": ("Scanlines Classic", SCANLINES_CLASSIC_GLSL),
-            "sharp": ("Sharp Bilinear", SHARP_BILINEAR_GLSL),
-            "stock": ("Stock Passthrough", STOCK_SHADER_GLSL)
-        }
-
-        name, src = shader_map.get(preset_id, ("Shader", STOCK_SHADER_GLSL))
+        from .shader_pipeline import BUILTIN_SHADER_REGISTRY
+        name, src = BUILTIN_SHADER_REGISTRY.get(preset_id, BUILTIN_SHADER_REGISTRY["stock"])
         if prepend:
-            self.sm.prepend_shader(name, src)
+            self.sm.prepend_shader(name, src, builtin_id=preset_id)
         else:
-            self.sm.append_shader(name, src)
+            self.sm.append_shader(name, src, builtin_id=preset_id)
 
         self.refresh_passes_table()
         self.refresh_parameters_ui()
@@ -332,6 +328,7 @@ class ShaderConfigDialog(QDialog):
         for p in self.sm.passes:
             for param in p.parameters.values():
                 param.current_val = param.default_val
+        self.sm.save_chain_to_config()
         self.refresh_parameters_ui()
         if self.vw:
             self.vw.update()
@@ -357,3 +354,9 @@ class ShaderConfigDialog(QDialog):
         if filepath:
             self.sm.save_preset_file(filepath)
             QMessageBox.information(self, "Preset Saved", f"Successfully exported preset to:\n{filepath}")
+
+    def done(self, result):
+        if self._save_timer.isActive():
+            self._save_timer.stop()
+        self.sm.save_chain_to_config()
+        super().done(result)

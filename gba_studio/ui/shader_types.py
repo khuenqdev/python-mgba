@@ -1,14 +1,9 @@
-# shader_manager.py
-import os
+# shader_types.py
 import re
-import ctypes
-import configparser
-import numpy as np
-from OpenGL import GL
 
-from PyQt6.QtOpenGL import (QOpenGLShader, QOpenGLShaderProgram, 
-                            QOpenGLFramebufferObject, QOpenGLFramebufferObjectFormat)
-from PyQt6.QtGui import QMatrix4x4, QOpenGLContext
+from PyQt6.QtOpenGL import QOpenGLShader, QOpenGLShaderProgram
+from PyQt6.QtGui import QOpenGLContext
+
 
 class ShaderParameter:
     def __init__(self, name: str, desc: str, default_val: float, min_val: float, max_val: float, step_val: float):
@@ -22,10 +17,11 @@ class ShaderParameter:
 
 
 class ShaderPass:
-    def __init__(self, name: str, source: str, filepath: str = ""):
+    def __init__(self, name: str, source: str, filepath: str = "", builtin_id: str = ""):
         self.name = name
         self.source = source
         self.filepath = filepath
+        self.builtin_id = builtin_id
         self.filter_linear = True
         self.scale_type = "viewport"
         self.scale_factor = 1.0
@@ -39,7 +35,14 @@ class ShaderPass:
         pattern = r'#pragma\s+parameter\s+(\w+)\s+"([^"]+)"\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)'
         matches = re.findall(pattern, self.source)
         for m in matches:
-            p = ShaderParameter(name=m[0], desc=m[1], default_val=m[2], min_val=m[3], max_val=m[4], step_val=m[5])
+            p = ShaderParameter(
+                name=m[0],
+                desc=m[1],
+                default_val=m[2],
+                min_val=m[3],
+                max_val=m[4],
+                step_val=m[5]
+            )
             self.parameters[p.name] = p
 
     def compile(self) -> bool:
@@ -51,8 +54,8 @@ class ShaderPass:
             self.program = None
 
         program = QOpenGLShaderProgram()
-        clean_source = re.sub(r'#pragma\s+parameter[^\n]*\n?', '', self.source)
-        declared_params = set(re.findall(r'uniform\s+float\s+(\w+)\s*;', clean_source))
+        clean_source = re.sub(r"#pragma\s+parameter[^\n]*\n?", "", self.source)
+        declared_params = set(re.findall(r"uniform\s+float\s+(\w+)\s*;", clean_source))
 
         v_prefix = "#version 120\n#define VERTEX 1\n#define PARAMETER_UNIFORM 1\n"
         for p in self.parameters.values():
@@ -85,5 +88,3 @@ class ShaderPass:
 
         self.program = program
         return True
-
-

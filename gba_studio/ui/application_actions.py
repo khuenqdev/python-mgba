@@ -1,34 +1,13 @@
-# gui.py
+# application_actions.py
 import os
-import sys
 import html
-import math
-import datetime
-import numpy as np
 
-from PyQt6.QtWidgets import (QMainWindow, QWidget, QFileDialog, QMessageBox, 
-                             QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
-                             QComboBox, QPushButton, QTextEdit, QSplitter, 
-                             QFrame, QSizePolicy)
-from PyQt6.QtGui import (QImage, QPainter, QAction, QActionGroup, QKeySequence, 
-                         QColor, QFont, QPen, QBrush)
-from PyQt6.QtCore import Qt, QTimer, QPoint, QRect, QEvent, QSize
-from PyQt6.QtOpenGLWidgets import QOpenGLWidget
-from PyQt6.QtOpenGL import QOpenGLTexture
+from PyQt6.QtWidgets import QFileDialog, QMessageBox
+from PyQt6.QtGui import QAction
 
-from ..core.core_worker import EmulatorWorker
-from .controller import ControllerManager, ControllerConfigDialog, LIBRETRO_BTNS, QT_KEY_MAP
-from ..tools.dev_tools import (PaletteViewerDialog, SpriteViewerDialog, TileViewerDialog,
-                               MapViewerDialog, FrameInspectorDialog, MemoryViewerDialog,
-                               MemorySearchDialog, IORegisterViewerDialog)
 from ..tools.ai_translator import TranslationWorker
-from .shader_manager import RetroArchShaderManager
 from .shader_dialog import ShaderConfigDialog
-from ..paths import PROJECT_ROOT
 
-
-from .video_widget import VideoGLWidget
-from .sensor_hud import SensorHudWidget
 
 class ApplicationActionsMixin:
     def open_shader_dialog(self):
@@ -54,8 +33,54 @@ class ApplicationActionsMixin:
         self.video_widget.update()
         self.video_widget.show_osd(f"Preset Applied: {preset_id.replace('_', ' ').title()}")
 
+    def toggle_fullscreen(self):
+        if not self.isFullScreen():
+            self._pre_fs_geometry = self.saveGeometry()
+            self._pre_fs_splitter = self.splitter.sizes()
+            self._pre_fs_hud_visible = self.sensor_hud.isVisible()
+            self._pre_fs_trans_visible = self.translation_panel.isVisible()
+
+            self.menuBar().hide()
+            self.sensor_hud.hide()
+            self.translation_panel.hide()
+            self.showFullScreen()
+            self.fullscreen_action.setChecked(True)
+            self.video_widget.setFocus()
+            self.video_widget.show_osd("Fullscreen (Alt+Enter / F11 / Esc to exit)", 2500)
+        else:
+            self.showNormal()
+            self.menuBar().show()
+            self.sensor_hud.setVisible(bool(getattr(self, "_pre_fs_hud_visible", True)))
+            self.translation_panel.setVisible(bool(getattr(self, "_pre_fs_trans_visible", True)))
+
+            if getattr(self, "_pre_fs_splitter", None):
+                self.splitter.setSizes(self._pre_fs_splitter)
+            if getattr(self, "_pre_fs_geometry", None):
+                self.restoreGeometry(self._pre_fs_geometry)
+
+            self.fullscreen_action.setChecked(False)
+            self.video_widget.setFocus()
+            self.video_widget.show_osd("Windowed Mode", 1500)
+
+    def toggle_integer_scaling(self):
+        val = self.integer_scale_action.isChecked()
+        self.config.set("video", "integer_scaling", val)
+        self.video_widget.update()
+        self.video_widget.show_osd(f"Integer Scaling: {'ON' if val else 'OFF'}")
+
+    def toggle_rewind_enabled(self):
+        val = self.rewind_enabled_action.isChecked()
+        self.config.set("emulation", "rewind_enabled", val)
+        if not val and self.worker:
+            self.worker.set_rewinding(False)
+            self.worker.rewind_buffer.clear()
+        self.video_widget.show_osd(f"Rewind Buffer: {'ON' if val else 'OFF'}")
+
     def set_scale(self, scale: int):
         """Applies exact GBA 3:2 geometric scaling with zero pillarboxing and full persistence."""
+        if self.isFullScreen():
+            self.toggle_fullscreen()
+
         self.scale_factor = scale
         self.config.set("video", "scale", scale)
         if scale in self.scale_actions:
@@ -69,7 +94,7 @@ class ApplicationActionsMixin:
 
         self.splitter.setSizes([video_h, hud_h, panel_h])
         self.resize(video_w, total_h)
-        
+
         self.config.set("video", "window_width", video_w)
         self.config.set("video", "window_height", total_h)
         self.config.set("video", "splitter_sizes", [video_h, hud_h, panel_h])
@@ -87,8 +112,12 @@ class ApplicationActionsMixin:
     def toggle_sensor_hud(self):
         val = self.act_sensor_hud.isChecked()
         self.config.set("sensors", "show_hud", val)
-        self.sensor_hud.setVisible(val)
 
+        if self.isFullScreen():
+            self._pre_fs_hud_visible = val
+            return
+
+        self.sensor_hud.setVisible(val)
         sizes = self.splitter.sizes()
         if len(sizes) == 3:
             sizes[1] = 30 if val else 0
@@ -151,7 +180,7 @@ class ApplicationActionsMixin:
             if json_path:
                 self.video_widget.show_osd(f"Saved Replay: {os.path.basename(json_path)}", 4000)
                 QMessageBox.information(
-                    self, "Session Recorded", 
+                    self, "Session Recorded",
                     f"Gameplay session and initial snapshot saved successfully!\n\n"
                     f"Replay File (AI-Friendly JSON):\n{json_path}"
                 )
@@ -163,7 +192,7 @@ class ApplicationActionsMixin:
 
         replays_dir = self.config.get("paths", "replays") or "replays"
         os.makedirs(replays_dir, exist_ok=True)
-        
+
         filepath, _ = QFileDialog.getOpenFileName(
             self, "Load Replay Session", replays_dir, "Replay Files (*.replay.json *.json)"
         )
@@ -175,7 +204,7 @@ class ApplicationActionsMixin:
             self.video_widget.show_osd(f"▶ REPLAYING: {os.path.basename(filepath)}", 3000)
         else:
             QMessageBox.critical(
-                self, "Replay Error", 
+                self, "Replay Error",
                 "Failed to start replay. Ensure the corresponding .state file exists in the same folder."
             )
 

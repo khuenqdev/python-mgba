@@ -1,41 +1,24 @@
-# gui.py
+# runtime_actions.py
 import os
-import sys
-import html
-import math
+import hashlib
+import zipfile
+import tempfile
 import datetime
-import numpy as np
 
-from PyQt6.QtWidgets import (QMainWindow, QWidget, QFileDialog, QMessageBox, 
-                             QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
-                             QComboBox, QPushButton, QTextEdit, QSplitter, 
-                             QFrame, QSizePolicy)
-from PyQt6.QtGui import (QImage, QPainter, QAction, QActionGroup, QKeySequence, 
-                         QColor, QFont, QPen, QBrush)
-from PyQt6.QtCore import Qt, QTimer, QPoint, QRect, QEvent, QSize
-from PyQt6.QtOpenGLWidgets import QOpenGLWidget
-from PyQt6.QtOpenGL import QOpenGLTexture
+from PyQt6.QtWidgets import QFileDialog, QMessageBox
 
 from ..core.core_worker import EmulatorWorker
-from .controller import ControllerManager, ControllerConfigDialog, LIBRETRO_BTNS, QT_KEY_MAP
-from ..tools.dev_tools import (PaletteViewerDialog, SpriteViewerDialog, TileViewerDialog,
-                               MapViewerDialog, FrameInspectorDialog, MemoryViewerDialog,
-                               MemorySearchDialog, IORegisterViewerDialog)
-from ..tools.ai_translator import TranslationWorker
-from .shader_manager import RetroArchShaderManager
-from .shader_dialog import ShaderConfigDialog
-from ..paths import PROJECT_ROOT
+from .controller import LIBRETRO_BTNS, QT_KEY_MAP
 
+SUPPORTED_ROM_EXTS = (".gba", ".gb", ".gbc", ".sgb")
 
-from .video_widget import VideoGLWidget
-from .sensor_hud import SensorHudWidget
 
 class RuntimeActionsMixin:
     def _build_keymap(self):
         self.keymap = {}
         self.autofire_keymap = {}
         keyboard_cfg = self.config.get("input", "keyboard") or {}
-        
+
         for gba_btn, user_key in keyboard_cfg.items():
             if gba_btn in LIBRETRO_BTNS:
                 qt_key = QT_KEY_MAP.get(str(user_key).lower())
@@ -50,11 +33,43 @@ class RuntimeActionsMixin:
                     self.autofire_keymap[qt_key] = af_btn.replace("autofire_", "")
 
     def poll_gamepad(self):
-        if self.worker and hasattr(self, 'is_running') and self.is_running:
+        if self.worker and hasattr(self, "is_running") and self.is_running:
             self.controller_manager.poll_gamepad_events(self.worker)
 
+    def _extract_zip_rom(self, zip_path: str) -> str:
+        """Extracts the first supported ROM inside a .zip archive into a temp cache."""
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            candidates = [
+                zi for zi in zf.infolist()
+                if not zi.is_dir()
+                and not zi.filename.startswith("__MACOSX/")
+                and zi.filename.lower().endswith(SUPPORTED_ROM_EXTS)
+            ]
+            if not candidates:
+                raise ValueError("No supported ROM (.gba, .gb, .gbc, .sgb) found inside the ZIP archive.")
+
+            candidates.sort(key=lambda zi: (0 if zi.filename.lower().endswith(".gba") else 1, zi.filename.lower()))
+            target = candidates[0]
+
+            zip_hash = hashlib.md5(os.path.abspath(zip_path).encode("utf-8")).hexdigest()[:12]
+            cache_dir = os.path.join(tempfile.gettempdir(), "gba_studio_rom_cache", zip_hash)
+            os.makedirs(cache_dir, exist_ok=True)
+
+            safe_name = os.path.basename(target.filename)
+            extracted_path = os.path.join(cache_dir, safe_name)
+
+            if not os.path.exists(extracted_path) or os.path.getsize(extracted_path) != target.file_size:
+                with zf.open(target, "r") as src, open(extracted_path, "wb") as dst:
+                    while True:
+                        chunk = src.read(65536)
+                        if not chunk:
+                            break
+                        dst.write(chunk)
+
+            return extracted_path
+
     def load_rom(self):
-        filters = "Supported ROMs (*.gba *.gb *.gbc *.sgb *.zip);;GBA ROMs (*.gba);;GB/GBC ROMs (*.gb *.gbc);;All Files (*.*)"
+        filters = "Supported ROMs (*.gba *.gb *.gbc *.sgb *.zip);;GBA ROMs (*.gba);;GB/GBC ROMs (*.gb *.gbc);;ZIP Archives (*.zip);;All Files (*.*)"
         filepath, _ = QFileDialog.getOpenFileName(self, "Load Game", "", filters)
         if filepath:
             self.load_rom_file(filepath)
@@ -63,7 +78,17 @@ class RuntimeActionsMixin:
         if not os.path.exists(filepath):
             QMessageBox.warning(self, "File Error", f"ROM not found:\n{filepath}")
             return
-        self.current_rom = filepath
+
+        boot_path = filepath
+        if filepath.lower().endswith(".zip"):
+            try:
+                boot_path = self._extract_zip_rom(filepath)
+            except (zipfile.BadZipFile, ValueError, OSError) as e:
+                QMessageBox.warning(self, "ZIP Error", f"Failed to load ZIP ROM:\n{e}")
+                return
+
+        self.source_rom = filepath
+        self.current_rom = boot_path
         self.config.add_recent_file(filepath)
         self.update_recent_menu()
         self.start_emulation()
@@ -77,21 +102,28 @@ class RuntimeActionsMixin:
             self.worker.stop()
             self.worker.wait()
 
-        self.worker = EmulatorWorker(self.core_path, self.current_rom, self.config)
+        save_base = os.path.splitext(os.path.basename(self.current_rom))[0]
+        self.worker = EmulatorWorker(
+            self.core_path,
+            self.current_rom,
+            self.config,
+            save_base_name=save_base,
+        )
         self.worker.frame_ready.connect(self.video_widget.set_frame)
         self.worker.error_occurred.connect(self.handle_error)
         self.worker.replay_finished.connect(self.on_replay_finished)
-        
+        self.worker.rewind_status.connect(self.video_widget.show_osd)
+
         self.worker.rumble_triggered.connect(self.sensor_hud.on_rumble_triggered)
         self.worker.rumble_triggered.connect(self.controller_manager.trigger_rumble)
         self.worker.solar_changed.connect(self.sensor_hud.on_solar_updated)
         self.worker.tilt_changed.connect(self.sensor_hud.on_tilt_updated)
         self.worker.game_identified.connect(self.sensor_hud.on_game_identified)
         self.worker.game_identified.connect(self.on_game_identified)
-        
+
         self.worker.fast_forward = self.ff_action.isChecked()
         self.worker.is_paused = self.pause_action.isChecked()
-        
+
         self.worker.start()
         self.is_running = True
 
@@ -118,7 +150,9 @@ class RuntimeActionsMixin:
         if self.worker:
             self.worker.fast_forward = self.ff_action.isChecked()
             spd = float(self.config.get("emulation", "fast_forward_ratio") or 2.0)
-            self.video_widget.show_osd(f"Fast Forward: {'ON (' + str(spd) + 'x)' if self.worker.fast_forward else 'OFF'}")
+            self.video_widget.show_osd(
+                f"Fast Forward: {'ON (' + str(spd) + 'x)' if self.worker.fast_forward else 'OFF'}"
+            )
 
     def cycle_ff_speed(self, forward: bool = True):
         speeds = [1.5, 2.0, 3.0, 4.0, 8.0, 10.0]
@@ -168,7 +202,7 @@ class RuntimeActionsMixin:
         os.makedirs(out_dir, exist_ok=True)
         filename = f"screenshot_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
         from PIL import Image
-        Image.fromarray(self.video_widget.current_frame_data, 'RGB').save(os.path.join(out_dir, filename))
+        Image.fromarray(self.video_widget.current_frame_data, "RGB").save(os.path.join(out_dir, filename))
         self.video_widget.show_osd("Screenshot Captured!")
 
     def get_state_path(self, slot: int):
@@ -213,4 +247,3 @@ class RuntimeActionsMixin:
         if filepath:
             self.worker.load_state(filepath)
             self.video_widget.show_osd(f"Loaded: {os.path.basename(filepath)}")
-
