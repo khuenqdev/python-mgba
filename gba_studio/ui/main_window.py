@@ -336,6 +336,9 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
                 if event.key() == Qt.Key.Key_I:
                     self.input_overlay_action.trigger()
                     return
+                if event.key() == Qt.Key.Key_O:
+                    self.act_trans_overlay.trigger()
+                    return
 
         if not self.worker:
             return

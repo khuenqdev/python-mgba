@@ -107,7 +107,6 @@ class RuntimeActionsMixin:
                     sz.extract(path=stage_dir, targets=[target.filename])
                     staged_file = os.path.join(stage_dir, target.filename)
                     if not os.path.exists(staged_file):
-                        # Fallback search inside stage_dir
                         for root_dir, _, files in os.walk(stage_dir):
                             if safe_name in files:
                                 staged_file = os.path.join(root_dir, safe_name)
@@ -212,9 +211,9 @@ class RuntimeActionsMixin:
             self.worker.stop()
             self.worker.wait()
 
-        # Reset back to Global settings before probing the new ROM header
         self.config.deactivate_profile()
         self.video_widget.set_input_hud("IDLE", 0, 0, 0)
+        self.video_widget.clear_translation_boxes()
 
         save_base = os.path.splitext(os.path.basename(self.current_rom))[0]
         self.worker = EmulatorWorker(
@@ -224,7 +223,6 @@ class RuntimeActionsMixin:
             save_base_name=save_base,
         )
 
-        # Load Per-Game Profile if one exists for this ROM's game_code / ID
         profile_id = self.worker.get_profile_id()
         profile_loaded = self.config.activate_profile_if_exists(profile_id, title=self.worker.game_title)
         self._apply_effective_config_to_runtime()

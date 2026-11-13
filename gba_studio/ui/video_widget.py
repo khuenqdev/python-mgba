@@ -3,7 +3,7 @@ import math
 import numpy as np
 
 from PyQt6.QtWidgets import QSizePolicy
-from PyQt6.QtGui import QPainter, QColor, QFont, QPen
+from PyQt6.QtGui import QPainter, QColor, QFont, QFontMetrics, QPen
 from PyQt6.QtCore import Qt, QTimer, QPoint, QSize, QRect
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 
@@ -50,8 +50,11 @@ class VideoGLWidget(QOpenGLWidget):
         self.input_hud_max_frame = 0
         self.input_hud_mask = 0
 
-        # Clip Recording Badge (e.g. "● REC GIF 00:04")
+        # Clip Recording Badge
         self.clip_rec_label = ""
+
+        # Fullscreen Floating Subtitle Overlay State
+        self.subtitle_boxes = []
 
         # Pixel Ruler State
         self.ruler_enabled = False
@@ -106,6 +109,19 @@ class VideoGLWidget(QOpenGLWidget):
         self.clip_rec_label = label
         self.update()
 
+    def set_translation_boxes(self, boxes: list):
+        self.subtitle_boxes = list(boxes or [])
+        parent_win = self.window()
+        if parent_win and parent_win.isFullScreen():
+            self.update()
+
+    def clear_translation_boxes(self):
+        if self.subtitle_boxes:
+            self.subtitle_boxes = []
+            parent_win = self.window()
+            if parent_win and parent_win.isFullScreen():
+                self.update()
+
     def _get_viewport_transform(self) -> tuple[float, float, float]:
         """Returns (logical_scale, offset_x, offset_y) matching the GL viewport."""
         dpr = self.devicePixelRatioF() or 1.0
@@ -123,9 +139,20 @@ class VideoGLWidget(QOpenGLWidget):
         oy = (self.height() - (160.0 * scale)) / 2.0
         return scale, ox, oy
 
-    def _draw_input_hud(self, painter: QPainter):
+    def _is_input_hud_visible(self) -> bool:
         show_always = bool(self.sm.config.get("video", "show_input_overlay", False)) if self.sm and self.sm.config else False
-        if self.input_hud_mode == "IDLE" and not show_always:
+        return (self.input_hud_mode != "IDLE") or show_always
+
+    @staticmethod
+    def _make_font(families: list[str], pt_size: int, weight: QFont.Weight) -> QFont:
+        f = QFont()
+        f.setFamilies(families)
+        f.setPointSize(pt_size)
+        f.setWeight(weight)
+        return f
+
+    def _draw_input_hud(self, painter: QPainter):
+        if not self._is_input_hud_visible():
             return
 
         compact = self.width() < 400
@@ -134,7 +161,7 @@ class VideoGLWidget(QOpenGLWidget):
         pad_x = 4 if compact else 7
         gap = 2 if compact else 4
 
-        font = QFont("Cascadia Code, Consolas, Courier New, monospace", font_sz, QFont.Weight.Bold)
+        font = self._make_font(["Cascadia Code", "Consolas", "Courier New", "Monospace"], font_sz, QFont.Weight.Bold)
         painter.setFont(font)
         fm = painter.fontMetrics()
 
@@ -170,7 +197,11 @@ class VideoGLWidget(QOpenGLWidget):
 
         py = by + 4
         painter.setPen(status_col)
-        painter.drawText(QRect(bx + pad_x, py, status_w, pill_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, status_txt)
+        painter.drawText(
+            QRect(bx + pad_x, py, status_w, pill_h),
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+            status_txt,
+        )
 
         cx = bx + pad_x + status_w + 4
         for (bit_idx, lbl), pw in zip(OVERLAY_BUTTON_LABELS, pill_widths):
@@ -193,7 +224,7 @@ class VideoGLWidget(QOpenGLWidget):
     def _draw_clip_badge(self, painter: QPainter):
         if not self.clip_rec_label:
             return
-        font = QFont("Cascadia Code, Consolas, Courier New, monospace", 9, QFont.Weight.Bold)
+        font = self._make_font(["Cascadia Code", "Consolas", "Courier New", "Monospace"], 9, QFont.Weight.Bold)
         painter.setFont(font)
         fm = painter.fontMetrics()
         tw = fm.horizontalAdvance(self.clip_rec_label) + 16
@@ -204,6 +235,139 @@ class VideoGLWidget(QOpenGLWidget):
         painter.drawRoundedRect(rect, 5, 5)
         painter.setPen(QColor(255, 110, 110))
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, self.clip_rec_label)
+
+    def _build_subtitle_layout(self, inner_max_w: int, shrink_pt: int = 0):
+        families = ["Segoe UI", "Meiryo", "Arial", "Sans Serif"]
+        sp_pt = max(9, min(15, int(self.height() / 76)) - shrink_pt)
+        dlg_pt = max(10, min(18, int(self.height() / 62)) - shrink_pt)
+        tag_pt = max(9, min(15, int(self.height() / 72)) - shrink_pt)
+
+        speaker_font = self._make_font(families, sp_pt, QFont.Weight.Bold)
+        dialogue_font = self._make_font(families, dlg_pt, QFont.Weight.Bold)
+        tag_font = self._make_font(families, tag_pt, QFont.Weight.DemiBold)
+
+        fm_speaker = QFontMetrics(speaker_font)
+        fm_dialogue = QFontMetrics(dialogue_font)
+        fm_tag = QFontMetrics(tag_font)
+
+        entries = []
+        used_w = 0
+
+        for b in self.subtitle_boxes:
+            trans = (getattr(b, "translated", "") or "").strip()
+            if not trans:
+                continue
+
+            cat = getattr(b, "category", "dialogue")
+            sp_orig = (getattr(b, "speaker_orig", "") or "").strip()
+            sp_trans = (getattr(b, "speaker_trans", "") or "").strip()
+
+            if cat == "dialogue":
+                if sp_trans and sp_orig and sp_trans.lower() != sp_orig.lower():
+                    sp_line = f"💬 {sp_trans} ({sp_orig})"
+                elif sp_trans or sp_orig:
+                    sp_line = f"💬 {sp_trans or sp_orig}"
+                else:
+                    sp_line = ""
+
+                if sp_line:
+                    sp_rect = fm_speaker.boundingRect(
+                        QRect(0, 0, inner_max_w, 2000),
+                        Qt.TextFlag.TextWordWrap,
+                        sp_line,
+                    )
+                    entries.append((speaker_font, QColor(255, 213, 79), sp_line, sp_rect.height() + 2, 2))
+                    used_w = max(used_w, sp_rect.width() + 8)
+
+                body_rect = fm_dialogue.boundingRect(
+                    QRect(0, 0, inner_max_w, 2000),
+                    Qt.TextFlag.TextWordWrap,
+                    trans,
+                )
+                entries.append((dialogue_font, QColor(235, 245, 255), trans, body_rect.height() + 2, 7))
+                used_w = max(used_w, body_rect.width() + 8)
+
+            elif cat == "menu":
+                line = f"[MENU] {trans}"
+                t_rect = fm_tag.boundingRect(
+                    QRect(0, 0, inner_max_w, 2000),
+                    Qt.TextFlag.TextWordWrap,
+                    line,
+                )
+                entries.append((tag_font, QColor(129, 199, 132), line, t_rect.height() + 2, 4))
+                used_w = max(used_w, t_rect.width() + 8)
+
+            else:
+                line = f"[LABEL] {trans}"
+                t_rect = fm_tag.boundingRect(
+                    QRect(0, 0, inner_max_w, 2000),
+                    Qt.TextFlag.TextWordWrap,
+                    line,
+                )
+                entries.append((tag_font, QColor(255, 213, 79), line, t_rect.height() + 2, 4))
+                used_w = max(used_w, t_rect.width() + 8)
+
+        if not entries:
+            return [], 0, 0
+
+        total_h = sum(item_h + gap for _, _, _, item_h, gap in entries[:-1]) + entries[-1][3]
+        return entries, used_w, total_h
+
+    def _draw_subtitle_overlay(self, painter: QPainter):
+        """Renders floating AI translation subtitles ONLY when in Fullscreen mode."""
+        parent_win = self.window()
+        if not parent_win or not parent_win.isFullScreen():
+            return
+
+        overlay_enabled = bool(self.sm.config.get("ai_translation", "overlay_enabled", True)) if self.sm and self.sm.config else True
+        if not overlay_enabled or not self.subtitle_boxes:
+            return
+
+        max_box_w = max(280, min(int(self.width() * 0.82), 1040))
+        pad_x = 18
+        pad_y = 14
+        inner_max_w = max_box_w - (pad_x * 2)
+        max_allowed_h = int(self.height() * 0.72)
+
+        entries, used_w, total_h = self._build_subtitle_layout(inner_max_w, shrink_pt=0)
+        for shrink in (2, 4, 6):
+            if not entries or (total_h + pad_y * 2) <= max_allowed_h:
+                break
+            entries, used_w, total_h = self._build_subtitle_layout(inner_max_w, shrink_pt=shrink)
+
+        if not entries:
+            return
+
+        box_w = min(max_box_w, max(260, used_w + (pad_x * 2)))
+        box_h = min(max_allowed_h, total_h + (pad_y * 2))
+
+        bottom_margin = 48 if self._is_input_hud_visible() else 20
+        bx = (self.width() - box_w) // 2
+        by = max(16, self.height() - box_h - bottom_margin)
+
+        painter.setPen(QPen(QColor(100, 150, 220, 195), 2))
+        painter.setBrush(QColor(12, 16, 24, 224))
+        painter.drawRoundedRect(bx, by, box_w, box_h, 10, 10)
+
+        painter.save()
+        content_rect = QRect(bx + pad_x, by + pad_y, box_w - (pad_x * 2), box_h - (pad_y * 2))
+        painter.setClipRect(content_rect)
+
+        cur_y = by + pad_y
+        draw_w = box_w - (pad_x * 2)
+        for font, color, text, item_h, gap in entries:
+            if cur_y >= by + box_h - pad_y:
+                break
+            painter.setFont(font)
+            painter.setPen(color)
+            painter.drawText(
+                QRect(bx + pad_x, cur_y, draw_w, item_h),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.TextWordWrap,
+                text,
+            )
+            cur_y += item_h + gap
+
+        painter.restore()
 
     def paintGL(self):
         from OpenGL import GL
@@ -274,6 +438,7 @@ class VideoGLWidget(QOpenGLWidget):
 
         self._draw_clip_badge(painter)
         self._draw_input_hud(painter)
+        self._draw_subtitle_overlay(painter)
 
         # Global OSD Message (Top-Right)
         if self.osd_text:

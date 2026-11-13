@@ -1,33 +1,24 @@
-# ai_translator.py
+# vision.py
 import os
-import csv
 import json
 import re
-import ssl
-import glob
 import io
 import time
 import base64
-import statistics
 import urllib.request
-import urllib.parse
 import urllib.error
 import numpy as np
-import cv2
 from PIL import Image
 
-from PyQt6.QtCore import QThread, pyqtSignal
-from ...paths import PROJECT_ROOT
-
-# =============================================================================
-# 1. ENVIRONMENT CONFIGURATION & SECURITY (.env LOADER)
-# =============================================================================
 from .engines import (
     LANG_NAMES,
     _GAME_CRITERIA_CACHE,
     UNIVERSAL_GBA_CRITERIA,
     _has_meaningful_text,
 )
+
+_LAST_GROQ_CALL_TIME = 0.0
+
 
 class TranslatedBox:
     """Represents a categorized UI text element ('dialogue', 'menu', or 'label')."""
@@ -270,8 +261,3 @@ def run_groq_vision(frame_data: np.ndarray, src_lang: str, tgt_lang: str, api_ke
             continue
 
     return None, None
-
-
-# =============================================================================
-# 5. OFFLINE SPATIAL LAYOUT CLASSIFIER & BATCH TRANSLATOR (MeikiOCR Fallback)
-# =============================================================================

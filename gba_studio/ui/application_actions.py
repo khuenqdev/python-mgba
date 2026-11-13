@@ -11,6 +11,16 @@ from .state_browser import SaveStateBrowserDialog
 
 
 class ApplicationActionsMixin:
+    def toggle_translation_overlay(self):
+        val = self.act_trans_overlay.isChecked()
+        self.config.set("ai_translation", "overlay_enabled", val)
+        self.video_widget.update()
+        self.video_widget.show_osd(f"Fullscreen Subtitle Overlay: {'ON' if val else 'OFF'}")
+
+    def clear_translation_subtitles(self):
+        self.translation_panel.clear()
+        self.video_widget.clear_translation_boxes()
+
     def _apply_effective_config_to_runtime(self):
         """Re-applies active config (Global or Per-Game Profile) to shaders, audio, sensors, and UI."""
         self.shader_manager.enabled = bool(self.config.get("shaders", "enabled", False))
@@ -212,6 +222,7 @@ class ApplicationActionsMixin:
             self.showFullScreen()
             self.fullscreen_action.setChecked(True)
             self.video_widget.setFocus()
+            self.video_widget.update()
             self.video_widget.show_osd("Fullscreen (Alt+Enter / F11 / Esc to exit)", 2500)
         else:
             self.showNormal()
@@ -226,6 +237,7 @@ class ApplicationActionsMixin:
 
             self.fullscreen_action.setChecked(False)
             self.video_widget.setFocus()
+            self.video_widget.update()
             self.video_widget.show_osd("Windowed Mode", 1500)
 
     def toggle_integer_scaling(self):
@@ -403,6 +415,8 @@ class ApplicationActionsMixin:
         self.trans_worker.start()
 
     def on_ai_translation_finished(self, boxes: list, msg: str):
+        self.video_widget.set_translation_boxes(boxes or [])
+
         if boxes:
             blocks_html = []
             for b in boxes:

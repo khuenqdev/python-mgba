@@ -412,8 +412,14 @@ class MenuBuilderMixin:
         ai_trans_act.triggered.connect(self.trigger_ai_translation)
         translation_menu.addAction(ai_trans_act)
 
+        self.act_trans_overlay = QAction("Fullscreen Floating Subtitle Overlay", self, checkable=True)
+        self.act_trans_overlay.setShortcut(QKeySequence("Ctrl+Shift+O"))
+        self.act_trans_overlay.setChecked(bool(self.config.get("ai_translation", "overlay_enabled", True)))
+        self.act_trans_overlay.triggered.connect(self.toggle_translation_overlay)
+        translation_menu.addAction(self.act_trans_overlay)
+
         clear_panel_act = QAction("Clear Subtitle Panel", self)
-        clear_panel_act.triggered.connect(self.translation_panel.clear)
+        clear_panel_act.triggered.connect(self.clear_translation_subtitles)
         translation_menu.addAction(clear_panel_act)
 
         ai_cfg_act = QAction("Configure AI Translation...", self)

@@ -1,0 +1,6 @@
+- Use Hán-Việt for East Asian or historical terms; retain Japanese romaji for unique Zoids names.
+- Map Japanese honorifics (san, senpai) to appropriate Vietnamese pronouns (anh, chị, em) based on age and rank.
+- Adapt dialogue tone to match character archetypes, using formal speech for elders and casual speech for peers.
+- Keep UI and menu labels concise, using standard Vietnamese gaming terminology to save screen space.
+- Ensure cultural references are localized for Vietnamese audiences while preserving original narrative intent.
+- Maintain consistency in terminology across all text assets, including cutscenes, manuals, and in-game descriptions.
