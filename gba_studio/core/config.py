@@ -7,7 +7,7 @@ import datetime
 
 CONFIG_FILE = "mgba_config.json"
 
-GLOBAL_ONLY_TOP_SECTIONS = {"recent_files", "paths"}
+GLOBAL_ONLY_TOP_SECTIONS = {"recent_files", "paths", "netplay"}
 GLOBAL_ONLY_KEY_PAIRS = {
     ("video", "window_width"),
     ("video", "window_height"),
@@ -24,7 +24,8 @@ DEFAULT_CONFIG = {
         "low_pass_filter": "medium",
         "stereo_widener": True,
         "bass_boost": False,
-        "soft_limiter": True
+        "soft_limiter": True,
+        "fast_forward_pitch_corrected": True
     },
     "emulation": {
         "skip_bios": True,
@@ -65,6 +66,13 @@ DEFAULT_CONFIG = {
         "source_lang": "ja",
         "target_lang": "vi",
         "overlay_enabled": True
+    },
+    "netplay": {
+        "host": "127.0.0.1",
+        "port": 5738,
+        "mode": "lockstep",
+        "frame_delay": 1,
+        "player_name": "Player"
     },
     "recent_files": [],
     "paths": {

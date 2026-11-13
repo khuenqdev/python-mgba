@@ -1,16 +1,12 @@
-# hex_editor.py
-import os
+# hex_dialog.py
 import struct
-import numpy as np
 
-from PyQt6.QtWidgets import (QDialog, QWidget, QAbstractScrollArea, QVBoxLayout, 
-                             QHBoxLayout, QLabel, QPushButton, QComboBox, QLineEdit, 
-                             QSplitter, QCheckBox, QSpinBox, QMenu, QMessageBox, 
-                             QFileDialog, QTableWidget, QTableWidgetItem, QHeaderView, 
-                             QGroupBox, QFrame)
-from PyQt6.QtGui import (QPainter, QColor, QFont, QFontMetrics, QPen, QBrush, 
-                         QKeySequence, QAction, QClipboard)
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QRect
+from PyQt6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
+    QLineEdit, QSplitter, QCheckBox, QSpinBox, QMessageBox,
+    QFileDialog, QFrame
+)
+from PyQt6.QtCore import Qt, QTimer
 
 # GBA Memory Region Definitions
 GBA_REGIONS = {
@@ -23,19 +19,20 @@ GBA_REGIONS = {
     "SRAM (32 KB)   - 0x0E000000": ("SRAM", 0x0E000000, 32 * 1024)
 }
 
-
 from .hex_canvas import VirtualHexCanvas
 from .data_inspector import DataInspectorWidget
+from .watch_table import WatchTablePanel
+
 
 class HexEditorDialog(QDialog):
-    """Full-featured Hex Editor & Forensic Analyzer (ImHex / HxD Replica)."""
+    """Full-featured Hex Editor, Watch Table & Write Watchpoint Studio."""
 
     def __init__(self, worker, config, parent=None):
         super().__init__(parent)
         self.worker = worker
         self.config = config
-        self.setWindowTitle("Interactive Hex Editor & Memory Studio")
-        self.resize(1150, 720)
+        self.setWindowTitle("Interactive Hex Editor, Watch Table & Watchpoint Studio")
+        self.resize(1180, 820)
 
         self.current_region_name = "EWRAM"
         self.current_base_addr = 0x02000000
@@ -43,7 +40,6 @@ class HexEditorDialog(QDialog):
         self._init_ui()
         self._load_active_region()
 
-        # Live RAM Watch Timer
         self.live_timer = QTimer(self)
         self.live_timer.timeout.connect(self.poll_live_memory)
 
@@ -59,16 +55,15 @@ class HexEditorDialog(QDialog):
         self.region_combo.currentIndexChanged.connect(self.on_region_changed)
         top_bar.addWidget(self.region_combo)
 
-        top_bar.addWidget(QLabel("Goto Offset:"))
+        top_bar.addWidget(QLabel("Goto:"))
         self.jump_edit = QLineEdit("0x02000000")
-        self.jump_edit.setFixedWidth(100)
+        self.jump_edit.setFixedWidth(95)
         top_bar.addWidget(self.jump_edit)
 
         btn_go = QPushButton("Go")
         btn_go.clicked.connect(self.on_jump_click)
         top_bar.addWidget(btn_go)
 
-        top_bar.addSpacing(10)
         self.cb_live = QCheckBox("⚡ Live Watch")
         self.cb_live.toggled.connect(self.toggle_live_watch)
         top_bar.addWidget(self.cb_live)
@@ -79,9 +74,19 @@ class HexEditorDialog(QDialog):
         self.spin_poll.setSuffix(" ms")
         top_bar.addWidget(self.spin_poll)
 
+        btn_pin_watch = QPushButton("📌 Pin Cursor")
+        btn_pin_watch.setStyleSheet("background-color: #1976D2; color: white; font-weight: bold;")
+        btn_pin_watch.clicked.connect(self.pin_cursor_to_watch)
+        top_bar.addWidget(btn_pin_watch)
+
+        btn_set_wp = QPushButton("🎯 Watchpoint")
+        btn_set_wp.setStyleSheet("background-color: #C62828; color: white; font-weight: bold;")
+        btn_set_wp.clicked.connect(self.set_watchpoint_at_cursor)
+        top_bar.addWidget(btn_set_wp)
+
         top_bar.addStretch()
 
-        self.btn_write = QPushButton("💾 Write Changes to RAM")
+        self.btn_write = QPushButton("💾 Write Changes")
         self.btn_write.setStyleSheet("background-color: #2E7D32; color: white; font-weight: bold; padding: 5px 10px;")
         self.btn_write.clicked.connect(self.commit_changes)
         top_bar.addWidget(self.btn_write)
@@ -92,23 +97,31 @@ class HexEditorDialog(QDialog):
 
         main_layout.addLayout(top_bar)
 
-        # 2. Main Body Splitter: Virtual Hex Canvas on Left + Data Inspector on Right
-        splitter = QSplitter(Qt.Orientation.Horizontal)
+        # 2. Outer Vertical Splitter: (Hex + Data Inspector) on top, Watch Table / Watchpoints below
+        outer_splitter = QSplitter(Qt.Orientation.Vertical)
 
+        h_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.hex_canvas = VirtualHexCanvas(self)
         self.hex_canvas.cursor_changed.connect(self.on_cursor_moved)
         self.hex_canvas.data_modified.connect(self.update_status_bar)
-        splitter.addWidget(self.hex_canvas)
+        h_splitter.addWidget(self.hex_canvas)
 
         self.inspector = DataInspectorWidget(self)
         self.inspector.jump_requested.connect(self.jump_to_address)
-        splitter.addWidget(self.inspector)
+        h_splitter.addWidget(self.inspector)
 
-        splitter.setStretchFactor(0, 4)
-        splitter.setStretchFactor(1, 1)
-        main_layout.addWidget(splitter)
+        h_splitter.setStretchFactor(0, 4)
+        h_splitter.setStretchFactor(1, 1)
+        outer_splitter.addWidget(h_splitter)
 
-        # 3. Find & Replace Bottom Dock (Expandable)
+        self.watch_panel = WatchTablePanel(self.worker, self.config, self)
+        outer_splitter.addWidget(self.watch_panel)
+        outer_splitter.setStretchFactor(0, 3)
+        outer_splitter.setStretchFactor(1, 2)
+
+        main_layout.addWidget(outer_splitter)
+
+        # 3. Find Bottom Dock
         self.search_bar = QFrame()
         self.search_bar.setFrameShape(QFrame.Shape.StyledPanel)
         sb_layout = QHBoxLayout(self.search_bar)
@@ -137,9 +150,20 @@ class HexEditorDialog(QDialog):
         self.status_label.setStyleSheet("font-family: monospace; font-size: 11px; color: #90A4AE; padding: 2px;")
         main_layout.addWidget(self.status_label)
 
-    # =========================================================================
-    # Region Switching & Live Watching
-    # =========================================================================
+    def pin_cursor_to_watch(self):
+        abs_addr = self.current_base_addr + self.hex_canvas.cursor_pos
+        s, e = self.hex_canvas.get_selection_range()
+        sel_len = max(1, (e - s) + 1)
+        dtype = "uint8" if sel_len == 1 else ("uint16" if sel_len == 2 else ("uint32" if sel_len == 4 else "uint16"))
+        self.watch_panel.add_watch_entry(abs_addr, label=f"{self.current_region_name} 0x{abs_addr:08X}", dtype=dtype)
+
+    def set_watchpoint_at_cursor(self):
+        abs_addr = self.current_base_addr + self.hex_canvas.cursor_pos
+        s, e = self.hex_canvas.get_selection_range()
+        sel_len = max(1, (e - s) + 1)
+        width = 1 if sel_len == 1 else (4 if sel_len >= 4 else 2)
+        self.watch_panel.add_watchpoint_entry(abs_addr, width=width, label=f"WP 0x{abs_addr:08X}")
+
     def on_region_changed(self):
         reg_str = self.region_combo.currentText()
         reg_name, base_addr, _ = GBA_REGIONS[reg_str]
@@ -149,7 +173,8 @@ class HexEditorDialog(QDialog):
         self._load_active_region()
 
     def _load_active_region(self):
-        if not self.worker: return
+        if not self.worker:
+            return
         raw_mem = self.worker.get_memory_region(self.current_region_name)
         if raw_mem is not None:
             self.hex_canvas.set_buffer(raw_mem, self.current_base_addr)
@@ -171,14 +196,12 @@ class HexEditorDialog(QDialog):
             self.status_label.setText("Live watch stopped.")
 
     def poll_live_memory(self):
-        if not self.worker: return
+        if not self.worker:
+            return
         raw = self.worker.get_memory_region(self.current_region_name)
         if raw:
             self.hex_canvas.update_live_buffer(raw)
 
-    # =========================================================================
-    # Navigation & Actions
-    # =========================================================================
     def on_jump_click(self):
         try:
             val = int(self.jump_edit.text(), 16)
@@ -218,18 +241,14 @@ class HexEditorDialog(QDialog):
             f"Total Size: {len(self.hex_canvas.data):,} bytes"
         )
 
-    # =========================================================================
-    # Memory Writing & Exporting
-    # =========================================================================
     def commit_changes(self):
-        """Flushes all modified bytes directly into active emulator RAM or ROM."""
         if not self.worker or not self.hex_canvas.modified_map:
             QMessageBox.information(self, "Notice", "No modifications to commit.")
             return
 
         if self.current_region_name == "ROM":
             reply = QMessageBox.question(
-                self, "Save Modified ROM", 
+                self, "Save Modified ROM",
                 "Save changes directly to a new .gba file on disk?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
@@ -255,15 +274,13 @@ class HexEditorDialog(QDialog):
                 f.write(self.hex_canvas.data)
             QMessageBox.information(self, "Exported", f"Saved binary file to:\n{filepath}")
 
-    # =========================================================================
-    # Search Engine
-    # =========================================================================
     def _get_search_pattern(self) -> bytes:
         query = self.search_edit.text().strip()
-        if not query: return None
+        if not query:
+            return None
 
         if self.cb_search_text.isChecked():
-            return query.encode('latin-1', errors='ignore')
+            return query.encode("latin-1", errors="ignore")
         else:
             clean = query.replace(" ", "").replace(",", "").replace("0x", "")
             try:
@@ -273,13 +290,14 @@ class HexEditorDialog(QDialog):
 
     def find_next(self):
         pat = self._get_search_pattern()
-        if not pat: return
+        if not pat:
+            return
 
         data = bytes(self.hex_canvas.data)
         start_pos = self.hex_canvas.cursor_pos + 1
         pos = data.find(pat, start_pos)
         if pos == -1:
-            pos = data.find(pat, 0)  # Wrap around
+            pos = data.find(pat, 0)
 
         if pos != -1:
             self.hex_canvas.set_cursor(pos)
@@ -291,12 +309,13 @@ class HexEditorDialog(QDialog):
 
     def find_prev(self):
         pat = self._get_search_pattern()
-        if not pat: return
+        if not pat:
+            return
 
         data = bytes(self.hex_canvas.data)
         pos = data.rfind(pat, 0, max(0, self.hex_canvas.cursor_pos))
         if pos == -1:
-            pos = data.rfind(pat)  # Wrap around
+            pos = data.rfind(pat)
 
         if pos != -1:
             self.hex_canvas.set_cursor(pos)
@@ -307,6 +326,8 @@ class HexEditorDialog(QDialog):
             QMessageBox.information(self, "Not Found", "Pattern not found.")
 
     def closeEvent(self, event):
-        if hasattr(self, 'live_timer'):
+        if hasattr(self, "live_timer"):
             self.live_timer.stop()
+        if hasattr(self, "watch_panel"):
+            self.watch_panel.stop_timers()
         event.accept()

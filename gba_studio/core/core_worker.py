@@ -14,7 +14,13 @@ except ImportError:
 from pdretro import Emulator
 from .cheats import CheatEngine
 from .audio_dsp import AudioDSP
-from .session_recorder import SessionRecorder, ID_TO_BTN
+from .watchpoints import WatchTableAndWatchpointEngine
+from .session_recorder import (
+    SessionRecorder,
+    ID_TO_BTN,
+    TAS_BUTTON_ORDER,
+    tas_mask_to_buttons,
+)
 
 AF_TO_LIBRETRO = {
     "a": 8,
@@ -70,19 +76,31 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
     tilt_changed = pyqtSignal(float, float, float)
     game_identified = pyqtSignal(str, str, str)
 
-    def __init__(self, core_path: str, rom_path: str, config, save_base_name: str = None):
+    # TAS Timeline Signals
+    tas_seek_completed = pyqtSignal(int, bytes)
+    tas_greenzone_captured = pyqtSignal(int, bytes)
+    tas_frame_recorded = pyqtSignal(int, int)
+
+    # Watchpoint Hit Signal
+    watchpoint_hit = pyqtSignal(dict)
+
+    def __init__(self, core_path: str, rom_path: str, config, save_base_name: str = None, netplay=None):
         super().__init__()
         self.core_path = os.path.abspath(core_path)
         self.rom_path = os.path.abspath(rom_path) if rom_path else ""
         self.config = config
         self.save_base_name = save_base_name
+        self.netplay = netplay
 
         self.emu = None
         self._is_running = False
         self.fast_forward = False
+        self._was_fast_forward = False
         self.is_paused = False
         self.step_requested = False
         self.reset_requested = False
+
+        self._tas_seek_req = None
 
         # Rewind State
         buf_max = max(30, int(self.config.get("emulation", "rewind_buffer_size", 300) or 300))
@@ -92,6 +110,7 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
 
         self.mutex = QMutexClass()
         self.cheat_engine = CheatEngine(self)
+        self.watch_engine = WatchTableAndWatchpointEngine(self)
         self.dsp = AudioDSP(self.config)
 
         self.recorder = SessionRecorder()
@@ -131,14 +150,12 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
             b"current_dir": b"."
         }
 
-        # Read Cartridge Header (0xAC: Game Code, 0xA0: Title)
         self.game_code = "UNKNOWN"
         self.game_title = "Unknown"
         self.rumble_type = "None"
         self._parse_rom_header()
 
     def get_profile_id(self) -> str:
-        """Returns a stable identifier for per-game config profiles."""
         if self.game_code and self.game_code not in ("UNKNOWN", ""):
             return self.game_code
         if self.save_base_name:
@@ -168,7 +185,6 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
             pass
 
     def _libretro_environ_cb(self, cmd: int, data: int) -> bool:
-        """Acts as the Libretro environment provider, configuring mGBA natively."""
         if cmd == RETRO_ENVIRONMENT_GET_VARIABLE:
             if not data:
                 return False
@@ -225,7 +241,6 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
         return False
 
     def _libretro_rumble_cb(self, port: int, effect: int, strength: int) -> bool:
-        """Dispatches genuine in-game vibration events fired directly by mGBA's CPU core."""
         if not self.config.get("sensors", "rumble_enabled"):
             return True
 
@@ -269,6 +284,10 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
         if active:
             self._notified_rewind_empty = False
 
+    def request_tas_seek(self, target_frame: int, anchor_frame: int, anchor_state_bytes: bytes, dense_masks: list):
+        with QMutexLocker(self.mutex):
+            self._tas_seek_req = (int(target_frame), int(anchor_frame), anchor_state_bytes, list(dense_masks))
+
     def _push_rewind_snapshot(self, frame_idx: int):
         raw_state = self.serialize_state_bytes()
         if raw_state:
@@ -282,10 +301,99 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
             return np.array(vid_obj.data, copy=False)
         return np.array(vid_obj, copy=False)
 
+    def _execute_tas_seek(self, generator, req_tuple):
+        target_frame, anchor_frame, anchor_comp, dense_masks = req_tuple
+        try:
+            raw_anchor = zlib.decompress(anchor_comp)
+        except Exception:
+            self.tas_seek_completed.emit(self.replay_frame_counter, b"")
+            return
+
+        if not self.unserialize_state_bytes(raw_anchor):
+            self.tas_seek_completed.emit(self.replay_frame_counter, b"")
+            return
+
+        with QMutexLocker(self.mutex):
+            self.replay_frame_counter = anchor_frame
+            self.previous_frame = None
+
+        steps = max(0, target_frame - anchor_frame)
+        last_item = None
+
+        if steps == 0:
+            with QMutexLocker(self.mutex):
+                for lib_id in ID_TO_BTN.keys():
+                    if self.emu and hasattr(self.emu, "set_button"):
+                        self.emu.set_button(0, lib_id, False)
+            self.tas_seek_completed.emit(target_frame, anchor_comp)
+            return
+
+        for i in range(steps):
+            f_idx = anchor_frame + i
+            mask = dense_masks[f_idx] if 0 <= f_idx < len(dense_masks) else 0
+            pressed_btns = tas_mask_to_buttons(mask)
+
+            with QMutexLocker(self.mutex):
+                self.cheat_engine.apply_cheats()
+                self.watch_engine.apply_freezes_unlocked()
+                for lib_id, b_name in ID_TO_BTN.items():
+                    if self.emu and hasattr(self.emu, "set_button"):
+                        self.emu.set_button(0, lib_id, b_name in pressed_btns)
+                try:
+                    last_item = next(generator)
+                except Exception:
+                    break
+                self.replay_frame_counter = f_idx + 1
+
+            if (i + 1) % 30 == 0 and (f_idx + 1) < target_frame:
+                raw_mid = self.serialize_state_bytes()
+                if raw_mid:
+                    self.tas_greenzone_captured.emit(f_idx + 1, zlib.compress(raw_mid, level=1))
+
+        if last_item is not None:
+            vid_obj = last_item[0] if isinstance(last_item, tuple) else getattr(last_item, "video", last_item)
+            frame_data = self._extract_video_array(vid_obj)
+            self.latest_video_frame = frame_data
+            self.frame_ready.emit(frame_data)
+
+        final_mask = dense_masks[target_frame] if 0 <= target_frame < len(dense_masks) else 0
+        final_btns = tas_mask_to_buttons(final_mask)
+        hud_mask = 0
+        for bit_idx, (btn_name, _) in enumerate(HUD_BTN_BITS):
+            if btn_name in final_btns:
+                hud_mask |= (1 << bit_idx)
+
+        self.input_hud_updated.emit("PLAYBACK", target_frame, len(dense_masks), hud_mask)
+
+        raw_final = self.serialize_state_bytes()
+        comp_final = zlib.compress(raw_final, level=1) if raw_final else b""
+        self.is_paused = True
+        self.tas_seek_completed.emit(target_frame, comp_final)
+
+    def _compute_live_inputs(self, frame_counter: int) -> tuple[dict, set, int]:
+        autofire_pulse = (frame_counter // 2) % 2 == 0
+        effective_states = dict(self.standard_buttons)
+        for btn_name, libretro_id in AF_TO_LIBRETRO.items():
+            is_af_held = self.autofire_buttons.get(btn_name, False)
+            std_held = self.standard_buttons.get(libretro_id, False)
+            if is_af_held:
+                effective_states[libretro_id] = autofire_pulse or std_held
+
+        active_names = {
+            btn_name for lib_id, btn_name in ID_TO_BTN.items()
+            if effective_states.get(lib_id, False)
+        }
+        hud_mask = 0
+        for bit_idx, (_, lib_id) in enumerate(HUD_BTN_BITS):
+            if effective_states.get(lib_id, False):
+                hud_mask |= (1 << bit_idx)
+
+        return effective_states, active_names, hud_mask
+
     def run(self):
-        # Refresh per-game settings that may have been loaded via profile activation
         self.solar_level = int(self.config.get("sensors", "solar_level", 5) or 5)
         self.dsp.update_settings()
+        self.dsp.reset_stretcher()
 
         buf_max = max(30, int(self.config.get("emulation", "rewind_buffer_size", 300) or 300))
         if self.rewind_buffer.maxlen != buf_max:
@@ -301,6 +409,7 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
             self.emu.load_game(self.rom_path)
             self.load_sram_from_disk()
             self.cheat_engine.load_default_cheats()
+            self.watch_engine.load_default_watches()
 
             print("\n=======================================================")
             print(f"[ROM IDENTIFICATION] Title: {self.game_title} | Code: {self.game_code}")
@@ -341,6 +450,16 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
         self._last_gui_render_time = time.perf_counter()
 
         while self._is_running:
+            seek_req = None
+            with QMutexLocker(self.mutex):
+                if self._tas_seek_req is not None:
+                    seek_req = self._tas_seek_req
+                    self._tas_seek_req = None
+            if seek_req is not None:
+                self._execute_tas_seek(generator, seek_req)
+                next_time = time.perf_counter()
+                continue
+
             if self.is_rewinding:
                 if self.rewind_buffer:
                     saved_fc, comp_bytes = self.rewind_buffer.pop()
@@ -388,6 +507,7 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
             hud_mode = "IDLE"
             hud_max_frame = 0
             btn_mask = 0
+            wp_hit_info = None
 
             with QMutexLocker(self.mutex):
                 if self.reset_requested and hasattr(self.emu, "reset"):
@@ -398,60 +518,73 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
                     self.reset_requested = False
 
                 self.cheat_engine.apply_cheats()
+                self.watch_engine.apply_freezes_unlocked()
 
                 if self.recorder.is_playing:
                     hud_mode = "PLAYBACK"
                     hud_max_frame = self.recorder.playback_max_frame
-                    pressed_btns, should_pause, is_done = self.recorder.step_playback(self.replay_frame_counter)
 
-                    for libretro_id, btn_name in ID_TO_BTN.items():
-                        is_down = (btn_name in pressed_btns)
-                        if self.emu and hasattr(self.emu, "set_button"):
-                            self.emu.set_button(0, libretro_id, is_down)
+                    if self.recorder.tas_overwrite_mode:
+                        effective_states, active_names, btn_mask = self._compute_live_inputs(frame_counter)
+                        tas_mask = 0
+                        for idx, b_name in enumerate(TAS_BUTTON_ORDER):
+                            if b_name in active_names:
+                                tas_mask |= (1 << idx)
+                        self.recorder.set_frame_buttons(self.replay_frame_counter, active_names)
+                        self.tas_frame_recorded.emit(self.replay_frame_counter, tas_mask)
+                        for lib_id in ID_TO_BTN.keys():
+                            if self.emu and hasattr(self.emu, "set_button"):
+                                self.emu.set_button(0, lib_id, effective_states.get(lib_id, False))
+                    else:
+                        pressed_btns, should_pause, is_done = self.recorder.step_playback(self.replay_frame_counter)
+                        for libretro_id, btn_name in ID_TO_BTN.items():
+                            is_down = (btn_name in pressed_btns)
+                            if self.emu and hasattr(self.emu, "set_button"):
+                                self.emu.set_button(0, libretro_id, is_down)
 
-                    for bit_idx, (btn_name, _) in enumerate(HUD_BTN_BITS):
-                        if btn_name in pressed_btns:
-                            btn_mask |= (1 << bit_idx)
+                        for bit_idx, (btn_name, _) in enumerate(HUD_BTN_BITS):
+                            if btn_name in pressed_btns:
+                                btn_mask |= (1 << bit_idx)
 
-                    if should_pause:
-                        self.is_paused = True
+                        if should_pause:
+                            self.is_paused = True
 
-                    if is_done:
-                        self.replay_finished.emit()
+                        if is_done:
+                            self.replay_finished.emit()
 
                 elif self.recorder.is_recording:
                     hud_mode = "RECORDING"
-                    active_now = []
-                    for libretro_id, btn_name in ID_TO_BTN.items():
-                        if self.standard_buttons.get(libretro_id, False):
-                            active_now.append(btn_name)
-
-                    self.recorder.record_frame(self.replay_frame_counter, active_now, self.is_paused)
-
-                    for bit_idx, (_, lib_id) in enumerate(HUD_BTN_BITS):
-                        if self.standard_buttons.get(lib_id, False):
-                            btn_mask |= (1 << bit_idx)
+                    effective_states, active_names, btn_mask = self._compute_live_inputs(frame_counter)
+                    for lib_id in ID_TO_BTN.keys():
+                        if self.emu and hasattr(self.emu, "set_button"):
+                            self.emu.set_button(0, lib_id, effective_states.get(lib_id, False))
+                    self.recorder.record_frame(self.replay_frame_counter, list(active_names), self.is_paused)
 
                 else:
                     hud_mode = "IDLE"
-                    autofire_pulse = (frame_counter // 2) % 2 == 0
-                    effective_states = dict(self.standard_buttons)
-                    for btn_name, libretro_id in AF_TO_LIBRETRO.items():
-                        is_af_held = self.autofire_buttons.get(btn_name, False)
-                        std_held = self.standard_buttons.get(libretro_id, False)
+                    effective_states, active_names, btn_mask = self._compute_live_inputs(frame_counter)
 
-                        if is_af_held:
-                            desired = autofire_pulse or std_held
-                            effective_states[libretro_id] = desired
-                            if self.emu and hasattr(self.emu, "set_button"):
-                                self.emu.set_button(0, libretro_id, desired)
-                        else:
-                            if self.emu and hasattr(self.emu, "set_button"):
-                                self.emu.set_button(0, libretro_id, std_held)
+                    if self.netplay and self.netplay.is_connected and self.netplay.mode == "lockstep":
+                        local_tas_mask = 0
+                        for idx, b_name in enumerate(TAS_BUTTON_ORDER):
+                            if b_name in active_names:
+                                local_tas_mask |= (1 << idx)
 
-                    for bit_idx, (_, lib_id) in enumerate(HUD_BTN_BITS):
-                        if effective_states.get(lib_id, False):
-                            btn_mask |= (1 << bit_idx)
+                        eff_tas_mask = self.netplay.exchange_lockstep_input(
+                            self.replay_frame_counter, local_tas_mask
+                        )
+                        if eff_tas_mask is not None:
+                            eff_names = tas_mask_to_buttons(eff_tas_mask)
+                            btn_mask = 0
+                            for bit_idx, (b_name, lib_id) in enumerate(HUD_BTN_BITS):
+                                is_down = (b_name in eff_names)
+                                effective_states[lib_id] = is_down
+                                if is_down:
+                                    btn_mask |= (1 << bit_idx)
+
+                    for lib_id in ID_TO_BTN.keys():
+                        if self.emu and hasattr(self.emu, "set_button"):
+                            self.emu.set_button(0, lib_id, effective_states.get(lib_id, False))
 
                 if self.emu:
                     val_x = int(self.tilt_x * 32767)
@@ -466,6 +599,20 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
                                 except Exception:
                                     pass
 
+                if self.netplay and self.netplay.is_connected and self.netplay.mode == "link_sio":
+                    raw_state = self.serialize_state_bytes()
+                    if raw_state:
+                        pram = self.get_memory_region("PRAM")
+                        local_sio = self.netplay.sio_probe.read_sio_snapshot(raw_state, pram)
+                        if local_sio:
+                            peer_sio = self.netplay.exchange_sio_frame(self.replay_frame_counter, local_sio)
+                            if peer_sio:
+                                patched_state = self.netplay.sio_probe.patch_peer_sio_into_state(
+                                    raw_state, peer_sio, self.netplay.is_host, pram
+                                )
+                                if patched_state:
+                                    self.unserialize_state_bytes(patched_state)
+
                 self.replay_frame_counter += 1
                 current_frame_num = self.replay_frame_counter
 
@@ -476,6 +623,14 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
                 except Exception as e:
                     print(f"Core step error: {e}")
                     break
+
+                # Check Write Watchpoints after frame execution
+                wp_hit_info = self.watch_engine.check_watchpoints_unlocked(current_frame_num)
+                if wp_hit_info is not None:
+                    self.is_paused = True
+
+            if wp_hit_info is not None:
+                self.watchpoint_hit.emit(wp_hit_info)
 
             rewind_enabled = bool(self.config.get("emulation", "rewind_enabled", True))
             rewind_interval = max(1, int(self.config.get("emulation", "rewind_interval", 10) or 10))
@@ -525,7 +680,11 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
                     self._last_hud_mask = btn_mask
 
             is_ff = self.fast_forward
-            ff_ratio = self.config.get("emulation", "fast_forward_ratio") or 2.0
+            if self._was_fast_forward and not is_ff:
+                self.dsp.reset_stretcher()
+            self._was_fast_forward = is_ff
+
+            ff_ratio = float(self.config.get("emulation", "fast_forward_ratio") or 2.0)
             fps_target = (59.7275 * ff_ratio) if is_ff else 59.7275
             frame_time = 1.0 / fps_target
             played_audio = False
@@ -539,11 +698,15 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
                     audio_arr = np.frombuffer(raw_audio, dtype=np.int16)
                     if len(audio_arr) % 2 == 0:
                         stereo_audio = audio_arr.reshape(-1, 2)
-                        processed_audio = self.dsp.process(stereo_audio)
-
-                        if stream and not is_ff and not was_single_step:
-                            stream.write(processed_audio)
-                            played_audio = True
+                        if stream and not was_single_step:
+                            if is_ff:
+                                ff_audio = self.dsp.process_fast_forward(stereo_audio, ff_ratio)
+                                if len(ff_audio) > 0:
+                                    stream.write(ff_audio)
+                            else:
+                                processed_audio = self.dsp.process(stereo_audio)
+                                stream.write(processed_audio)
+                                played_audio = True
                 except Exception:
                     pass
 
@@ -565,6 +728,7 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
 
         self.flush_sram_to_disk()
         self.cheat_engine.save_default_cheats(only_if_exists_or_nonempty=True)
+        self.watch_engine.save_default_watches()
 
         with QMutexLocker(self.mutex):
             if self.emu:

@@ -143,7 +143,7 @@ class MenuBuilderMixin:
         ff_speed_menu.addAction(act_ff_down)
 
         emu_menu.addSeparator()
-        replay_menu = emu_menu.addMenu("Gameplay Replay & Recording")
+        replay_menu = emu_menu.addMenu("Gameplay Replay & TAS")
 
         self.act_record_session = QAction("⏺ Start Recording Session...", self)
         self.act_record_session.setShortcut(QKeySequence("Ctrl+Shift+R"))
@@ -158,6 +158,13 @@ class MenuBuilderMixin:
         self.act_stop_replay = QAction("⏹ Stop Current Replay", self)
         self.act_stop_replay.triggered.connect(self.stop_replay_session)
         replay_menu.addAction(self.act_stop_replay)
+
+        replay_menu.addSeparator()
+
+        self.act_tas_editor = QAction("🎹 Piano-Roll TAS Timeline Editor...", self)
+        self.act_tas_editor.setShortcut(QKeySequence("Ctrl+Shift+E"))
+        self.act_tas_editor.triggered.connect(self.open_tas_editor)
+        replay_menu.addAction(self.act_tas_editor)
 
         # 3. SENSORS & PERIPHERALS MENU
         sensors_menu = menubar.addMenu("Sensors & Rumble")
@@ -217,6 +224,11 @@ class MenuBuilderMixin:
         self.mute_action.triggered.connect(self.toggle_mute)
         audio_menu.addAction(self.mute_action)
 
+        self.ff_pitch_action = QAction("Pitch-Corrected Fast-Forward Audio (WSOLA)", self, checkable=True)
+        self.ff_pitch_action.setChecked(bool(self.config.get("audio", "fast_forward_pitch_corrected", True)))
+        self.ff_pitch_action.triggered.connect(self.toggle_ff_pitch_corrected)
+        audio_menu.addAction(self.ff_pitch_action)
+
         audio_menu.addSeparator()
 
         lpf_menu = audio_menu.addMenu("Low-Pass Filter")
@@ -264,7 +276,7 @@ class MenuBuilderMixin:
             vol_menu.addAction(act)
             self.vol_actions[vol] = act
 
-        # 5. VIDEO MENU (Shaders, Fullscreen, Input HUD, Clip Recorder, Scaling)
+        # 5. VIDEO MENU
         video_menu = menubar.addMenu("Video")
 
         self.fullscreen_action = QAction("Fullscreen (Alt+Enter / F11)", self, checkable=True)
@@ -392,11 +404,11 @@ class MenuBuilderMixin:
         views_menu.addAction("View palettes...", lambda: self._open_dev_tool(PaletteViewerDialog))
         views_menu.addAction("View sprites...", lambda: self._open_dev_tool(SpriteViewerDialog))
         views_menu.addAction("View tiles...", lambda: self._open_dev_tool(TileViewerDialog))
-        views_menu.addAction("View map...", lambda: self._open_dev_tool(MapViewerDialog))
+        views_menu.addAction("View & edit map (SBB)...", lambda: self._open_dev_tool(MapViewerDialog))
         views_menu.addSeparator()
         views_menu.addAction("Frame inspector...", lambda: self._open_dev_tool(FrameInspectorDialog))
 
-        hex_act = QAction("View memory (Hex Editor)...", self)
+        hex_act = QAction("View memory (Hex Editor & Watch Table)...", self)
         hex_act.setShortcut(QKeySequence("Ctrl+H"))
         hex_act.triggered.connect(lambda: self._open_dev_tool(MemoryViewerDialog))
         views_menu.addAction(hex_act)
@@ -455,12 +467,21 @@ class MenuBuilderMixin:
         editor_act.triggered.connect(self.open_graphic_editor)
         tools_menu.addAction(editor_act)
 
-        hex_tool_act = QAction("Interactive Hex Editor (HxD / ImHex)...", self)
+        hex_tool_act = QAction("Interactive Hex Editor & Watch Table...", self)
         hex_tool_act.triggered.connect(lambda: self._open_dev_tool(MemoryViewerDialog))
         tools_menu.addAction(hex_tool_act)
 
+        sappy_act = QAction("🎵 Sappy (M4A) Music & Soundbank Extractor...", self)
+        sappy_act.triggered.connect(self.open_sappy_extractor)
+        tools_menu.addAction(sappy_act)
+
         tools_menu.addSeparator()
         tools_menu.addAction("Cheats Manager...", self.open_cheats_manager)
+
+        self.act_netplay = QAction("🌐 Netplay & Link Cable...", self)
+        self.act_netplay.triggered.connect(self.open_netplay_dialog)
+        tools_menu.addAction(self.act_netplay)
+
         tools_menu.addSeparator()
         tools_menu.addAction("Configure Controls & Motion Feedback...", self.open_controller_config)
 

@@ -39,7 +39,6 @@ class RuntimeActionsMixin:
             self.controller_manager.poll_gamepad_events(self.worker)
 
     def _extract_zip_rom(self, zip_path: str) -> str:
-        """Extracts the first supported ROM inside a .zip archive into a temp cache."""
         with zipfile.ZipFile(zip_path, "r") as zf:
             candidates = [
                 zi for zi in zf.infolist()
@@ -71,7 +70,6 @@ class RuntimeActionsMixin:
             return extracted_path
 
     def _extract_7z_rom(self, archive_path: str) -> str:
-        """Extracts the first supported ROM inside a .7z archive into a temp cache."""
         try:
             import py7zr
         except ImportError as e:
@@ -216,11 +214,16 @@ class RuntimeActionsMixin:
         self.video_widget.clear_translation_boxes()
 
         save_base = os.path.splitext(os.path.basename(self.current_rom))[0]
+        slot = int(getattr(self, "player_slot", 1) or 1)
+        if slot > 1:
+            save_base = f"{save_base}_p{slot}"
+
         self.worker = EmulatorWorker(
             self.core_path,
             self.current_rom,
             self.config,
             save_base_name=save_base,
+            netplay=getattr(self, "netplay_engine", None),
         )
 
         profile_id = self.worker.get_profile_id()
@@ -234,6 +237,7 @@ class RuntimeActionsMixin:
         self.worker.error_occurred.connect(self.handle_error)
         self.worker.replay_finished.connect(self.on_replay_finished)
         self.worker.rewind_status.connect(self.video_widget.show_osd)
+        self.worker.watchpoint_hit.connect(self._on_watchpoint_hit)
 
         self.worker.rumble_triggered.connect(self.sensor_hud.on_rumble_triggered)
         self.worker.rumble_triggered.connect(self.controller_manager.trigger_rumble)
@@ -248,13 +252,33 @@ class RuntimeActionsMixin:
         self.worker.start()
         self.is_running = True
 
+        if hasattr(self, "netplay_engine") and self.netplay_engine:
+            self.netplay_engine.set_local_rom_info(self.worker.game_title, self.worker.game_code)
+
         osd_parts = []
         if self.active_patch:
             osd_parts.append(f"🩹 {os.path.basename(self.active_patch)}")
         if profile_loaded:
             osd_parts.append(f"🎮 Profile: {profile_id}")
+        if slot > 1:
+            osd_parts.append(f"🔗 Peer {slot}")
         if osd_parts:
             self.video_widget.show_osd(" | ".join(osd_parts), 3500)
+
+    def _on_netplay_state_received(self, raw_state: bytes):
+        if self.worker and raw_state:
+            ok = self.worker.unserialize_state_bytes(raw_state)
+            if ok:
+                self.worker.replay_frame_counter = 0
+                self.video_widget.show_osd("🤝 Netplay State Synced!", 2000)
+
+    def _on_watchpoint_hit(self, hit_info: dict):
+        if hasattr(self, "pause_action"):
+            self.pause_action.setChecked(True)
+        self.video_widget.show_osd(f"🎯 Watchpoint Hit: 0x{hit_info['address']:08X}", 3000)
+        from ..tools.watch_table import WatchpointHitDialog
+        self._active_wp_dialog = WatchpointHitDialog(hit_info, self.worker, self)
+        self._active_wp_dialog.show()
 
     def reset_emulation(self):
         if self.worker:

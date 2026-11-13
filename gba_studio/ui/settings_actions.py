@@ -8,6 +8,10 @@ from ..tools.dev_tools import MemoryViewerDialog
 class SettingsActionsMixin:
     def _sync_ui_with_config(self):
         self.mute_action.setChecked(bool(self.config.get("audio", "mute")))
+        if hasattr(self, "ff_pitch_action"):
+            self.ff_pitch_action.setChecked(
+                bool(self.config.get("audio", "fast_forward_pitch_corrected", True))
+            )
 
         lpf = str(self.config.get("audio", "low_pass_filter") or "medium").lower()
         if lpf in self.lpf_actions:
@@ -80,6 +84,13 @@ class SettingsActionsMixin:
 
         self._build_keymap()
 
+    def toggle_ff_pitch_corrected(self):
+        val = self.ff_pitch_action.isChecked()
+        self.config.set("audio", "fast_forward_pitch_corrected", val)
+        if self.worker:
+            self.worker.update_audio_settings()
+        self.video_widget.show_osd(f"Fast-Forward Pitch Correction: {'ON (WSOLA)' if val else 'OFF'}")
+
     def set_lpf_mode(self, mode: str):
         self.config.set("audio", "low_pass_filter", mode)
         if self.worker:
@@ -140,6 +151,27 @@ class SettingsActionsMixin:
             QMessageBox.warning(self, "Notice", "Emulation must be running to inspect game state.")
             return
         self.active_tool_window = dialog_cls(self.worker, self.config, self)
+        self.active_tool_window.show()
+
+    def open_tas_editor(self):
+        if not self.worker:
+            QMessageBox.warning(self, "Notice", "Emulation must be running to use the Piano-Roll TAS Editor.")
+            return
+        from ..tools.tas_editor import TASTimelineDialog
+        self.active_tool_window = TASTimelineDialog(self, self)
+        self.active_tool_window.show()
+
+    def open_sappy_extractor(self):
+        if not self.worker:
+            QMessageBox.warning(self, "Notice", "Load a ROM first to scan for Sappy / M4A music.")
+            return
+        from ..tools.sappy_extractor import SappyExtractorDialog
+        self.active_tool_window = SappyExtractorDialog(self.worker, self.config, self)
+        self.active_tool_window.show()
+
+    def open_netplay_dialog(self):
+        from .netplay_dialog import NetplayLinkDialog
+        self.active_tool_window = NetplayLinkDialog(self, self)
         self.active_tool_window.show()
 
     def open_graphic_editor(self):

@@ -1,94 +1,83 @@
-Based on your current codebase (`core_worker.py`, `gui.py`, `dev_tools.py`, `graphic_editor.py`, `hex_editor.py`, `shader_manager.py`, `translation_tools.py`, etc.), you already have an impressive emulator + ROM hacking/AI translation workstation.
+# Roadmap & Future Enhancements Checklist
 
-Here are the highest-impact improvements, grouped from **critical core gaps** to **new features and polish** tailored to your exact code:
+### 1. Advanced AI Translation & Localization Workstation
 
----
+- [ ] 1. **Auto-Translate on Scene / Dialogue Change (Smart Auto-Trigger)**
 
-### 1. Core Emulation & Quality-of-Life Gaps (High Impact)
+  * **Current State:** Translation currently requires manual invocation via hotkey (`T`).
+  * **Enhancement:** Add an optional auto-translate background detector. Monitor frame differences (using perceptual hashing, SSIM via OpenCV, or VRAM tilemap dirty tracking) on text regions. Automatically queue an AI translation without user input when a dialogue box advances, with a debounce timer to avoid API throttling.
+- [ ] 2. **In-Place Visual Inpainting / Direct Textbox Replacement**
 
-- [X] ~~1. **Automatic Battery Save (`.sav`) Persistence**~~ *(Implemented in `state_storage.py` & `core_worker.py`)*
+  * **Current State:** Translations display in the bottom dock or as a fullscreen floating subtitle card.
+  * **Enhancement:** Use OCR bounding box coordinates `(x, y, w, h)` to render matching background patches directly over the Japanese dialogue bubble in `VideoGLWidget` and draw the localized text inside the game's actual textbox.
+- [ ] 3. **Text-To-Speech (TTS) Game Dubbing**
 
-  * ~~**Current Gap:** `config.py` defines `"saves": "saves"`, and `_libretro_environ_cb` passes it to mGBA, **but neither `core_worker.py` nor `gui.py` actually reads/writes `MemoryRegion.SAVE_RAM` (`SRAM`) to disk**. In `pdretro`, in-game saves (like Pokémon save files) can be lost when closing the emulator unless you use Save States.~~
-  * ~~**Enhancement:** On ROM load, check for `saves/<rom_name>.sav` and inject it via `write_memory_region("SRAM", 0, data)`. Periodically hash `SRAM` (e.g., every 2 seconds) and on `stop()`, flush changes back to `.sav` automatically.~~
-- [X] ~~2. **Fix Live Audio Mute / Unmute (`core_worker.py` & `audio_dsp.py`)**~~ *(Implemented in `audio_dsp.py` & `core_worker.py`)*
+  * **Current State:** Dialogue is visual-only.
+  * **Enhancement:** Integrate lightweight offline or streaming TTS (`edge-tts` or `piper-tts`) to vocalize translated text upon detection. Automatically duck emulator audio volume during voice playback.
+- [ ] 4. **One-Click "Translate to ROM" (Direct Text Insertion Workflow)**
 
-  * ~~**Current Gap:** In `core_worker.py`, `sounddevice.OutputStream` is only created at startup if `mute` is `False`. Toggling **Audio → Mute** while playing updates `AudioDSP`, which doesn't check `mute`, so toggling Mute on/off mid-game does nothing until you reload the ROM.~~
-  * ~~**Enhancement:** Always initialize the stream (or manage it cleanly), and add `self.muted = bool(self.config.get("audio", "mute"))` inside `AudioDSP.update_settings()` to output zeros (or skip `stream.write()`) while keeping clock pacing smooth.~~
-- [X] ~~3. **Real-Time Rewind Buffer (`Space` / `` ` `` / Hotkey)**~~ *(Implemented in `core_worker.py`, `config.py`, `main_window.py`, `menu_actions.py`, `application_actions.py`, & `runtime_actions.py`)*
-
-  * ~~**Why it fits cleanly:** You already have fast in-memory state serialization via `_ra_wrapper.serialize_state()` and `unserialize_state()`.~~
-  * ~~**Enhancement:** Push `zlib`-compressed state snapshots into a `collections.deque(maxlen=300)` every ~10 frames (~50 seconds of rewind history in ~20–30 MB of RAM). Holding a Rewind key pauses normal execution and steps backward through the deque.~~
-- [ ] 4. **Automatic Soft-Patching on Load (`.ips` / `.ups` / `.bps`)**
-
-  * **Why it fits cleanly:** `graphic_editor.py` already generates `.ips` patches, and your emulator is heavily focused on ROM translation (`translation_tools.py`).
-  * **Enhancement:** When loading `Game.gba`, automatically check for `Game.ips` / `Game.bps` / `Game.ups` (or let the user pick a patch) and apply it to an in-memory/temp ROM buffer without modifying the original clean ROM on disk.
-- [ ] 5. **Visual Save State Slot Browser (With PNG Thumbnails)**
-
-  * **Enhancement:** Whenever `quick_save_state(slot)` runs, save `latest_video_frame` alongside `.ss1` as `.ss1.png` (plus timestamp). Add a **Save State Manager** dialog showing a 3×3 thumbnail grid of Slots 1–9 so you never accidentally overwrite the wrong slot.
+  * **Current State:** Script extraction, repointing, and text search require navigating several tabs in `TranslationToolsDialog`.
+  * **Enhancement:** Add an *"Inject to ROM"* action directly in the translation subtitle panel. Automatically find the active on-screen string in the ROM via relative/table search, repoint its pointer, and write the localized text directly to a patched `.gba` file.
 
 ---
 
-### 2. Dev Tools & ROM Hacking Polish (Fixing Existing Stubs)
+### 2. ROM Hacking & Forensic Dev Tools
 
-- [X] ~~6. **Real Palette (PRAM) Rendering in Tile & Map Viewers (`dev_tools.py`)**~~ *(Implemented in `tile_map_viewers.py` & `palette_sprite_viewers.py`)*
+- [X] 5. **Interactive GBA Tilemap (SBB) Editor (AdvanceMap Lite)**
 
-  * ~~**Current Gap:** Right now, `TileViewerDialog.render_tiles()` and `MapViewerDialog.render_map()` both call `colors = get_default_palette()` (rainbow placeholder colors) instead of reading the actual live `PRAM` from the game, even though `PaletteViewerDialog` already parses `PRAM`!~~
-  * ~~**Enhancement:** Extract `PRAM` via `bgr555_to_rgb` inside `TileViewerDialog` and `MapViewerDialog` so tiles and tilemaps render with true in-game colors.~~
-- [X] ~~7. **Live Auto-Refresh Mode in Dev Viewers (`dev_tools.py`)**~~ *(Implemented in `tile_map_viewers.py` & `palette_sprite_viewers.py`)*
+  * **Current State:** `TileViewerDialog` and `MapViewerDialog` are read-only inspectors; only `GraphicEditorDialog` allows drawing raw tile pixels.
+  * **Enhancement:** Enable interactive tile placement in `MapViewerDialog`. Selecting a tile from the pattern table acts as a brush to click and stamp tile indices and palette banks directly onto the 32×32 Screen Base Block in live VRAM, with IPS/ROM patch export support.
+- [X] 6. **Audio Soundbank & Sappy (M4A) Music Extractor**
 
-  * ~~**Enhancement:** `HexEditorDialog` already has a great `⚡ Live Watch` timer (`100 ms`). Adding a similar **Auto-Refresh (10 Hz)** checkbox to `PaletteViewerDialog`, `SpriteViewerDialog`, `TileViewerDialog`, and `MapViewerDialog` lets you watch VRAM tiles, palettes, and OAM sprites update live as the game plays.~~
-- [ ] 8. **Undo / Redo History in `GraphicEditorDialog` (`graphic_editor.py`)**
+  * **Current State:** Audio can only be recorded via the clip recorder or listened to in real-time.
+  * **Enhancement:** Scan ROM data for standard Nintendo GBA Sappy / M4A sound engine tables (`song_table` pointers). Enable playing individual music sequences and exporting them to standard `.mid` (MIDI), `.wav`, and `.sf2` soundfonts.
+- [X] 7. **Execution & Write Watchpoints / Breakpoints**
 
-  * **Current Gap:** `HexEditorDialog` has `undo_stack` and `redo_stack` (`Ctrl+Z` / `Ctrl+Y`), but the YY-CHR `GraphicEditorDialog` writes straight into `self.vram_copy` with no undo history.
-  * **Enhancement:** Record `(offset, old_byte, new_byte)` actions per stroke/fill so `Ctrl+Z` / `Ctrl+Y` works while drawing sprites or tiles.
-- [X] ~~9. **ZIP**~~ / **7z Archive ROM Loading** *(Implemented `.zip` loading in `runtime_actions.py`; `.7z` not yet added)*
+  * **Current State:** Memory inspection is passive or polled at fixed timer intervals.
+  * **Enhancement:** Allow setting memory write watchpoints on EWRAM/IWRAM addresses via `HexEditorDialog` or `MemorySearchDialog`. Automatically pause emulation and display the calling instruction (via Capstone) whenever a targeted variable (e.g., player HP) is modified.
+- [X] 8. **Live Memory Freeze & Watch Table (Cheat Engine "Address Table" View)**
 
-  * ~~**Current Gap:** `load_rom()` in `gui.py` includes `*.zip` in the file filter, but `pdretro` / `Emulator.load_game()` generally expects an uncompressed `.gba` path (and `_parse_rom_header` seeks `0xAC` directly on the file).~~
-  * ~~**Enhancement:** Use Python's built-in `zipfile` module in `load_rom_file()` to extract `.gba`/`.gb`/`.gbc` files transparently into a temporary cache folder before booting.~~
-
----
-
-### 3. Video, Shaders & UI Enhancements
-
-- [X] ~~10. **Save & Restore Custom Shader Chains & Parameters**~~ *(Implemented in `config.py`, `shader_types.py`, `shader_pipeline.py`, `shader_dialog.py`, & `main_window.py`)*
-
-  * ~~**Current Gap:** Currently `mgba_config.json` saves `shaders.enabled` and `shaders.preset` (e.g., `"gba_color"`), so if you prepend/append custom `.glsl` passes or tweak parameter sliders in `ShaderConfigDialog`, those tweaks reset on restart.~~
-  * ~~**Enhancement:** Auto-save the active shader chain to `shaders/autosave.glslp` (or store pass paths + parameter dicts inside `mgba_config.json`) and restore them automatically on boot.~~
-- [X] ~~11. **Fullscreen Mode (`Alt+Enter` / `F11`) & Integer Scaling Option**~~ *(Implemented in `shader_pipeline.py`, `video_widget.py`, `menu_actions.py`, `application_actions.py`, `settings_actions.py`, & `main_window.py`)*
-
-  * ~~**Enhancement:** Add a clean borderless fullscreen toggle that temporarily hides the menu bar, HUD, and translation panel, plus an **Integer Scale Only** toggle inside `VideoGLWidget` so pixels snap strictly to 1×, 2×, 3×, etc. without shimmer even in maximized windows.~~
-- [ ] 12. **Drag-and-Drop Support**
-
-  * **Enhancement:** Enable `setAcceptDrops(True)` on `MainWindow` so dragging a `.gba` ROM, `.state` save state, `.glslp` shader preset, or `.replay.json` onto the window immediately loads it.
-- [ ] 13. **Built-In Animated GIF / MP4 Clip Recorder**
-
-  * **Why it fits cleanly:** `Pillow` and `opencv-python` are already in `requirements.txt`.
-  * **Enhancement:** Add a **"Record GIF / Video Clip"** toggle in the Video menu that buffers `latest_video_frame` at 30/60 FPS and exports a crisp pixel-art GIF or MP4 to `exports/`.
-- [ ] 14. **Per-Game Configuration Profiles**
-
-  * **Enhancement:** Use `self.game_code` (like `BPPE`, `V49E`, `AXBJ`) to save per-game overrides (e.g., different controller layouts, rumble strength, shader presets, or Boktai solar levels per game).
+  * **Current State:** Cheats can be added to freeze memory, but arbitrary addresses cannot be monitored side-by-side in real time.
+  * **Enhancement:** Add a persistent "Watch Table" panel inside the Hex Editor or Cheat Engine. Pin arbitrary memory addresses with custom labels and display types (`uint8`, `uint16`, `uint32`, `float`, `hex`, `string`), with live-refresh readouts and toggleable freeze locks.
 
 ---
 
-### 4. AI Translation & Replay Ecosystem
+### 3. Core Emulation & TAS / Tool-Assisted Features
 
-- [ ] 15. **On-Screen Floating Subtitle Overlay**
+- [X] 9. **Piano-Roll TAS Input Timeline Editor**
 
-  * **Enhancement:** Alongside the bottom `translation_panel` dock, add an option (`ai_translation.overlay_enabled` is already in `config.py`!) to draw translated dialogue boxes directly onto `VideoGLWidget` via `QPainter` (either at the bottom of the frame or anchored to the detected OCR bounding boxes), which is especially useful in Fullscreen mode.
-- [ ] 16. **Translation Cache & Per-Game Glossary**
+  * **Current State:** Replay recording saves deterministic `.replay.json` files, but inputs cannot be graphically edited frame-by-frame.
+  * **Enhancement:** Build a visual column-based TAS timeline editor (BizHawk/FCEUX style). Display frames on the vertical axis and controller buttons (`A`, `B`, `L`, `R`, `D-Pad`, etc.) as clickable grid cells to toggle inputs, step backward/forward, and test frame-perfect actions.
+- [X] 10. **Time-Stretching / Pitch-Corrected Fast-Forward Audio**
 
-  * **Enhancement:** Cache `(source_text -> translated_text)` per ROM in `translations/<game_code>_cache.json` + editable character/term glossary so repeated menu prompts (`"はい / いいえ"`, `"セーブ"`) translate instantaneously without calling the LLM every time, and character names stay consistent.
-- [ ] 17. **Cheat Engine Code Validation & Persistence (`cheats.py`)**
+  * **Current State:** Fast-forwarding currently raises sound pitch or skips audio buffer writes.
+  * **Enhancement:** Integrate a WSOLA/SoundTouch time-stretching filter in `audio_dsp.py` so playing at `1.5x` or `2.0x` speeds up the music and sound effects without high-pitched distortion.
+- [X] 11. **GBA Local Netplay / Wireless Link Cable Emulation**
 
-  * **Enhancement:** Ensure cheats added from `MemorySearchDialog` or `CheatManagerWindow` auto-save to `cheats/<game_name>.cht` and auto-load on ROM boot, with support for GameShark v1/v3, Action Replay, and CodeBreaker decryption.
-- [ ] 18. **Live Input Overlay / TAS Frame Counter HUD**
-
-  * **Enhancement:** When `SessionRecorder` is recording or playing back, show a small frame counter + live pressed-button indicator (`[A] [B] [▲▼◀▶]`) on the HUD or OSD—great for debugging replays and speedruns.
+  * **Current State:** Single-player emulation only.
+  * **Enhancement:** Utilize mGBA's native serial/link cable communication via local network sockets or a dual-core worker instance, enabling Pokémon trading/battling and multi-player GBA titles.
 
 ---
 
-### Quick Pick — Completed
+### 4. UI, Presentation & Retro Aesthetics
 
-- [X] ~~1. **`.sav` SRAM persistence + `.zip` ROM loading + Live Mute fix** (fixes real gameplay persistence & audio bugs).~~
-- [X] ~~2. **Real `PRAM` colors & Auto-Refresh in `TileViewer` / `MapViewer`** (instant upgrade to your dev tools).~~
-- [X] ~~3. **In-Memory Rewind System** + **Shader Parameter Persistence + Fullscreen Mode**.~~
+- [ ] 12. **Custom Handheld Bezel & Artwork Borders**
+
+  * **Current State:** Fullscreen mode on 16:9/16:10 monitors displays black pillarboxes on the sides.
+  * **Enhancement:** Add selectable authentic GBA handheld bezel overlays (Original Indigo GBA, GBA SP, Game Boy Micro, or Game Boy Player frame) filling the unused border space around the 3:2 screen.
+- [ ] 13. **Visual ROM Library & Box Art Launcher Grid**
+
+  * **Current State:** Games are loaded exclusively through file dialogs or the recent files menu.
+  * **Enhancement:** Add a visual grid launcher view when no game is running, displaying scanned games from a `roms/` folder with scraped box art, game title, publisher, and cartridge metadata.
+- [ ] 14. **Per-Game Playtime & Statistics Tracking**
+
+  * **Current State:** Per-game profiles save configuration settings, but gameplay statistics are not recorded.
+  * **Enhancement:** Track and persist `playtime_seconds`, `launch_count`, and `last_played` timestamps inside each game's `profiles/<game_code>.json`, displaying stats in the status HUD or launcher.
+
+---
+
+### Quick Priority Pick
+
+1. **Auto-Translate on Scene Change (`#1`)** *(Massive quality-of-life upgrade for the AI translator)*
+2. **Live Memory Freeze & Watch Table (`#8`)** *(Turns the Hex Editor into a true Cheat Engine)*
+3. **Bezel / Handheld Frame Artwork in Fullscreen (`#12`)** *(Instant commercial polish to fullscreen mode)*
