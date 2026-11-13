@@ -9,6 +9,7 @@ from ..tools.ai_translator import (
     TranslationWorker,
     TranslationGlossaryDialog,
     AITranslationConfigDialog,
+    GlossaryAndCacheStore,
 )
 from .shader_dialog import ShaderConfigDialog
 from .state_browser import SaveStateBrowserDialog
@@ -22,6 +23,9 @@ class ApplicationActionsMixin:
         game_code = getattr(self.worker, "game_code", "") if self.worker else ""
         dlg = TranslationGlossaryDialog(self.current_rom, self.config, game_code=game_code, parent=self)
         dlg.exec()
+        if getattr(self, "_auto_cache_store", None) is not None:
+            self._auto_cache_store.load()
+        self._auto_ocr_cache = {}
 
     def toggle_translation_overlay(self):
         val = self.act_trans_overlay.isChecked()
@@ -29,12 +33,85 @@ class ApplicationActionsMixin:
         self.video_widget.update()
         self.video_widget.show_osd(f"Fullscreen Subtitle Overlay: {'ON' if val else 'OFF'}")
 
+    def toggle_auto_translate(self):
+        val = self.act_auto_translate.isChecked()
+        self.config.set("ai_translation", "auto_translate", val)
+        self.auto_trans_detector.reset()
+        self._sync_auto_translate_timer()
+        self.video_widget.show_osd(f"🤖 Auto-Translate: {'ON' if val else 'OFF'}", 2000)
+
+    def _sync_auto_translate_timer(self):
+        if not hasattr(self, "auto_trans_timer"):
+            return
+        enabled = bool(self.config.get("ai_translation", "auto_translate", False))
+        if enabled:
+            if not self.auto_trans_timer.isActive():
+                self.auto_trans_timer.start()
+        else:
+            if self.auto_trans_timer.isActive():
+                self.auto_trans_timer.stop()
+
+    def _get_ruler_rect(self):
+        if self.video_widget.ruler_start and self.video_widget.ruler_end:
+            return (*self.video_widget.ruler_start, *self.video_widget.ruler_end)
+        return None
+
+    def _get_auto_cache_store(self):
+        if not self.current_rom:
+            return None
+        game_code = getattr(self.worker, "game_code", "") if self.worker else ""
+        trans_dir = self.config.get("paths", "translations") or "translations"
+        src_lang = self.config.get("ai_translation", "source_lang") or "ja"
+        tgt_lang = self.config.get("ai_translation", "target_lang") or "vi"
+        key = (self.current_rom, game_code, trans_dir, src_lang, tgt_lang)
+        key_changed = getattr(self, "_auto_cache_key", None) != key
+        if key_changed or getattr(self, "_auto_cache_store", None) is None:
+            self._auto_cache_store = GlossaryAndCacheStore(
+                self.current_rom, trans_dir=trans_dir, game_code=game_code
+            )
+            if key_changed:
+                self._auto_cache_key = key
+                self._last_auto_ocr_sig = ""
+                self._auto_ocr_cache = {}
+                self.auto_trans_detector.reset()
+        return self._auto_cache_store
+
+    def _poll_auto_translate(self):
+        if not bool(self.config.get("ai_translation", "auto_translate", False)):
+            return
+        if not self.worker or not self.current_rom or self.video_widget.current_frame_data is None:
+            return
+        if self.worker.is_paused or self.worker.is_rewinding or self.worker.fast_forward:
+            return
+        if self.trans_worker and self.trans_worker.isRunning():
+            return
+
+        frame = self.video_widget.current_frame_data
+        roi_mode = str(self.config.get("ai_translation", "auto_roi_mode", "auto") or "auto")
+        debounce_ms = int(self.config.get("ai_translation", "auto_debounce_ms", 1200) or 1200)
+        cooldown_ms = int(self.config.get("ai_translation", "auto_cooldown_ms", 4000) or 4000)
+        src_lang = self.config.get("ai_translation", "source_lang") or "ja"
+        tgt_lang = self.config.get("ai_translation", "target_lang") or "vi"
+
+        store = self._get_auto_cache_store()
+        should_trigger, _ = self.auto_trans_detector.evaluate(
+            frame,
+            roi_mode=roi_mode,
+            debounce_ms=debounce_ms,
+            cooldown_ms=cooldown_ms,
+            ruler_rect=self._get_ruler_rect(),
+            cache_store=store,
+            src_lang=src_lang,
+            tgt_lang=tgt_lang,
+        )
+        if should_trigger:
+            self.trigger_ai_translation(auto_triggered=True)
+
     def clear_translation_subtitles(self):
         self.translation_panel.clear()
         self.video_widget.clear_translation_boxes()
 
     def _apply_effective_config_to_runtime(self):
-        """Re-applies active config (Global or Per-Game Profile) to shaders, audio, sensors, and UI."""
         self.shader_manager.enabled = bool(self.config.get("shaders", "enabled", False))
         self.shader_manager.init_default_preset()
         if self.video_widget.context() is not None:
@@ -267,7 +344,6 @@ class ApplicationActionsMixin:
         self.video_widget.show_osd(f"Rewind Buffer: {'ON' if val else 'OFF'}")
 
     def set_scale(self, scale: int):
-        """Applies exact GBA 3:2 geometric scaling with zero pillarboxing and full persistence."""
         if self.isFullScreen():
             self.toggle_fullscreen()
 
@@ -291,9 +367,6 @@ class ApplicationActionsMixin:
         self.config.save()
         self.video_widget.show_osd(f"Window Scale: {scale}x ({video_w}×{video_h})")
 
-    # =========================================================================
-    # SENSORS & MOTION SLOTS
-    # =========================================================================
     def toggle_pause_on_unfocus(self):
         val = self.pause_unfocus_action.isChecked()
         self.config.set("emulation", "pause_on_unfocus", val)
@@ -347,9 +420,6 @@ class ApplicationActionsMixin:
             self.sensor_hud.on_tilt_updated(0.0, 0.0, 0.0)
             self.video_widget.show_osd("🎯 Gyro/Tilt Centered (0°)")
 
-    # =========================================================================
-    # REPLAY & EMULATION SLOTS
-    # =========================================================================
     def toggle_session_recording(self):
         if not self.worker or not self.current_rom:
             self.video_widget.show_osd("Error: No ROM running.")
@@ -406,29 +476,87 @@ class ApplicationActionsMixin:
     def on_replay_finished(self):
         self.video_widget.show_osd("🏁 Replay Complete! Control Restored.", 3000)
 
-    def trigger_ai_translation(self):
+    def trigger_ai_translation(self, auto_triggered: bool = False):
         if not self.worker or not self.current_rom or self.video_widget.current_frame_data is None:
-            self.video_widget.show_osd("Error: Game not running.")
+            if not auto_triggered:
+                self.video_widget.show_osd("Error: Game not running.")
             return
 
         if self.trans_worker and self.trans_worker.isRunning():
-            self.video_widget.show_osd("AI Translation in progress...")
+            if not auto_triggered:
+                self.video_widget.show_osd("AI Translation in progress...")
             return
 
-        self.video_widget.show_osd("🔍 Running AI Screen Translation...")
+        self._last_trans_was_auto = bool(auto_triggered)
+        frame_copy = self.video_widget.current_frame_data.copy()
+        self._last_trans_frame = frame_copy
 
+        if auto_triggered:
+            self.video_widget.show_osd("🤖 Auto-Translating...", 1400)
+        else:
+            self.video_widget.show_osd("🔍 Running AI Screen Translation...")
+
+        self._get_auto_cache_store()
         self.trans_worker = TranslationWorker(
-            frame_data=self.video_widget.current_frame_data.copy(),
+            frame_data=frame_copy,
             rom_path=self.current_rom,
             config=self.config,
             game_code=getattr(self.worker, "game_code", ""),
+            auto_triggered=auto_triggered,
+            last_auto_ocr_sig=getattr(self, "_last_auto_ocr_sig", ""),
+            auto_ocr_cache=getattr(self, "_auto_ocr_cache", {}),
         )
         self.trans_worker.finished.connect(self.on_ai_translation_finished)
-        self.trans_worker.error.connect(lambda err: QMessageBox.warning(self, "AI Translation Error", err))
+        self.trans_worker.skipped.connect(self.on_ai_translation_skipped)
+        self.trans_worker.error.connect(self.on_ai_translation_error)
         self.trans_worker.start()
+
+    def on_ai_translation_skipped(self, reason: str):
+        roi_mode = str(self.config.get("ai_translation", "auto_roi_mode", "auto") or "auto")
+        self.auto_trans_detector.notify_skipped(
+            getattr(self, "_last_trans_frame", None),
+            roi_mode=roi_mode,
+            ruler_rect=self._get_ruler_rect(),
+        )
+
+    def on_ai_translation_error(self, err: str):
+        if getattr(self, "_last_trans_was_auto", False):
+            roi_mode = str(self.config.get("ai_translation", "auto_roi_mode", "auto") or "auto")
+            self.auto_trans_detector.notify_skipped(
+                getattr(self, "_last_trans_frame", None),
+                roi_mode=roi_mode,
+                ruler_rect=self._get_ruler_rect(),
+            )
+            if "No text detected" not in err:
+                self.video_widget.show_osd(f"🤖 Auto-Translate: {err}", 2000)
+        else:
+            QMessageBox.warning(self, "AI Translation Error", err)
 
     def on_ai_translation_finished(self, boxes: list, msg: str):
         self.video_widget.set_translation_boxes(boxes or [])
+
+        roi_mode = str(self.config.get("ai_translation", "auto_roi_mode", "auto") or "auto")
+        if getattr(self, "_last_trans_frame", None) is not None:
+            is_api = ("Instant Cache" not in msg) and ("Text Cache" not in msg)
+            self.auto_trans_detector.mark_translated(
+                self._last_trans_frame,
+                roi_mode=roi_mode,
+                ruler_rect=self._get_ruler_rect(),
+                is_api_call=is_api,
+            )
+
+        sig = getattr(self.trans_worker, "result_ocr_sig", "") if self.trans_worker else ""
+        if sig and boxes:
+            self._last_auto_ocr_sig = sig
+            cache = getattr(self, "_auto_ocr_cache", None)
+            if cache is not None:
+                if len(cache) > 150:
+                    cache.clear()
+                cache[sig] = boxes
+
+        # Refresh store contents in-place without resetting detector / OCR baselines
+        if getattr(self, "_auto_cache_store", None) is not None:
+            self._auto_cache_store.load()
 
         if boxes:
             blocks_html = []
@@ -504,6 +632,9 @@ class ApplicationActionsMixin:
         )
         if dlg.exec():
             self.act_trans_overlay.setChecked(bool(self.config.get("ai_translation", "overlay_enabled", True)))
+            self.act_auto_translate.setChecked(bool(self.config.get("ai_translation", "auto_translate", False)))
+            self.auto_trans_detector.reset()
+            self._sync_auto_translate_timer()
             self.video_widget.update()
 
     def trigger_instant_scene_dump(self):

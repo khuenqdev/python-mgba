@@ -5,12 +5,14 @@ import json
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
     QTableWidget, QTableWidgetItem, QHeaderView, QTabWidget, QWidget,
-    QMessageBox, QFileDialog, QComboBox, QCheckBox, QDialogButtonBox
+    QMessageBox, QFileDialog, QComboBox, QCheckBox, QDialogButtonBox,
+    QGroupBox, QSpinBox
 )
 from PyQt6.QtCore import Qt
 
 from .engines import LANG_NAMES
 from .glossary import GlossaryAndCacheStore
+from .auto_trigger import AutoTranslateDetector
 
 
 class TranslationGlossaryDialog(QDialog):
@@ -45,9 +47,7 @@ class TranslationGlossaryDialog(QDialog):
 
         self.tabs = QTabWidget()
 
-        # =====================================================================
         # TAB 1: PER-GAME GLOSSARY
-        # =====================================================================
         tab_glossary = QWidget()
         gl_layout = QVBoxLayout(tab_glossary)
 
@@ -91,9 +91,7 @@ class TranslationGlossaryDialog(QDialog):
         gl_layout.addLayout(gl_btns)
         self.tabs.addTab(tab_glossary, "📖 Per-Game Glossary")
 
-        # =====================================================================
         # TAB 2: TRANSLATION CACHE
-        # =====================================================================
         tab_cache = QWidget()
         ca_layout = QVBoxLayout(tab_cache)
 
@@ -141,9 +139,6 @@ class TranslationGlossaryDialog(QDialog):
         btn_close.clicked.connect(self.accept)
         root.addWidget(btn_close, alignment=Qt.AlignmentFlag.AlignRight)
 
-    # =========================================================================
-    # GLOSSARY ACTIONS
-    # =========================================================================
     def refresh_glossary_table(self):
         self.gl_table.blockSignals(True)
         items = sorted(self.store.terms.items(), key=lambda kv: kv[0])
@@ -232,9 +227,6 @@ class TranslationGlossaryDialog(QDialog):
         except Exception as e:
             QMessageBox.warning(self, "Export Error", f"Failed to export glossary:\n{e}")
 
-    # =========================================================================
-    # CACHE ACTIONS
-    # =========================================================================
     def refresh_cache_table(self):
         query = self.cache_search_edit.text().strip().lower() if hasattr(self, "cache_search_edit") else ""
         filtered = []
@@ -357,7 +349,7 @@ class TranslationGlossaryDialog(QDialog):
 
 
 class AITranslationConfigDialog(QDialog):
-    """Configures AI translation languages, fullscreen overlay, and opens the Glossary editor."""
+    """Configures AI translation languages, smart auto-trigger, and glossary access."""
 
     def __init__(self, config, parent=None, rom_path: str = "", game_code: str = ""):
         super().__init__(parent)
@@ -365,7 +357,7 @@ class AITranslationConfigDialog(QDialog):
         self.rom_path = rom_path
         self.game_code = game_code
         self.setWindowTitle("Configure AI Translation")
-        self.resize(400, 220)
+        self.resize(450, 340)
         self._init_ui()
 
     def _init_ui(self):
@@ -399,6 +391,46 @@ class AITranslationConfigDialog(QDialog):
         self.overlay_cb.setChecked(bool(self.config.get("ai_translation", "overlay_enabled", True)))
         layout.addWidget(self.overlay_cb)
 
+        # Smart Auto-Trigger Group
+        auto_grp = QGroupBox("Smart Auto-Translate Detector")
+        auto_lay = QVBoxLayout(auto_grp)
+
+        self.auto_cb = QCheckBox("Auto-Translate on Scene / Dialogue Change")
+        self.auto_cb.setChecked(bool(self.config.get("ai_translation", "auto_translate", False)))
+        auto_lay.addWidget(self.auto_cb)
+
+        roi_row = QHBoxLayout()
+        roi_row.addWidget(QLabel("Watch Region:"))
+        self.roi_combo = QComboBox()
+        for key, lbl in AutoTranslateDetector.ROI_MODES:
+            self.roi_combo.addItem(lbl, key)
+        cur_roi = self.config.get("ai_translation", "auto_roi_mode", "auto")
+        r_idx = self.roi_combo.findData(cur_roi)
+        if r_idx >= 0:
+            self.roi_combo.setCurrentIndex(r_idx)
+        roi_row.addWidget(self.roi_combo)
+        auto_lay.addLayout(roi_row)
+
+        timing_row = QHBoxLayout()
+        timing_row.addWidget(QLabel("Settle Debounce:"))
+        self.debounce_spin = QSpinBox()
+        self.debounce_spin.setRange(250, 3000)
+        self.debounce_spin.setSingleStep(100)
+        self.debounce_spin.setSuffix(" ms")
+        self.debounce_spin.setValue(int(self.config.get("ai_translation", "auto_debounce_ms", 900) or 900))
+        timing_row.addWidget(self.debounce_spin)
+
+        timing_row.addWidget(QLabel("API Cooldown:"))
+        self.cooldown_spin = QSpinBox()
+        self.cooldown_spin.setRange(500, 10000)
+        self.cooldown_spin.setSingleStep(200)
+        self.cooldown_spin.setSuffix(" ms")
+        self.cooldown_spin.setValue(int(self.config.get("ai_translation", "auto_cooldown_ms", 2800) or 2800))
+        timing_row.addWidget(self.cooldown_spin)
+        auto_lay.addLayout(timing_row)
+
+        layout.addWidget(auto_grp)
+
         btn_glossary = QPushButton("📖 Open Per-Game Glossary & Cache...")
         btn_glossary.setEnabled(bool(self.rom_path))
         btn_glossary.clicked.connect(self._open_glossary)
@@ -419,4 +451,8 @@ class AITranslationConfigDialog(QDialog):
         self.config.set("ai_translation", "source_lang", self.src_combo.currentData())
         self.config.set("ai_translation", "target_lang", self.tgt_combo.currentData())
         self.config.set("ai_translation", "overlay_enabled", self.overlay_cb.isChecked())
+        self.config.set("ai_translation", "auto_translate", self.auto_cb.isChecked())
+        self.config.set("ai_translation", "auto_roi_mode", self.roi_combo.currentData())
+        self.config.set("ai_translation", "auto_debounce_ms", self.debounce_spin.value())
+        self.config.set("ai_translation", "auto_cooldown_ms", self.cooldown_spin.value())
         self.accept()

@@ -421,8 +421,14 @@ class MenuBuilderMixin:
 
         ai_trans_act = QAction("⚡ Translate Screen with AI (Hotkey: T)", self)
         ai_trans_act.setShortcut(QKeySequence("T"))
-        ai_trans_act.triggered.connect(self.trigger_ai_translation)
+        ai_trans_act.triggered.connect(lambda: self.trigger_ai_translation(False))
         translation_menu.addAction(ai_trans_act)
+
+        self.act_auto_translate = QAction("🤖 Auto-Translate on Dialogue Change", self, checkable=True)
+        self.act_auto_translate.setShortcut(QKeySequence("Ctrl+Shift+A"))
+        self.act_auto_translate.setChecked(bool(self.config.get("ai_translation", "auto_translate", False)))
+        self.act_auto_translate.triggered.connect(self.toggle_auto_translate)
+        translation_menu.addAction(self.act_auto_translate)
 
         self.act_trans_overlay = QAction("Fullscreen Floating Subtitle Overlay", self, checkable=True)
         self.act_trans_overlay.setShortcut(QKeySequence("Ctrl+Shift+O"))

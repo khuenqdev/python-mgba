@@ -1,6 +1,8 @@
 # worker.py
 import os
+import re
 import csv
+from difflib import SequenceMatcher
 import numpy as np
 import cv2
 
@@ -11,7 +13,7 @@ from .engines import (
     get_meiki_reader,
     get_paddle_reader,
     get_easy_reader,
-    _normalize_text,
+    _has_meaningful_text,
     find_best_llm_model,
     get_llama_instance,
 )
@@ -21,36 +23,119 @@ from .local import LocalQwenTranslator
 from .glossary import GlossaryAndCacheStore
 
 
+def _normalize_ocr_signature(text: str) -> str:
+    """Normalizes OCR/vision text by stripping cursor glyphs, brackets, and whitespace."""
+    if not text:
+        return ""
+    cleaned = re.sub(r'[▶▷►▼▽▲△◀◁\s\-_=•·・]+', '', text)
+    return cleaned.strip()
+
+
+def _has_dialogue_or_menu_text(raw_lines: list, src_lang: str) -> bool:
+    """Filters out pure numeric action-game HUDs (HP, timers, scores, FPS)."""
+    joined = "".join(t for _, t, _ in raw_lines).strip()
+    if not _has_meaningful_text(joined):
+        return False
+    if src_lang == "ja":
+        # Require at least 2 Japanese kana/kanji characters OR >= 4 alphabetic characters
+        jp_chars = re.findall(r'[\u3040-\u309f\u30a0-\u30ff\u4e00-\u9faf]', joined)
+        alpha_chars = re.findall(r'[A-Za-z]', joined)
+        return len(jp_chars) >= 2 or len(alpha_chars) >= 4
+    alpha_chars = re.findall(r'[A-Za-z\u00C0-\u1EF9]', joined)
+    return len(alpha_chars) >= 3
+
+
 class TranslationWorker(QThread):
     finished = pyqtSignal(list, str)
+    skipped = pyqtSignal(str)
     error = pyqtSignal(str)
 
-    def __init__(self, frame_data: np.ndarray, rom_path: str, config, game_code: str = ""):
+    def __init__(
+        self,
+        frame_data: np.ndarray,
+        rom_path: str,
+        config,
+        game_code: str = "",
+        auto_triggered: bool = False,
+        last_auto_ocr_sig: str = "",
+        auto_ocr_cache: dict | None = None,
+    ):
         super().__init__()
         self.frame_data = frame_data
         self.rom_path = rom_path
         self.config = config
         self.game_code = game_code
+        self.auto_triggered = bool(auto_triggered)
+        self.last_auto_ocr_sig = last_auto_ocr_sig or ""
+        self.auto_ocr_cache = auto_ocr_cache if auto_ocr_cache is not None else {}
+        self.result_ocr_sig = ""
 
     def preprocess_image(self, img_array: np.ndarray, scale: int = 4) -> np.ndarray:
         height, width, _ = img_array.shape
         return cv2.resize(img_array, (width * scale, height * scale), interpolation=cv2.INTER_LANCZOS4)
 
+    def _run_local_ocr_raw(self, img_np: np.ndarray, src_lang: str, models_dir: str) -> tuple[list, str]:
+        results = []
+        ocr_engine_name = "None"
+
+        if src_lang == "ja":
+            meiki_reader = get_meiki_reader()
+            if meiki_reader:
+                try:
+                    img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+                    meiki_lines = meiki_reader.run_ocr(img_bgr)
+                    for line in meiki_lines:
+                        chars = line.get("chars", [])
+                        if not chars:
+                            continue
+                        clean_text = _clean_meiki_chars_furigana(chars).strip()
+                        if not clean_text:
+                            continue
+                        xs = [c["bbox"][0] for c in chars] + [c["bbox"][2] for c in chars]
+                        ys = [c["bbox"][1] for c in chars] + [c["bbox"][3] for c in chars]
+                        bbox = [[min(xs), min(ys)], [max(xs), min(ys)], [max(xs), max(ys)], [min(xs), max(ys)]]
+                        results.append((bbox, clean_text, 1.0))
+                    return results, "MeikiOCR"
+                except Exception as e:
+                    print(f"[OCR Warning] MeikiOCR failed ({e}). Trying PaddleOCR...")
+
+        paddle_reader = get_paddle_reader(src_lang)
+        if paddle_reader:
+            try:
+                paddle_res = paddle_reader.predict(img_np)
+                if paddle_res:
+                    for res in paddle_res:
+                        if isinstance(res, dict):
+                            for poly, text, conf in zip(res.get("dt_polys", []), res.get("rec_text", []), res.get("rec_score", [])):
+                                results.append((poly, text, conf))
+                        elif hasattr(res, "keys"):
+                            for poly, text, conf in zip(res["dt_polys"], res["rec_text"], res["rec_score"]):
+                                results.append((poly, text, conf))
+                return results, "PaddleOCR"
+            except Exception as e:
+                print(f"[OCR Warning] PaddleOCR failed ({e}). Trying EasyOCR...")
+
+        easy_reader = get_easy_reader(src_lang, models_dir)
+        if easy_reader:
+            try:
+                results = easy_reader.readtext(img_np, text_threshold=0.5, low_text=0.3)
+                return results, "EasyOCR"
+            except Exception as e:
+                print(f"[OCR Warning] EasyOCR failed: {e}")
+
+        return results, ocr_engine_name
+
     def _apply_store_overrides(self, store: GlossaryAndCacheStore, boxes: list, src_lang: str, tgt_lang: str):
-        """Applies exact glossary terms & locked cache overrides to translated boxes."""
         for b in boxes:
-            # 1. Glossary speaker match always takes precedence
             if b.speaker_orig:
                 gl_sp = store.lookup_term(b.speaker_orig)
                 if gl_sp:
                     b.speaker_trans = gl_sp
 
-            # 2. Exact glossary match for standalone menu/label/term blocks
             gl_term = store.lookup_term(b.original)
             if gl_term:
                 b.translated = gl_term
 
-            # 3. Locked manual cache override wins over AI output
             cached = store.lookup_entry(src_lang, tgt_lang, b.category, b.speaker_orig, b.original)
             if cached and cached.get("locked"):
                 b.translated = cached.get("translated") or b.translated
@@ -95,8 +180,44 @@ class TranslationWorker(QThread):
                 )
                 for it in cached_frame_items
             ]
+            self.result_ocr_sig = _normalize_ocr_signature("".join(b.original for b in boxes))
             self.finished.emit(boxes, f"Translated {len(boxes)} block(s) via Instant Cache [{store.game_id}]")
             return
+
+        SCALE = 4
+        precomputed_ocr = None
+        precomputed_engine = "None"
+        local_ocr_sig = ""
+
+        # 1. Local OCR Text-Change Gate (prevents API spam in action games & animated menus)
+        if self.auto_triggered:
+            img_np = self.preprocess_image(self.frame_data, scale=SCALE)
+            precomputed_ocr, precomputed_engine = self._run_local_ocr_raw(img_np, src_lang, models_dir)
+
+            if precomputed_engine != "None":
+                if not precomputed_ocr or not _has_dialogue_or_menu_text(precomputed_ocr, src_lang):
+                    self.skipped.emit("Auto-skip: No dialogue/menu text on screen")
+                    return
+
+                merged_preview = self._merge_horizontal_row_fragments(precomputed_ocr)
+                local_ocr_sig = _normalize_ocr_signature("".join(t for _, t, _ in merged_preview))
+                if not local_ocr_sig:
+                    self.skipped.emit("Auto-skip: No meaningful text")
+                    return
+
+                # Skip if on-screen text is >= 82% identical to the previous screen (animated cursor/portrait)
+                if self.last_auto_ocr_sig:
+                    sim = SequenceMatcher(None, local_ocr_sig, self.last_auto_ocr_sig).ratio()
+                    if sim >= 0.82:
+                        self.skipped.emit("Auto-skip: Text unchanged")
+                        return
+
+                # Reuse in-memory session translation if exact normalized text was already seen
+                if local_ocr_sig in self.auto_ocr_cache:
+                    cached_boxes = self.auto_ocr_cache[local_ocr_sig]
+                    self.result_ocr_sig = local_ocr_sig
+                    self.finished.emit(cached_boxes, f"Translated {len(cached_boxes)} block(s) via Text Cache [{store.game_id}]")
+                    return
 
         game_name = os.path.splitext(os.path.basename(self.rom_path))[0]
         csv_path = os.path.join(trans_dir, f"{game_name}_translations.csv")
@@ -105,7 +226,7 @@ class TranslationWorker(QThread):
         criteria = get_or_create_game_criteria(self.rom_path, src_lang, tgt_lang, groq_api_key, trans_dir)
         glossary_prompt = store.format_glossary_prompt()
 
-        # 1. Primary: Groq Multimodal Vision
+        # 2. Primary: Groq Multimodal Vision
         if groq_api_key:
             vision_boxes, vision_model = run_groq_vision(
                 self.frame_data, src_lang, tgt_lang, groq_api_key, criteria, glossary_text=glossary_prompt
@@ -115,73 +236,27 @@ class TranslationWorker(QThread):
                 store.save_frame_layout(frame_hash, vision_boxes)
                 store.save_cache()
                 self._export_csv_mirror(csv_path, store)
+                self.result_ocr_sig = local_ocr_sig or _normalize_ocr_signature(
+                    "".join((b.speaker_orig + b.original) for b in vision_boxes)
+                )
                 status_msg = f"Translated {len(vision_boxes)} block(s) via Groq Vision [{vision_model}]"
                 self.finished.emit(vision_boxes, status_msg)
                 return
             else:
                 print("[AI Translator] Groq Vision rate limited or unavailable. Falling back to local OCR...")
 
-        # 2. Offline Fallback (MeikiOCR > PaddleOCR > EasyOCR)
-        SCALE = 4
-        img_np = self.preprocess_image(self.frame_data, scale=SCALE)
-
-        results = []
-        ocr_engine_name = "None"
-
-        if src_lang == "ja":
-            meiki_reader = get_meiki_reader()
-            if meiki_reader:
-                try:
-                    img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-                    meiki_lines = meiki_reader.run_ocr(img_bgr)
-                    for line in meiki_lines:
-                        chars = line.get("chars", [])
-                        if not chars:
-                            continue
-                        clean_text = _clean_meiki_chars_furigana(chars).strip()
-                        if not clean_text:
-                            continue
-
-                        xs = [c["bbox"][0] for c in chars] + [c["bbox"][2] for c in chars]
-                        ys = [c["bbox"][1] for c in chars] + [c["bbox"][3] for c in chars]
-                        bbox = [[min(xs), min(ys)], [max(xs), min(ys)], [max(xs), max(ys)], [min(xs), max(ys)]]
-                        results.append((bbox, clean_text, 1.0))
-                    if results:
-                        ocr_engine_name = "MeikiOCR"
-                except Exception as e:
-                    print(f"[OCR Warning] MeikiOCR failed ({e}). Trying PaddleOCR...")
+        # 3. Offline Fallback (reuse precomputed OCR if auto-triggered already scanned it)
+        if precomputed_ocr is not None and precomputed_engine != "None":
+            results, ocr_engine_name = precomputed_ocr, precomputed_engine
+        else:
+            img_np = self.preprocess_image(self.frame_data, scale=SCALE)
+            results, ocr_engine_name = self._run_local_ocr_raw(img_np, src_lang, models_dir)
 
         if not results:
-            paddle_reader = get_paddle_reader(src_lang)
-            if paddle_reader:
-                try:
-                    paddle_res = paddle_reader.predict(img_np)
-                    if paddle_res:
-                        for res in paddle_res:
-                            if isinstance(res, dict):
-                                for poly, text, conf in zip(res.get("dt_polys", []), res.get("rec_text", []), res.get("rec_score", [])):
-                                    results.append((poly, text, conf))
-                            elif hasattr(res, "keys"):
-                                for poly, text, conf in zip(res["dt_polys"], res["rec_text"], res["rec_score"]):
-                                    results.append((poly, text, conf))
-                    if results:
-                        ocr_engine_name = "PaddleOCR"
-                except Exception as e:
-                    print(f"[OCR Warning] PaddleOCR failed ({e}). Trying EasyOCR...")
-
-        if not results:
-            easy_reader = get_easy_reader(src_lang, models_dir)
-            if easy_reader:
-                try:
-                    results = easy_reader.readtext(img_np, text_threshold=0.5, low_text=0.3)
-                    if results:
-                        ocr_engine_name = "EasyOCR"
-                except Exception as e:
-                    self.error.emit(f"All OCR backends failed: {e}")
-                    return
-
-        if not results:
-            self.error.emit("No text detected on screen.")
+            if self.auto_triggered:
+                self.skipped.emit("No text detected on screen.")
+            else:
+                self.error.emit("No text detected on screen.")
             return
 
         merged_rows = self._merge_horizontal_row_fragments(results)
@@ -246,6 +321,10 @@ class TranslationWorker(QThread):
         store.save_frame_layout(frame_hash, translated_boxes)
         store.save_cache()
         self._export_csv_mirror(csv_path, store)
+
+        self.result_ocr_sig = local_ocr_sig or _normalize_ocr_signature(
+            "".join((b.speaker_orig + b.original) for b in translated_boxes)
+        )
 
         if cache_hits == len(translated_boxes) and translated_boxes:
             backend_tag = f"Cache/Glossary [{store.game_id}]"

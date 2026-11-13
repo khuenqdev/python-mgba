@@ -6,8 +6,10 @@ from PyQt6.QtWidgets import QMainWindow, QTextEdit, QSplitter, QSizePolicy, QMes
 from PyQt6.QtCore import Qt, QTimer, QEvent
 
 from ..core.clip_recorder import ClipRecorder
+from ..core.netplay import NetplayEngine
 from .controller import ControllerManager
 from ..tools.dev_tools import MemoryViewerDialog
+from ..tools.ai_translator import AutoTranslateDetector
 from .shader_manager import RetroArchShaderManager
 from ..paths import PROJECT_ROOT
 
@@ -31,9 +33,10 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
     else:
         DEFAULT_CORE = "mgba_libretro.dylib"
 
-    def __init__(self, config):
+    def __init__(self, config, player_slot: int = 1):
         super().__init__()
         self.config = config
+        self.player_slot = max(1, int(player_slot))
         self.worker = None
         self.current_rom = None
         self.clean_rom = None
@@ -51,20 +54,39 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
         self.trans_worker = None
         self._auto_paused = False
 
+        # Smart Auto-Translate State
+        self.auto_trans_detector = AutoTranslateDetector()
+        self._auto_cache_store = None
+        self._auto_cache_key = None
+        self._last_trans_was_auto = False
+        self._last_trans_frame = None
+        self.auto_trans_timer = QTimer(self)
+        self.auto_trans_timer.setInterval(150)
+        self.auto_trans_timer.timeout.connect(self._poll_auto_translate)
+
         # Fullscreen restoration cache
         self._pre_fs_geometry = None
         self._pre_fs_splitter = None
         self._pre_fs_hud_visible = None
         self._pre_fs_trans_visible = None
 
-        self.setWindowTitle("mGBA (PyQt6 Replica)")
+        slot_tag = f" [Peer {self.player_slot}]" if self.player_slot > 1 else ""
+        self.setWindowTitle(f"mGBA (PyQt6 Replica){slot_tag}")
         self.setAcceptDrops(True)
 
         script_dir = str(PROJECT_ROOT)
         self.core_path = os.path.join(script_dir, self.DEFAULT_CORE)
 
-        # Initialize RetroArch Shader Engine
+        # Initialize RetroArch Shader Engine & Netplay/Link Engine
         self.shader_manager = RetroArchShaderManager(self.config)
+        self.netplay_engine = NetplayEngine(self)
+        self.netplay_engine.state_sync_received.connect(self._on_netplay_state_received)
+        self.netplay_engine.status_changed.connect(
+            lambda code, msg: self.video_widget.show_osd(f"🌐 {code}: {msg}", 2500)
+        )
+        self.netplay_engine.error_occurred.connect(
+            lambda err: self.video_widget.show_osd(f"🌐 Netplay Error: {err}", 3500)
+        )
 
         self.controller_manager = ControllerManager(self.config)
         self.gamepad_timer = QTimer(self)
@@ -121,7 +143,6 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
         self.splitter.setStretchFactor(1, 0)
         self.splitter.setStretchFactor(2, 2)
 
-        # Restore window geometry & splitter heights from persistent configuration
         saved_w = self.config.get("video", "window_width")
         saved_h = self.config.get("video", "window_height")
         saved_splitter = self.config.get("video", "splitter_sizes")
@@ -279,6 +300,8 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
     def changeEvent(self, event):
         if event.type() == QEvent.Type.ActivationChange:
             pause_enabled = bool(self.config.get("emulation", "pause_on_unfocus", True))
+            if getattr(self, "netplay_engine", None) and self.netplay_engine.is_connected:
+                pause_enabled = False
             if not self.isActiveWindow():
                 if self.worker and getattr(self.worker, "is_rewinding", False):
                     self.worker.set_rewinding(False)
@@ -301,6 +324,8 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
 
     def on_game_identified(self, title: str, code: str, hw_type: str):
         display_title = f"mGBA - {title} [{code}]"
+        if self.player_slot > 1:
+            display_title += f" [Peer {self.player_slot}]"
         if hw_type != "None":
             display_title += f" ({hw_type.replace('_', ' ').title()})"
         if self.active_patch:
@@ -394,8 +419,8 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
             self.reset_sensors()
             return
 
-        if event.key() == Qt.Key.Key_T:
-            self.trigger_ai_translation()
+        if event.key() == Qt.Key.Key_T and event.modifiers() == Qt.KeyboardModifier.NoModifier:
+            self.trigger_ai_translation(False)
             return
 
         if (
@@ -483,6 +508,12 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
         self.is_running = False
         if hasattr(self, "gamepad_timer"):
             self.gamepad_timer.stop()
+
+        if hasattr(self, "auto_trans_timer"):
+            self.auto_trans_timer.stop()
+
+        if hasattr(self, "netplay_engine") and self.netplay_engine:
+            self.netplay_engine.stop()
 
         if hasattr(self, "clip_recorder"):
             if self.clip_recorder.is_recording:

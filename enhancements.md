@@ -2,7 +2,7 @@
 
 ### 1. Advanced AI Translation & Localization Workstation
 
-- [ ] 1. **Auto-Translate on Scene / Dialogue Change (Smart Auto-Trigger)**
+- [X] 1. **Auto-Translate on Scene / Dialogue Change (Smart Auto-Trigger)**
 
   * **Current State:** Translation currently requires manual invocation via hotkey (`T`).
   * **Enhancement:** Add an optional auto-translate background detector. Monitor frame differences (using perceptual hashing, SSIM via OpenCV, or VRAM tilemap dirty tracking) on text regions. Automatically queue an AI translation without user input when a dialogue box advances, with a debounce timer to avoid API throttling.
@@ -69,7 +69,7 @@
 
   * **Current State:** Games are loaded exclusively through file dialogs or the recent files menu.
   * **Enhancement:** Add a visual grid launcher view when no game is running, displaying scanned games from a `roms/` folder with scraped box art, game title, publisher, and cartridge metadata.
-- [ ] 14. **Per-Game Playtime & Statistics Tracking**
+- [X] 14. **Per-Game Playtime & Statistics Tracking**
 
   * **Current State:** Per-game profiles save configuration settings, but gameplay statistics are not recorded.
   * **Enhancement:** Track and persist `playtime_seconds`, `launch_count`, and `last_played` timestamps inside each game's `profiles/<game_code>.json`, displaying stats in the status HUD or launcher.

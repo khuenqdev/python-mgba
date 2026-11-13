@@ -65,7 +65,11 @@ DEFAULT_CONFIG = {
     "ai_translation": {
         "source_lang": "ja",
         "target_lang": "vi",
-        "overlay_enabled": True
+        "overlay_enabled": True,
+        "auto_translate": False,
+        "auto_debounce_ms": 900,
+        "auto_cooldown_ms": 2800,
+        "auto_roi_mode": "auto"
     },
     "netplay": {
         "host": "127.0.0.1",
