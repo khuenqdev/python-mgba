@@ -2,8 +2,8 @@
 import sys
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication
-from config import EmulatorConfig
-from gui import MainWindow
+from gba_studio.core.config import EmulatorConfig
+from gba_studio.ui.gui import MainWindow
 
 def main():
     QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseDesktopOpenGL)

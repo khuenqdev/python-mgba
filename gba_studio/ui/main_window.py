@@ -1,0 +1,330 @@
+# gui.py
+import os
+import sys
+import html
+import math
+import datetime
+import numpy as np
+
+from PyQt6.QtWidgets import (QMainWindow, QWidget, QFileDialog, QMessageBox, 
+                             QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
+                             QComboBox, QPushButton, QTextEdit, QSplitter, 
+                             QFrame, QSizePolicy)
+from PyQt6.QtGui import (QImage, QPainter, QAction, QActionGroup, QKeySequence, 
+                         QColor, QFont, QPen, QBrush)
+from PyQt6.QtCore import Qt, QTimer, QPoint, QRect, QEvent, QSize
+from PyQt6.QtOpenGLWidgets import QOpenGLWidget
+from PyQt6.QtOpenGL import QOpenGLTexture
+
+from ..core.core_worker import EmulatorWorker
+from .controller import ControllerManager, ControllerConfigDialog, LIBRETRO_BTNS, QT_KEY_MAP
+from ..tools.dev_tools import (PaletteViewerDialog, SpriteViewerDialog, TileViewerDialog,
+                               MapViewerDialog, FrameInspectorDialog, MemoryViewerDialog,
+                               MemorySearchDialog, IORegisterViewerDialog)
+from ..tools.ai_translator import TranslationWorker
+from .shader_manager import RetroArchShaderManager
+from .shader_dialog import ShaderConfigDialog
+from ..paths import PROJECT_ROOT
+
+
+from .video_widget import VideoGLWidget
+from .sensor_hud import SensorHudWidget
+
+from .menu_actions import MenuBuilderMixin
+from .application_actions import ApplicationActionsMixin
+from .settings_actions import SettingsActionsMixin
+from .runtime_actions import RuntimeActionsMixin
+
+class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, SettingsActionsMixin, RuntimeActionsMixin):
+    if sys.platform.startswith('win'):
+        DEFAULT_CORE = "mgba_libretro.dll"
+    elif sys.platform.startswith('linux'):
+        DEFAULT_CORE = "mgba_libretro.so"
+    else:
+        DEFAULT_CORE = "mgba_libretro.dylib"
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.worker = None
+        self.current_rom = None
+        
+        # Restore active scale factor
+        saved_scale = self.config.get("video", "scale")
+        try:
+            self.scale_factor = max(1, min(6, int(saved_scale))) if saved_scale is not None else 3
+        except (ValueError, TypeError):
+            self.scale_factor = 3
+
+        self.current_slot = self.config.get("emulation", "state_slot") or 1
+        self.active_tool_window = None 
+        self.trans_worker = None
+        self._auto_paused = False
+        
+        self.setWindowTitle("mGBA (PyQt6 Replica)")
+        
+        script_dir = str(PROJECT_ROOT)
+        self.core_path = os.path.join(script_dir, self.DEFAULT_CORE)
+
+        # Initialize RetroArch Shader Engine
+        self.shader_manager = RetroArchShaderManager(self.config)
+
+        self.controller_manager = ControllerManager(self.config)
+        self.gamepad_timer = QTimer(self)
+        self.gamepad_timer.timeout.connect(self.poll_gamepad)
+        self.gamepad_timer.start(8)
+
+        # Vertical Splitter: OpenGL Video -> HUD Panel -> Subtitle Panel
+        self.splitter = QSplitter(Qt.Orientation.Vertical)
+        self.splitter.setHandleWidth(3)
+        self.splitter.setStyleSheet("QSplitter::handle { background-color: #282828; }")
+        self.splitter.splitterMoved.connect(self.on_splitter_moved)
+
+        # 1. Hardware-Accelerated OpenGL Video Surface
+        self.video_widget = VideoGLWidget(self.shader_manager)
+        self.splitter.addWidget(self.video_widget)
+
+        # 2. Separated Sensor & Rumble HUD Panel
+        self.sensor_hud = SensorHudWidget()
+        show_hud_pref = bool(self.config.get("sensors", "show_hud", True))
+        self.sensor_hud.setVisible(show_hud_pref)
+        self.splitter.addWidget(self.sensor_hud)
+
+        # 3. Translation Subtitle Panel
+        self.translation_panel = QTextEdit()
+        self.translation_panel.setReadOnly(True)
+        self.translation_panel.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.translation_panel.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self.translation_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.translation_panel.setMinimumSize(0, 50)
+        self.translation_panel.setStyleSheet("""
+            QTextEdit {
+                background-color: #101216;
+                color: #E0E0E0;
+                font-family: 'Segoe UI', 'Meiryo', sans-serif;
+                font-size: 13px;
+                border: none;
+                padding: 6px 10px;
+                line-height: 1.4;
+            }
+        """)
+        self.translation_panel.setPlaceholderText("Press [T] to translate screen with AI...")
+        self.splitter.addWidget(self.translation_panel)
+
+        self.splitter.setStretchFactor(0, 8)
+        self.splitter.setStretchFactor(1, 0)
+        self.splitter.setStretchFactor(2, 2)
+
+        # Restore window geometry & splitter heights from persistent configuration
+        saved_w = self.config.get("video", "window_width")
+        saved_h = self.config.get("video", "window_height")
+        saved_splitter = self.config.get("video", "splitter_sizes")
+
+        default_hud_h = 30 if show_hud_pref else 0
+        default_panel_h = 75 if self.scale_factor <= 2 else 115
+        default_vid_h = 160 * self.scale_factor
+        default_vid_w = 240 * self.scale_factor
+
+        if saved_w and saved_h:
+            try:
+                self.resize(int(saved_w), int(saved_h))
+            except Exception:
+                self.resize(default_vid_w, default_vid_h + default_hud_h + default_panel_h)
+        else:
+            self.resize(default_vid_w, default_vid_h + default_hud_h + default_panel_h)
+
+        if saved_splitter and isinstance(saved_splitter, list) and len(saved_splitter) == 3:
+            try:
+                sz = [int(s) for s in saved_splitter]
+                if not show_hud_pref:
+                    sz[1] = 0
+                elif sz[1] <= 0:
+                    sz[1] = 30
+                self.splitter.setSizes(sz)
+            except Exception:
+                self.splitter.setSizes([default_vid_h, default_hud_h, default_panel_h])
+        else:
+            self.splitter.setSizes([default_vid_h, default_hud_h, default_panel_h])
+
+        self.setCentralWidget(self.splitter)
+        
+        self._create_menus()
+        self._sync_ui_with_config()
+        self.update_recent_menu()
+        self.video_widget.setFocus()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if not self.isMaximized() and not self.isMinimized():
+            self.config.set("video", "window_width", self.width())
+            self.config.set("video", "window_height", self.height())
+            if hasattr(self, 'splitter'):
+                self.config.set("video", "splitter_sizes", self.splitter.sizes())
+
+    def on_splitter_moved(self, pos, index):
+        if not self.isMaximized() and not self.isMinimized():
+            self.config.set("video", "splitter_sizes", self.splitter.sizes())
+
+    def changeEvent(self, event):
+        if event.type() == QEvent.Type.ActivationChange:
+            pause_enabled = bool(self.config.get("emulation", "pause_on_unfocus", True))
+            if not self.isActiveWindow():
+                if pause_enabled and self.worker and hasattr(self, 'is_running') and self.is_running and not self.worker.is_paused:
+                    self._auto_paused = True
+                    self.worker.is_paused = True
+                    self.pause_action.setChecked(True)
+                    self.video_widget.show_osd("⏸ Auto-Paused (Window Inactive)", 1500)
+            else:
+                if getattr(self, '_auto_paused', False):
+                    self._auto_paused = False
+                    if self.worker and hasattr(self, 'is_running') and self.is_running:
+                        self.worker.is_paused = False
+                        self.pause_action.setChecked(False)
+                        self.video_widget.show_osd("▶ Resumed", 1000)
+        super().changeEvent(event)
+
+    def on_manual_rumble_test(self):
+        self.sensor_hud.on_rumble_triggered(1.0, 1.0, 300)
+
+    def on_game_identified(self, title: str, code: str, hw_type: str):
+        display_title = f"mGBA - {title} [{code}]"
+        if hw_type != "None":
+            display_title += f" ({hw_type.replace('_', ' ').title()})"
+        self.setWindowTitle(display_title)
+        self.video_widget.show_osd(f"Loaded: {title} [{code}]", 2500)
+
+    def keyPressEvent(self, event):
+        if not self.worker:
+            return
+
+        if event.key() in [Qt.Key.Key_Equal, Qt.Key.Key_Plus] and not event.isAutoRepeat():
+            if not self.ff_action.isChecked():
+                self.ff_action.setChecked(True)
+                self.toggle_ff()
+            else:
+                self.cycle_ff_speed(forward=True)
+            return
+
+        if event.key() in [Qt.Key.Key_Minus, Qt.Key.Key_Underscore] and not event.isAutoRepeat():
+            if not self.ff_action.isChecked():
+                self.ff_action.setChecked(True)
+                self.toggle_ff()
+            else:
+                cur_ratio = float(self.config.get("emulation", "fast_forward_ratio") or 2.0)
+                if abs(cur_ratio - 1.5) < 0.01:
+                    self.ff_action.setChecked(False)
+                    self.toggle_ff()
+                else:
+                    self.cycle_ff_speed(forward=False)
+            return
+
+        if event.key() == Qt.Key.Key_BracketRight:
+            self.adjust_solar_sensor(1)
+            return
+        if event.key() == Qt.Key.Key_BracketLeft:
+            self.adjust_solar_sensor(-1)
+            return
+
+        if event.key() == Qt.Key.Key_Q:
+            new_ang = (self.sensor_hud.current_gyro_angle - 15) % 360
+            self.worker.set_gyro_angle(new_ang)
+            return
+        if event.key() == Qt.Key.Key_E:
+            new_ang = (self.sensor_hud.current_gyro_angle + 15) % 360
+            self.worker.set_gyro_angle(new_ang)
+            return
+        if event.key() == Qt.Key.Key_Backspace:
+            self.reset_sensors()
+            return
+
+        if event.key() == Qt.Key.Key_T:
+            self.trigger_ai_translation()
+            return
+
+        if ((event.key() == Qt.Key.Key_D and 
+             event.modifiers() == (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)) 
+            or event.key() == Qt.Key.Key_F11):
+            self.trigger_instant_scene_dump()
+            return
+
+        if event.key() == Qt.Key.Key_G and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            self.open_graphic_editor()
+            return
+
+        if event.key() == Qt.Key.Key_H and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            self._open_dev_tool(MemoryViewerDialog)
+            return
+
+        if event.key() == Qt.Key.Key_Tab and not event.isAutoRepeat():
+            self.ff_action.setChecked(True)
+            self.toggle_ff()
+            return
+
+        if event.key() == Qt.Key.Key_R and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            self.reset_emulation()
+            return
+
+        if event.key() == Qt.Key.Key_N and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            self.step_frame()
+            return
+
+        if event.key() == Qt.Key.Key_F10:
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                self.quick_save_state(self.current_slot)
+            else:
+                self.quick_load_state(self.current_slot)
+            return
+
+        if Qt.Key.Key_F1 <= event.key() <= Qt.Key.Key_F9:
+            slot = event.key() - Qt.Key.Key_F1 + 1
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                self.quick_save_state(slot)
+            else:
+                self.quick_load_state(slot)
+            return
+
+        af_btn = self.autofire_keymap.get(event.key())
+        if af_btn and not event.isAutoRepeat():
+            self.worker.set_autofire(af_btn, True)
+            return
+
+        btn_id = self.keymap.get(event.key())
+        if btn_id is not None and not event.isAutoRepeat():
+            self.worker.set_input(btn_id, True)
+
+    def keyReleaseEvent(self, event):
+        if not self.worker:
+            return
+
+        if event.key() == Qt.Key.Key_Tab and not event.isAutoRepeat():
+            self.ff_action.setChecked(False)
+            self.toggle_ff()
+            return
+
+        af_btn = self.autofire_keymap.get(event.key())
+        if af_btn and not event.isAutoRepeat():
+            self.worker.set_autofire(af_btn, False)
+            return
+
+        btn_id = self.keymap.get(event.key())
+        if btn_id is not None and not event.isAutoRepeat():
+            self.worker.set_input(btn_id, False)
+
+    def closeEvent(self, event):
+        self.is_running = False
+        if hasattr(self, 'gamepad_timer'):
+            self.gamepad_timer.stop()
+        if self.worker:
+            self.worker.stop()
+            self.worker.wait()
+            
+        if not self.isMaximized() and not self.isMinimized():
+            self.config.set("video", "window_width", self.width())
+            self.config.set("video", "window_height", self.height())
+            if hasattr(self, 'splitter'):
+                self.config.set("video", "splitter_sizes", self.splitter.sizes())
+        self.config.set("video", "scale", self.scale_factor)
+        self.config.set("sensors", "show_hud", self.sensor_hud.isVisible())
+        self.config.set("shaders", "enabled", self.shader_manager.enabled)
+        self.config.save()
+        event.accept()

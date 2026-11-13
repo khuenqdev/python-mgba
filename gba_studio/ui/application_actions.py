@@ -1,0 +1,319 @@
+# gui.py
+import os
+import sys
+import html
+import math
+import datetime
+import numpy as np
+
+from PyQt6.QtWidgets import (QMainWindow, QWidget, QFileDialog, QMessageBox, 
+                             QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
+                             QComboBox, QPushButton, QTextEdit, QSplitter, 
+                             QFrame, QSizePolicy)
+from PyQt6.QtGui import (QImage, QPainter, QAction, QActionGroup, QKeySequence, 
+                         QColor, QFont, QPen, QBrush)
+from PyQt6.QtCore import Qt, QTimer, QPoint, QRect, QEvent, QSize
+from PyQt6.QtOpenGLWidgets import QOpenGLWidget
+from PyQt6.QtOpenGL import QOpenGLTexture
+
+from ..core.core_worker import EmulatorWorker
+from .controller import ControllerManager, ControllerConfigDialog, LIBRETRO_BTNS, QT_KEY_MAP
+from ..tools.dev_tools import (PaletteViewerDialog, SpriteViewerDialog, TileViewerDialog,
+                               MapViewerDialog, FrameInspectorDialog, MemoryViewerDialog,
+                               MemorySearchDialog, IORegisterViewerDialog)
+from ..tools.ai_translator import TranslationWorker
+from .shader_manager import RetroArchShaderManager
+from .shader_dialog import ShaderConfigDialog
+from ..paths import PROJECT_ROOT
+
+
+from .video_widget import VideoGLWidget
+from .sensor_hud import SensorHudWidget
+
+class ApplicationActionsMixin:
+    def open_shader_dialog(self):
+        dlg = ShaderConfigDialog(self.shader_manager, self.video_widget, self.config, self)
+        dlg.exec()
+        self.act_shader_toggle.setChecked(self.shader_manager.enabled)
+
+    def toggle_shaders(self):
+        val = self.act_shader_toggle.isChecked()
+        self.shader_manager.enabled = val
+        self.config.set("shaders", "enabled", val)
+        self.config.save()
+        self.video_widget.update()
+        self.video_widget.show_osd(f"Shaders: {'ON' if val else 'OFF'}")
+
+    def apply_quick_shader_preset(self, preset_id: str):
+        self.shader_manager.load_preset_by_name(preset_id)
+        self.shader_manager.enabled = True
+        self.act_shader_toggle.setChecked(True)
+        self.config.set("shaders", "enabled", True)
+        self.config.set("shaders", "preset", preset_id)
+        self.config.save()
+        self.video_widget.update()
+        self.video_widget.show_osd(f"Preset Applied: {preset_id.replace('_', ' ').title()}")
+
+    def set_scale(self, scale: int):
+        """Applies exact GBA 3:2 geometric scaling with zero pillarboxing and full persistence."""
+        self.scale_factor = scale
+        self.config.set("video", "scale", scale)
+        if scale in self.scale_actions:
+            self.scale_actions[scale].setChecked(True)
+
+        hud_h = 30 if self.sensor_hud.isVisible() else 0
+        panel_h = 75 if scale <= 2 else 115
+        video_h = 160 * scale
+        video_w = 240 * scale
+        total_h = video_h + hud_h + panel_h
+
+        self.splitter.setSizes([video_h, hud_h, panel_h])
+        self.resize(video_w, total_h)
+        
+        self.config.set("video", "window_width", video_w)
+        self.config.set("video", "window_height", total_h)
+        self.config.set("video", "splitter_sizes", [video_h, hud_h, panel_h])
+        self.config.save()
+        self.video_widget.show_osd(f"Window Scale: {scale}x ({video_w}×{video_h})")
+
+    # =========================================================================
+    # SENSORS & MOTION SLOTS
+    # =========================================================================
+    def toggle_pause_on_unfocus(self):
+        val = self.pause_unfocus_action.isChecked()
+        self.config.set("emulation", "pause_on_unfocus", val)
+        self.video_widget.show_osd(f"Pause When Unfocused: {'ON' if val else 'OFF'}")
+
+    def toggle_sensor_hud(self):
+        val = self.act_sensor_hud.isChecked()
+        self.config.set("sensors", "show_hud", val)
+        self.sensor_hud.setVisible(val)
+
+        sizes = self.splitter.sizes()
+        if len(sizes) == 3:
+            sizes[1] = 30 if val else 0
+            self.splitter.setSizes(sizes)
+            self.config.set("video", "splitter_sizes", sizes)
+        self.config.save()
+        self.video_widget.show_osd(f"Sensor HUD: {'ON' if val else 'OFF'}")
+
+    def set_solar_level(self, level: int):
+        if self.worker:
+            self.worker.set_solar_level(level)
+            self.sensor_hud.on_solar_updated(level)
+            self.video_widget.show_osd(f"☀️ Solar Sensor: Level {level}/10")
+
+    def adjust_solar_sensor(self, delta: int):
+        if self.worker:
+            self.worker.step_solar_level(delta)
+            cur = self.worker.solar_level
+            self.sensor_hud.on_solar_updated(cur)
+            if cur in self.solar_actions:
+                self.solar_actions[cur].setChecked(True)
+            self.video_widget.show_osd(f"☀️ Solar Sensor: Level {cur}/10")
+
+    def toggle_rumble(self):
+        val = self.act_rumble.isChecked()
+        self.config.set("sensors", "rumble_enabled", val)
+        self.video_widget.show_osd(f"Rumble Motor: {'ON' if val else 'OFF'}")
+
+    def toggle_mouse_gyro(self):
+        val = self.act_mouse_gyro.isChecked()
+        self.config.set("sensors", "mouse_gyro", val)
+        self.video_widget.show_osd(f"Mouse Gyro Drag: {'ON' if val else 'OFF'}")
+
+    def reset_sensors(self):
+        if self.worker:
+            self.worker.reset_sensors()
+            self.sensor_hud.on_tilt_updated(0.0, 0.0, 0.0)
+            self.video_widget.show_osd("🎯 Gyro/Tilt Centered (0°)")
+
+    # =========================================================================
+    # REPLAY & EMULATION SLOTS
+    # =========================================================================
+    def toggle_session_recording(self):
+        if not self.worker or not self.current_rom:
+            self.video_widget.show_osd("Error: No ROM running.")
+            return
+
+        replays_dir = self.config.get("paths", "replays") or "replays"
+
+        if not self.worker.recorder.is_recording:
+            saved_state_path = self.worker.start_recording_session(replays_dir)
+            if saved_state_path:
+                self.act_record_session.setText("⏹ Stop Recording Session")
+                self.video_widget.show_osd("⏺ RECORDING STARTED", 3000)
+            else:
+                self.video_widget.show_osd("Error: Could not save initial state.")
+        else:
+            json_path = self.worker.stop_recording_session(replays_dir)
+            self.act_record_session.setText("⏺ Start Recording Session...")
+            if json_path:
+                self.video_widget.show_osd(f"Saved Replay: {os.path.basename(json_path)}", 4000)
+                QMessageBox.information(
+                    self, "Session Recorded", 
+                    f"Gameplay session and initial snapshot saved successfully!\n\n"
+                    f"Replay File (AI-Friendly JSON):\n{json_path}"
+                )
+
+    def load_replay_session(self):
+        if not self.worker or not self.current_rom:
+            self.video_widget.show_osd("Error: Load ROM first.")
+            return
+
+        replays_dir = self.config.get("paths", "replays") or "replays"
+        os.makedirs(replays_dir, exist_ok=True)
+        
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "Load Replay Session", replays_dir, "Replay Files (*.replay.json *.json)"
+        )
+        if not filepath:
+            return
+
+        success = self.worker.start_replay_session(filepath)
+        if success:
+            self.video_widget.show_osd(f"▶ REPLAYING: {os.path.basename(filepath)}", 3000)
+        else:
+            QMessageBox.critical(
+                self, "Replay Error", 
+                "Failed to start replay. Ensure the corresponding .state file exists in the same folder."
+            )
+
+    def stop_replay_session(self):
+        if self.worker and self.worker.recorder.is_playing:
+            self.worker.stop_replay_session()
+            self.video_widget.show_osd("⏹ Replay Stopped. Control Restored.")
+
+    def on_replay_finished(self):
+        self.video_widget.show_osd("🏁 Replay Complete! Control Restored.", 3000)
+
+    def trigger_ai_translation(self):
+        if not self.worker or not self.current_rom or self.video_widget.current_frame_data is None:
+            self.video_widget.show_osd("Error: Game not running.")
+            return
+
+        if self.trans_worker and self.trans_worker.isRunning():
+            self.video_widget.show_osd("AI Translation in progress...")
+            return
+
+        self.video_widget.show_osd("🔍 Running AI Screen Translation...")
+
+        self.trans_worker = TranslationWorker(
+            frame_data=self.video_widget.current_frame_data.copy(),
+            rom_path=self.current_rom,
+            config=self.config
+        )
+        self.trans_worker.finished.connect(self.on_ai_translation_finished)
+        self.trans_worker.error.connect(lambda err: QMessageBox.warning(self, "AI Translation Error", err))
+        self.trans_worker.start()
+
+    def on_ai_translation_finished(self, boxes: list, msg: str):
+        if boxes:
+            blocks_html = []
+            for b in boxes:
+                orig = html.escape((b.original or "").strip())
+                trans = html.escape((b.translated or "").strip())
+                if not orig or not trans:
+                    continue
+
+                cat = getattr(b, "category", "dialogue")
+                sp_orig = html.escape(getattr(b, "speaker_orig", "") or "")
+                sp_trans = html.escape(getattr(b, "speaker_trans", "") or "")
+
+                if cat == "dialogue":
+                    accent = "#64B5F6" if sp_orig else "#BA68C8"
+                    if sp_orig and sp_trans and sp_trans.lower() != sp_orig.lower():
+                        speaker_html = (
+                            f'<div style="color: #FFD54F; font-weight: bold; font-size: 12px; margin-bottom: 2px;">'
+                            f'💬 {sp_trans} <span style="color: #90A4AE; font-weight: normal;">({sp_orig})</span></div>'
+                        )
+                    elif sp_orig:
+                        speaker_html = (
+                            f'<div style="color: #FFD54F; font-weight: bold; font-size: 12px; margin-bottom: 2px;">'
+                            f'💬 {sp_orig}</div>'
+                        )
+                    else:
+                        speaker_html = ""
+
+                    blocks_html.append(
+                        f'<table width="100%" cellspacing="0" cellpadding="0" style="margin-bottom: 6px;">'
+                        f'<tr>'
+                        f'<td width="4" bgcolor="{accent}"></td>'
+                        f'<td bgcolor="#181C24" style="padding: 6px 10px;">'
+                        f'{speaker_html}'
+                        f'<div style="color: #90CAF9; font-size: 12px; margin-bottom: 2px;">{orig}</div>'
+                        f'<div style="color: #A5D6A7; font-weight: bold; font-size: 14px;">→ {trans}</div>'
+                        f'</td>'
+                        f'</tr></table>'
+                    )
+
+                elif cat == "menu":
+                    blocks_html.append(
+                        f'<div style="margin-bottom: 3px; padding: 2px 4px;">'
+                        f'<span style="background-color: #1E3A44; color: #4DD0E1; font-size: 11px; font-weight: bold;">'
+                        f'&nbsp;MENU&nbsp;</span>&nbsp;&nbsp;'
+                        f'<span style="color: #B0BEC5;">{orig}</span> '
+                        f'<span style="color: #78909C;">→</span> '
+                        f'<span style="color: #81C784; font-weight: bold;">{trans}</span>'
+                        f'</div>'
+                    )
+
+                else:
+                    blocks_html.append(
+                        f'<div style="margin-bottom: 4px; padding: 2px 4px;">'
+                        f'<span style="background-color: #3E2C18; color: #FFB74D; font-size: 11px; font-weight: bold;">'
+                        f'&nbsp;LABEL&nbsp;</span>&nbsp;&nbsp;'
+                        f'<span style="color: #FFE082;">{orig}</span> '
+                        f'<span style="color: #78909C;">→</span> '
+                        f'<span style="color: #FFD54F; font-weight: bold;">{trans}</span>'
+                        f'</div>'
+                    )
+
+            self.translation_panel.setHtml("".join(blocks_html))
+            sb = self.translation_panel.verticalScrollBar()
+            sb.setValue(0)
+
+        self.video_widget.show_osd(msg, 3000)
+
+    def open_ai_translation_config(self):
+        dlg = AITranslationConfigDialog(self.config, self)
+        dlg.exec()
+
+    def trigger_instant_scene_dump(self):
+        if not self.worker or not self.current_rom:
+            self.video_widget.show_osd("Error: No active ROM to dump")
+            return
+        try:
+            from ..tools.scene_engine import SceneDumpEngine
+            engine = SceneDumpEngine(self.worker, self.config)
+            dump_folder = engine.create_compact_dump(self.current_rom)
+            short_path = os.path.basename(dump_folder)
+            self.video_widget.show_osd(f"AI Dossier Dumped: {short_path}", 3000)
+        except Exception as e:
+            QMessageBox.critical(self, "Dump Error", f"Failed to create scene dump: {e}")
+
+    def update_recent_menu(self):
+        self.recent_menu.clear()
+        recent_files = self.config.get_recent_files()
+
+        if not recent_files:
+            no_recents = QAction("No Recent Files", self)
+            no_recents.setEnabled(False)
+            self.recent_menu.addAction(no_recents)
+            return
+
+        for path in recent_files:
+            file_name = os.path.basename(path)
+            action = QAction(f"{file_name} ({path})", self)
+            action.triggered.connect(lambda checked, p=path: self.load_rom_file(p))
+            self.recent_menu.addAction(action)
+
+        self.recent_menu.addSeparator()
+        clear_act = QAction("Clear Recent Files", self)
+        clear_act.triggered.connect(self.clear_recent_files)
+        self.recent_menu.addAction(clear_act)
+
+    def clear_recent_files(self):
+        self.config.clear_recent_files()
+        self.update_recent_menu()
+        self.video_widget.show_osd("Cleared Recent Files")

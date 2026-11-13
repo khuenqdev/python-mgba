@@ -269,7 +269,7 @@ class ShaderConfigDialog(QDialog):
         menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
 
     def add_builtin_shader(self, preset_id: str, prepend: bool):
-        from shader_manager import (GBA_COLOR_LCD_GLSL, CRT_EASYMODE_GLSL, 
+        from .shader_presets import (GBA_COLOR_LCD_GLSL, CRT_EASYMODE_GLSL,
                                     SCANLINES_CLASSIC_GLSL, SHARP_BILINEAR_GLSL, 
                                     STOCK_SHADER_GLSL)
         shader_map = {

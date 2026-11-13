@@ -101,20 +101,15 @@ Zero-dependency, NumPy-accelerated audio processing:
 
 ```text
 GBA/
-├── core_worker.py          # Emulation thread, mGBA Libretro CTypes bridge, GBP & rumble logic
-├── core.py                 # Standalone headless emulator wrapper
-├── gui.py                  # PyQt6 main window, responsive HUD, video surface, menus
-├── controller.py           # Gamepad polling, XInput 64-bit vibration, remapping dialog
-├── config.py               # EmulatorConfig manager, persistent settings synchronizer
-├── audio_dsp.py            # Vectorized FIR low-pass filter, bass boost, stereo widener
-├── graphic_editor.py       # In-game YY-CHR style graphic editor & LZ77/IPS patcher
-├── hex_editor.py           # Virtualized memory hex editor, live diff watch, data inspector
-├── dev_tools.py            # Palette, Sprite, Tile, Map, I/O registers, and Cheat search dialogs
-├── translation_tools.py    # Script repointing, TBL manager, relative search, live RAM injection
-├── font_tools.py           # 1bpp/2bpp/4bpp font ripper & TTF-to-GBA VWF generator
-├── scene_dump.py           # Forensic frame dossier generator (layers, state, JSON, disassembly)
-├── session_recorder.py     # Deterministic replay recorder and player (JSON format)
-├── memory_tools.py         # Memory region utilities
+├── gba_studio/
+│   ├── core/                # Emulator, configuration, audio, cheats, and replay services
+│   ├── ui/                  # Main window, video/HUD widgets, controllers, and shaders
+│   ├── tools/               # ROM editors, memory viewers, translation, and forensics
+│   │   ├── ai/              # OCR, vision translation, local translation, and worker
+│   │   └── graphics/        # Graphic editor, canvas widgets, and IPS/LZ77 codecs
+│   └── paths.py             # Shared project-root path
+├── main.py                  # Application entry point
+├── bundle_codebase.py       # Source-context bundler utility
 ├── mgba_libretro.dll       # mGBA Libretro Core binary (Windows x64)
 ├── mgba_config.json        # User configuration file
 ├── requirements.txt        # Python dependency manifest
