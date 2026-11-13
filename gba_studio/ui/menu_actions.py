@@ -21,6 +21,11 @@ class MenuBuilderMixin:
         file_menu.addAction(load_action)
 
         self.recent_menu = file_menu.addMenu("Open Recent")
+
+        apply_patch_act = QAction("Apply Soft-Patch (.ips / .bps / .ups)...", self)
+        apply_patch_act.triggered.connect(self.apply_patch_dialog)
+        file_menu.addAction(apply_patch_act)
+
         file_menu.addSeparator()
 
         save_file_act = QAction("Save State to File...", self)
@@ -67,6 +72,11 @@ class MenuBuilderMixin:
         self.rewind_enabled_action.triggered.connect(self.toggle_rewind_enabled)
         emu_menu.addAction(self.rewind_enabled_action)
 
+        self.auto_patch_action = QAction("Auto Soft-Patch (.ips / .bps / .ups)", self, checkable=True)
+        self.auto_patch_action.setChecked(bool(self.config.get("emulation", "auto_soft_patch", True)))
+        self.auto_patch_action.triggered.connect(self.toggle_auto_soft_patch)
+        emu_menu.addAction(self.auto_patch_action)
+
         emu_menu.addSeparator()
 
         self.skip_bios_action = QAction("Skip BIOS Intro", self, checkable=True)
@@ -85,6 +95,11 @@ class MenuBuilderMixin:
         quick_load_act.setShortcut(QKeySequence("F10"))
         quick_load_act.triggered.connect(lambda: self.quick_load_state(self.current_slot))
         emu_menu.addAction(quick_load_act)
+
+        state_browser_act = QAction("Save State Slot Browser...", self)
+        state_browser_act.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        state_browser_act.triggered.connect(self.open_state_browser)
+        emu_menu.addAction(state_browser_act)
 
         slot_menu = emu_menu.addMenu("Select State Slot")
         self.slot_group = QActionGroup(self)
@@ -263,7 +278,6 @@ class MenuBuilderMixin:
 
         video_menu.addSeparator()
 
-        # RetroArch Shaders Submenu
         shader_menu = video_menu.addMenu("RetroArch Shaders")
 
         self.act_shader_toggle = QAction("Enable Shaders", self, checkable=True)
@@ -318,7 +332,6 @@ class MenuBuilderMixin:
 
         video_menu.addSeparator()
 
-        # Scale Factor Menu
         scale_menu = video_menu.addMenu("Window Scale")
         self.scale_group = QActionGroup(self)
         self.scale_group.setExclusive(True)

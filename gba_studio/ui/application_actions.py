@@ -7,9 +7,22 @@ from PyQt6.QtGui import QAction
 
 from ..tools.ai_translator import TranslationWorker
 from .shader_dialog import ShaderConfigDialog
+from .state_browser import SaveStateBrowserDialog
 
 
 class ApplicationActionsMixin:
+    def open_state_browser(self):
+        if not self.current_rom:
+            QMessageBox.information(self, "Notice", "Please load a ROM first to view its save state slots.")
+            return
+        dlg = SaveStateBrowserDialog(self, self)
+        dlg.exec()
+
+    def toggle_auto_soft_patch(self):
+        val = self.auto_patch_action.isChecked()
+        self.config.set("emulation", "auto_soft_patch", val)
+        self.video_widget.show_osd(f"Auto Soft-Patch: {'ON' if val else 'OFF'} (Applies on next load)")
+
     def open_shader_dialog(self):
         dlg = ShaderConfigDialog(self.shader_manager, self.video_widget, self.config, self)
         dlg.exec()

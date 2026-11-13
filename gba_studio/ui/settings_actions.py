@@ -27,6 +27,7 @@ class SettingsActionsMixin:
 
         self.skip_bios_action.setChecked(bool(self.config.get("emulation", "skip_bios")))
         self.rewind_enabled_action.setChecked(bool(self.config.get("emulation", "rewind_enabled", True)))
+        self.auto_patch_action.setChecked(bool(self.config.get("emulation", "auto_soft_patch", True)))
         self.blend_action.setChecked(bool(self.config.get("video", "interframe_blending")))
         self.integer_scale_action.setChecked(bool(self.config.get("video", "integer_scaling", False)))
         self.pause_unfocus_action.setChecked(bool(self.config.get("emulation", "pause_on_unfocus", True)))

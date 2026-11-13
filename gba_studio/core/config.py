@@ -21,7 +21,8 @@ DEFAULT_CONFIG = {
         "pause_on_unfocus": True,
         "rewind_enabled": True,
         "rewind_buffer_size": 300,
-        "rewind_interval": 10
+        "rewind_interval": 10,
+        "auto_soft_patch": True
     },
     "sensors": {
         "solar_level": 5,

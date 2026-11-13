@@ -19,6 +19,7 @@ from .settings_actions import SettingsActionsMixin
 from .runtime_actions import RuntimeActionsMixin
 
 ROM_DROP_EXTS = {".gba", ".gb", ".gbc", ".sgb", ".zip"}
+PATCH_DROP_EXTS = {".ips", ".bps", ".ups"}
 
 
 class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, SettingsActionsMixin, RuntimeActionsMixin):
@@ -34,7 +35,9 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
         self.config = config
         self.worker = None
         self.current_rom = None
+        self.clean_rom = None
         self.source_rom = None
+        self.active_patch = None
 
         saved_scale = self.config.get("video", "scale")
         try:
@@ -103,7 +106,7 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
                 line-height: 1.4;
             }
         """)
-        self.translation_panel.setPlaceholderText("Press [T] to translate screen with AI... (or drag & drop ROM / State / Shader / Replay here)")
+        self.translation_panel.setPlaceholderText("Press [T] to translate screen with AI... (or drag & drop ROM / Patch / State / Shader / Replay here)")
         self.splitter.addWidget(self.translation_panel)
 
         self.splitter.setStretchFactor(0, 8)
@@ -159,6 +162,8 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
 
         if ext in ROM_DROP_EXTS:
             return "rom"
+        if ext in PATCH_DROP_EXTS:
+            return "patch"
         if ext == ".state" or (ext.startswith(".ss") and ext[3:].isdigit()):
             return "state"
         if ext == ".glslp":
@@ -198,6 +203,8 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
 
             if kind == "rom":
                 self.load_rom_file(path)
+            elif kind == "patch":
+                self.apply_soft_patch(path)
             elif kind == "state":
                 if self.worker:
                     ok = self.worker.load_state(path)
@@ -288,8 +295,11 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
         display_title = f"mGBA - {title} [{code}]"
         if hw_type != "None":
             display_title += f" ({hw_type.replace('_', ' ').title()})"
+        if self.active_patch:
+            display_title += f" [Patched: {os.path.basename(self.active_patch)}]"
         self.setWindowTitle(display_title)
-        self.video_widget.show_osd(f"Loaded: {title} [{code}]", 2500)
+        if not self.active_patch:
+            self.video_widget.show_osd(f"Loaded: {title} [{code}]", 2500)
 
     def keyPressEvent(self, event):
         if (

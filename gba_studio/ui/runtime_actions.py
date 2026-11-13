@@ -8,6 +8,7 @@ import datetime
 from PyQt6.QtWidgets import QFileDialog, QMessageBox
 
 from ..core.core_worker import EmulatorWorker
+from ..core.rom_patcher import PatchError, find_matching_patch, prepare_patched_rom
 from .controller import LIBRETRO_BTNS, QT_KEY_MAP
 
 SUPPORTED_ROM_EXTS = (".gba", ".gb", ".gbc", ".sgb")
@@ -79,18 +80,62 @@ class RuntimeActionsMixin:
             QMessageBox.warning(self, "File Error", f"ROM not found:\n{filepath}")
             return
 
-        boot_path = filepath
+        clean_path = filepath
         if filepath.lower().endswith(".zip"):
             try:
-                boot_path = self._extract_zip_rom(filepath)
+                clean_path = self._extract_zip_rom(filepath)
             except (zipfile.BadZipFile, ValueError, OSError) as e:
                 QMessageBox.warning(self, "ZIP Error", f"Failed to load ZIP ROM:\n{e}")
                 return
 
         self.source_rom = filepath
+        self.clean_rom = clean_path
+        self.active_patch = None
+        boot_path = clean_path
+
+        if bool(self.config.get("emulation", "auto_soft_patch", True)):
+            patch_path = find_matching_patch(clean_path, source_path=filepath)
+            if patch_path:
+                try:
+                    boot_path = prepare_patched_rom(clean_path, patch_path)
+                    self.active_patch = patch_path
+                except (PatchError, OSError) as e:
+                    QMessageBox.warning(
+                        self, "Soft-Patch Warning",
+                        f"Found matching patch '{os.path.basename(patch_path)}' but failed to apply:\n{e}\n\nBooting unpatched ROM."
+                    )
+
         self.current_rom = boot_path
         self.config.add_recent_file(filepath)
         self.update_recent_menu()
+        self.start_emulation()
+
+    def apply_patch_dialog(self):
+        if not self.clean_rom or not os.path.exists(self.clean_rom):
+            QMessageBox.information(self, "Notice", "Please load a ROM first before applying a soft-patch.")
+            return
+
+        start_dir = os.path.dirname(self.source_rom or self.clean_rom)
+        patch_path, _ = QFileDialog.getOpenFileName(
+            self, "Apply Soft-Patch", start_dir,
+            "ROM Patches (*.ips *.bps *.ups);;IPS Patches (*.ips);;BPS Patches (*.bps);;UPS Patches (*.ups)"
+        )
+        if patch_path:
+            self.apply_soft_patch(patch_path)
+
+    def apply_soft_patch(self, patch_path: str):
+        if not self.clean_rom or not os.path.exists(self.clean_rom):
+            QMessageBox.information(self, "Notice", "Load a ROM first before applying a patch.")
+            return
+
+        try:
+            patched_path = prepare_patched_rom(self.clean_rom, patch_path)
+        except (PatchError, OSError) as e:
+            QMessageBox.critical(self, "Patch Error", f"Failed to apply patch:\n{e}")
+            return
+
+        self.active_patch = patch_path
+        self.current_rom = patched_path
         self.start_emulation()
 
     def start_emulation(self):
@@ -126,6 +171,9 @@ class RuntimeActionsMixin:
 
         self.worker.start()
         self.is_running = True
+
+        if self.active_patch:
+            self.video_widget.show_osd(f"🩹 Soft-Patched: {os.path.basename(self.active_patch)}", 3500)
 
     def reset_emulation(self):
         if self.worker:
@@ -193,6 +241,8 @@ class RuntimeActionsMixin:
     def set_active_slot(self, slot: int):
         self.current_slot = slot
         self.config.set("emulation", "state_slot", slot)
+        if hasattr(self, "slot_actions") and slot in self.slot_actions:
+            self.slot_actions[slot].setChecked(True)
         self.video_widget.show_osd(f"Selected State Slot {slot}")
 
     def take_screenshot(self):
@@ -205,30 +255,42 @@ class RuntimeActionsMixin:
         Image.fromarray(self.video_widget.current_frame_data, "RGB").save(os.path.join(out_dir, filename))
         self.video_widget.show_osd("Screenshot Captured!")
 
-    def get_state_path(self, slot: int):
-        state_dir = self.config.get("paths", "states")
+    def get_state_path(self, slot: int) -> str | None:
+        if not self.current_rom:
+            return None
+        state_dir = self.config.get("paths", "states") or "states"
         os.makedirs(state_dir, exist_ok=True)
         base_name = os.path.splitext(os.path.basename(self.current_rom))[0]
         return os.path.join(state_dir, f"{base_name}.ss{slot}")
 
     def quick_save_state(self, slot: int):
-        if not self.worker:
+        if not self.worker or not self.current_rom:
             return
-        self.worker.save_state(self.get_state_path(slot))
-        self.video_widget.show_osd(f"Saved to Slot {slot}")
+        state_path = self.get_state_path(slot)
+        if state_path and self.worker.save_state(state_path):
+            frame = getattr(self.worker, "latest_video_frame", None)
+            if frame is None:
+                frame = self.video_widget.current_frame_data
+            if frame is not None:
+                try:
+                    from PIL import Image
+                    Image.fromarray(frame, "RGB").save(state_path + ".png", "PNG")
+                except Exception as e:
+                    print(f"[STATE THUMBNAIL WARNING] {e}")
+            self.video_widget.show_osd(f"Saved to Slot {slot}")
 
     def quick_load_state(self, slot: int):
-        if not self.worker:
+        if not self.worker or not self.current_rom:
             return
         path = self.get_state_path(slot)
-        if os.path.exists(path):
+        if path and os.path.exists(path):
             self.worker.load_state(path)
             self.video_widget.show_osd(f"Loaded from Slot {slot}")
         else:
             self.video_widget.show_osd(f"Slot {slot} is empty!")
 
     def save_state_to_file(self):
-        if not self.worker:
+        if not self.worker or not self.current_rom:
             return
         state_dir = self.config.get("paths", "states")
         os.makedirs(state_dir, exist_ok=True)
@@ -240,7 +302,7 @@ class RuntimeActionsMixin:
             self.video_widget.show_osd(f"Saved: {os.path.basename(filepath)}")
 
     def load_state_from_file(self):
-        if not self.worker:
+        if not self.worker or not self.current_rom:
             return
         state_dir = self.config.get("paths", "states")
         filepath, _ = QFileDialog.getOpenFileName(self, "Load State from File", state_dir, "Save States (*.state *.ss*)")
