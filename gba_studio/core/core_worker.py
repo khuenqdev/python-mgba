@@ -23,8 +23,6 @@ AF_TO_LIBRETRO = {
     "r": 11
 }
 
-# Bitmask order for Live Input HUD:
-# bit 0:A, 1:B, 2:L, 3:R, 4:UP, 5:DOWN, 6:LEFT, 7:RIGHT, 8:START, 9:SELECT
 HUD_BTN_BITS = [
     ("A", 8),
     ("B", 0),
@@ -38,9 +36,6 @@ HUD_BTN_BITS = [
     ("SELECT", 2),
 ]
 
-# =============================================================================
-# Libretro Native Environment & Rumble C-Types Specifications
-# =============================================================================
 RETRO_ENVIRONMENT_SET_PIXEL_FORMAT = 1
 RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY = 9
 RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS = 11
@@ -141,6 +136,16 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
         self.game_title = "Unknown"
         self.rumble_type = "None"
         self._parse_rom_header()
+
+    def get_profile_id(self) -> str:
+        """Returns a stable identifier for per-game config profiles."""
+        if self.game_code and self.game_code not in ("UNKNOWN", ""):
+            return self.game_code
+        if self.save_base_name:
+            return self.save_base_name
+        if self.rom_path:
+            return os.path.splitext(os.path.basename(self.rom_path))[0]
+        return "DEFAULT"
 
     def _parse_rom_header(self):
         try:
@@ -278,6 +283,14 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
         return np.array(vid_obj, copy=False)
 
     def run(self):
+        # Refresh per-game settings that may have been loaded via profile activation
+        self.solar_level = int(self.config.get("sensors", "solar_level", 5) or 5)
+        self.dsp.update_settings()
+
+        buf_max = max(30, int(self.config.get("emulation", "rewind_buffer_size", 300) or 300))
+        if self.rewind_buffer.maxlen != buf_max:
+            self.rewind_buffer = deque(self.rewind_buffer, maxlen=buf_max)
+
         skip_bios = bool(self.config.get("emulation", "skip_bios"))
         self._c_str_cache[b"mgba_skip_bios"] = b"ON" if skip_bios else b"OFF"
         self._c_str_cache[b"mgba_use_bios"] = b"OFF" if skip_bios else b"ON"

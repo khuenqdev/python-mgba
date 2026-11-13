@@ -19,7 +19,7 @@ from .application_actions import ApplicationActionsMixin
 from .settings_actions import SettingsActionsMixin
 from .runtime_actions import RuntimeActionsMixin
 
-ROM_DROP_EXTS = {".gba", ".gb", ".gbc", ".sgb", ".zip"}
+ROM_DROP_EXTS = {".gba", ".gb", ".gbc", ".sgb", ".zip", ".7z"}
 PATCH_DROP_EXTS = {".ips", ".bps", ".ups"}
 
 
@@ -305,8 +305,10 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
             display_title += f" ({hw_type.replace('_', ' ').title()})"
         if self.active_patch:
             display_title += f" [Patched: {os.path.basename(self.active_patch)}]"
+        if getattr(self.config, "active_profile_id", None):
+            display_title += " [Profile]"
         self.setWindowTitle(display_title)
-        if not self.active_patch:
+        if not self.active_patch and not getattr(self.config, "active_profile_id", None):
             self.video_widget.show_osd(f"Loaded: {title} [{code}]", 2500)
 
     def keyPressEvent(self, event):
@@ -322,7 +324,6 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
             self.toggle_fullscreen()
             return
 
-        # Keep Clip & Input HUD shortcuts active when menubar is hidden in Fullscreen
         if self.isFullScreen() and not event.isAutoRepeat():
             cs_mods = Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier
             if event.modifiers() == cs_mods:

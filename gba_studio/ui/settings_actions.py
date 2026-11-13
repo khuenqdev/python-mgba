@@ -60,6 +60,23 @@ class SettingsActionsMixin:
             self.solar_actions[solar_lvl].setChecked(True)
         self.sensor_hud.on_solar_updated(solar_lvl)
 
+        if hasattr(self, "use_profile_action"):
+            has_rom = bool(getattr(self, "worker", None) and getattr(self, "current_rom", None))
+            active_pid = getattr(self.config, "active_profile_id", None)
+            self.use_profile_action.blockSignals(True)
+            self.use_profile_action.setEnabled(has_rom)
+            self.use_profile_action.setChecked(bool(has_rom and active_pid))
+            if has_rom:
+                pid = self.worker.get_profile_id()
+                self.use_profile_action.setText(f"Use Per-Game Profile [{pid}]")
+                self.seed_profile_action.setEnabled(True)
+                self.delete_profile_action.setEnabled(self.config.has_profile(pid))
+            else:
+                self.use_profile_action.setText("Use Per-Game Profile (No ROM)")
+                self.seed_profile_action.setEnabled(False)
+                self.delete_profile_action.setEnabled(False)
+            self.use_profile_action.blockSignals(False)
+
         self._build_keymap()
 
     def set_lpf_mode(self, mode: str):
@@ -104,19 +121,16 @@ class SettingsActionsMixin:
     def reset_settings_to_default(self):
         confirm = QMessageBox.question(
             self, "Reset Settings",
-            "Are you sure you want to reset all settings, controls, sensors, shaders, and audio options back to default?",
+            "Are you sure you want to reset all global settings, controls, sensors, shaders, and audio options back to default?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No
         )
         if confirm == QMessageBox.StandardButton.Yes:
             self.config.reset_to_defaults()
-            self.shader_manager.enabled = False
-            self.shader_manager.load_preset_by_name("gba_color", compile_now=True, save_to_config=False)
-            self._sync_ui_with_config()
+            self._apply_effective_config_to_runtime()
             self.update_recent_menu()
-            self.video_widget.update()
             if self.worker:
-                self.worker.update_audio_settings()
+                self.on_game_identified(self.worker.game_title, self.worker.game_code, self.worker.rumble_type)
             self.video_widget.show_osd("Settings Reset to Default")
             QMessageBox.information(self, "Success", "All settings have been restored to factory defaults.")
 

@@ -1,9 +1,21 @@
 # config.py
 import os
+import re
 import json
 import copy
+import datetime
 
 CONFIG_FILE = "mgba_config.json"
+
+GLOBAL_ONLY_TOP_SECTIONS = {"recent_files", "paths"}
+GLOBAL_ONLY_KEY_PAIRS = {
+    ("video", "window_width"),
+    ("video", "window_height"),
+    ("video", "splitter_sizes"),
+    ("video", "scale"),
+    ("sensors", "show_hud"),
+}
+PER_GAME_SECTIONS = ("audio", "emulation", "sensors", "video", "shaders", "ai_translation", "input")
 
 DEFAULT_CONFIG = {
     "audio": {
@@ -63,7 +75,8 @@ DEFAULT_CONFIG = {
         "exports": "exports",
         "records": "records",
         "translations": "translations",
-        "replays": "replays"
+        "replays": "replays",
+        "profiles": "profiles"
     },
     "input": {
         "keyboard": {
@@ -110,7 +123,11 @@ DEFAULT_CONFIG = {
 
 class EmulatorConfig:
     def __init__(self):
+        self.global_settings = copy.deepcopy(DEFAULT_CONFIG)
         self.settings = copy.deepcopy(DEFAULT_CONFIG)
+        self.active_profile_id = None
+        self.active_profile_title = ""
+        self.profile_overrides = {}
         self.load()
 
     def load(self):
@@ -130,9 +147,11 @@ class EmulatorConfig:
                             "gamepad": DEFAULT_CONFIG["input"]["gamepad"]
                         }
 
-                    self._update_dict(self.settings, user_config)
+                    self._update_dict(self.global_settings, user_config)
             except Exception as e:
                 print(f"Config load error: {e}")
+
+        self._rebuild_effective_settings()
         self.save()
 
     def _update_dict(self, base, new):
@@ -140,24 +159,43 @@ class EmulatorConfig:
             if isinstance(v, dict) and k in base and isinstance(base[k], dict):
                 self._update_dict(base[k], v)
             else:
-                base[k] = v
+                base[k] = copy.deepcopy(v)
+
+    def _rebuild_effective_settings(self):
+        self.settings = copy.deepcopy(self.global_settings)
+        if self.active_profile_id and self.profile_overrides:
+            self._update_dict(self.settings, self.profile_overrides)
+
+    def _is_global_only(self, section: str, key: str = None) -> bool:
+        if section in GLOBAL_ONLY_TOP_SECTIONS:
+            return True
+        if key is not None and (section, key) in GLOBAL_ONLY_KEY_PAIRS:
+            return True
+        return False
 
     def save(self):
-        for _, path_val in self.settings.get("paths", {}).items():
+        for _, path_val in self.global_settings.get("paths", {}).items():
             os.makedirs(path_val, exist_ok=True)
 
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(self.settings, f, indent=4)
+                json.dump(self.global_settings, f, indent=4)
         except Exception as e:
             print(f"Config save error: {e}")
 
+        if self.active_profile_id:
+            self.save_active_profile()
+
     def reset_to_defaults(self):
-        self.settings = copy.deepcopy(DEFAULT_CONFIG)
+        self.active_profile_id = None
+        self.active_profile_title = ""
+        self.profile_overrides = {}
+        self.global_settings = copy.deepcopy(DEFAULT_CONFIG)
+        self._rebuild_effective_settings()
         self.save()
 
     def get(self, section, key=None, default=None):
-        """Safely retrieves config values, accepting an optional default argument."""
+        """Safely retrieves effective config values (global + active game profile)."""
         if key is None:
             return self.settings.get(section, default)
         sec = self.settings.get(section)
@@ -166,26 +204,150 @@ class EmulatorConfig:
         return default
 
     def set(self, section, key, value):
-        if section not in self.settings:
-            self.settings[section] = {}
-        self.settings[section][key] = value
-        self.save()
+        val_copy = copy.deepcopy(value)
+        if self.active_profile_id and not self._is_global_only(section, key):
+            if section not in self.profile_overrides:
+                self.profile_overrides[section] = {}
+            self.profile_overrides[section][key] = val_copy
+            if section not in self.settings:
+                self.settings[section] = {}
+            self.settings[section][key] = copy.deepcopy(val_copy)
+            self.save_active_profile()
+        else:
+            if section not in self.global_settings:
+                self.global_settings[section] = {}
+            self.global_settings[section][key] = val_copy
+            if section not in self.settings:
+                self.settings[section] = {}
+            self.settings[section][key] = copy.deepcopy(val_copy)
+            self.save()
 
+    # =========================================================================
+    # PER-GAME CONFIGURATION PROFILES
+    # =========================================================================
+    def get_profile_path(self, profile_id: str) -> str:
+        profiles_dir = self.global_settings.get("paths", {}).get("profiles", "profiles") or "profiles"
+        os.makedirs(profiles_dir, exist_ok=True)
+        safe_id = re.sub(r"[^\w\-]", "_", str(profile_id or "DEFAULT")).strip("_") or "DEFAULT"
+        return os.path.join(profiles_dir, f"{safe_id}.json")
+
+    def has_profile(self, profile_id: str) -> bool:
+        if not profile_id:
+            return False
+        return os.path.exists(self.get_profile_path(profile_id))
+
+    def deactivate_profile(self):
+        self.active_profile_id = None
+        self.active_profile_title = ""
+        self.profile_overrides = {}
+        self._rebuild_effective_settings()
+
+    def activate_profile_if_exists(self, profile_id: str, title: str = "") -> bool:
+        self.deactivate_profile()
+        if not profile_id:
+            return False
+
+        path = self.get_profile_path(profile_id)
+        if not os.path.exists(path):
+            return False
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+
+            overrides = raw.get("overrides", raw) if isinstance(raw, dict) else {}
+            cleaned = {}
+            for sec, sec_val in overrides.items():
+                if sec == "_meta" or sec in GLOBAL_ONLY_TOP_SECTIONS or not isinstance(sec_val, dict):
+                    continue
+                filtered = {
+                    k: v for k, v in sec_val.items()
+                    if (sec, k) not in GLOBAL_ONLY_KEY_PAIRS
+                }
+                if filtered:
+                    cleaned[sec] = filtered
+
+            self.active_profile_id = profile_id
+            self.active_profile_title = title or raw.get("_meta", {}).get("game_title", "")
+            self.profile_overrides = cleaned
+            self._rebuild_effective_settings()
+            return True
+        except Exception as e:
+            print(f"[PROFILE WARNING] Failed to load profile {path}: {e}")
+            self.deactivate_profile()
+            return False
+
+    def create_profile(self, profile_id: str, title: str = "", seed_from_current: bool = False) -> str:
+        self.active_profile_id = profile_id
+        self.active_profile_title = title
+        self.profile_overrides = {}
+
+        if seed_from_current:
+            for sec in PER_GAME_SECTIONS:
+                src_sec = self.settings.get(sec)
+                if isinstance(src_sec, dict):
+                    copied = {
+                        k: copy.deepcopy(v)
+                        for k, v in src_sec.items()
+                        if (sec, k) not in GLOBAL_ONLY_KEY_PAIRS
+                    }
+                    if copied:
+                        self.profile_overrides[sec] = copied
+
+        self._rebuild_effective_settings()
+        self.save_active_profile()
+        return self.get_profile_path(profile_id)
+
+    def save_active_profile(self):
+        if not self.active_profile_id:
+            return
+        path = self.get_profile_path(self.active_profile_id)
+        payload = {
+            "_meta": {
+                "profile_id": self.active_profile_id,
+                "game_title": self.active_profile_title,
+                "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            },
+            "overrides": self.profile_overrides,
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=4)
+        except Exception as e:
+            print(f"[PROFILE WARNING] Failed to save profile {path}: {e}")
+
+    def delete_profile(self, profile_id: str) -> bool:
+        path = self.get_profile_path(profile_id)
+        if self.active_profile_id == profile_id:
+            self.deactivate_profile()
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+                return True
+            except OSError as e:
+                print(f"[PROFILE WARNING] Failed to delete profile {path}: {e}")
+        return False
+
+    # =========================================================================
+    # RECENT FILES (ALWAYS GLOBAL)
+    # =========================================================================
     def get_recent_files(self):
-        recent = self.settings.get("recent_files", [])
+        recent = self.global_settings.get("recent_files", [])
         return [f for f in recent if os.path.exists(f)]
 
     def add_recent_file(self, filepath: str):
         if not filepath:
             return
         filepath = os.path.abspath(filepath)
-        recent = self.settings.get("recent_files", [])
+        recent = self.global_settings.get("recent_files", [])
         if filepath in recent:
             recent.remove(filepath)
         recent.insert(0, filepath)
-        self.settings["recent_files"] = recent[:10]
+        self.global_settings["recent_files"] = recent[:10]
+        self.settings["recent_files"] = list(self.global_settings["recent_files"])
         self.save()
 
     def clear_recent_files(self):
+        self.global_settings["recent_files"] = []
         self.settings["recent_files"] = []
         self.save()

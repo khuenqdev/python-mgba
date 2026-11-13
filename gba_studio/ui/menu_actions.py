@@ -452,6 +452,24 @@ class MenuBuilderMixin:
         tools_menu.addAction("Cheats Manager...", self.open_cheats_manager)
         tools_menu.addSeparator()
         tools_menu.addAction("Configure Controls & Motion Feedback...", self.open_controller_config)
+
+        profile_menu = tools_menu.addMenu("Per-Game Profile")
+
+        self.use_profile_action = QAction("Use Per-Game Profile (No ROM)", self, checkable=True)
+        self.use_profile_action.setEnabled(False)
+        self.use_profile_action.triggered.connect(self.toggle_game_profile)
+        profile_menu.addAction(self.use_profile_action)
+
+        self.seed_profile_action = QAction("Copy Current Settings to Game Profile", self)
+        self.seed_profile_action.setEnabled(False)
+        self.seed_profile_action.triggered.connect(self.copy_global_to_game_profile)
+        profile_menu.addAction(self.seed_profile_action)
+
+        self.delete_profile_action = QAction("Delete Current Game Profile...", self)
+        self.delete_profile_action.setEnabled(False)
+        self.delete_profile_action.triggered.connect(self.delete_game_profile)
+        profile_menu.addAction(self.delete_profile_action)
+
         tools_menu.addSeparator()
 
         reset_settings_act = QAction("Reset Settings to Default...", self)

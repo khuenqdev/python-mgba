@@ -1,5 +1,6 @@
 # runtime_actions.py
 import os
+import shutil
 import hashlib
 import zipfile
 import tempfile
@@ -69,8 +70,62 @@ class RuntimeActionsMixin:
 
             return extracted_path
 
+    def _extract_7z_rom(self, archive_path: str) -> str:
+        """Extracts the first supported ROM inside a .7z archive into a temp cache."""
+        try:
+            import py7zr
+        except ImportError as e:
+            raise RuntimeError("Missing dependency 'py7zr'. Install it with: pip install py7zr") from e
+
+        with py7zr.SevenZipFile(archive_path, mode="r") as sz:
+            candidates = [
+                fi for fi in sz.list()
+                if not fi.is_directory
+                and not fi.filename.startswith("__MACOSX/")
+                and fi.filename.lower().endswith(SUPPORTED_ROM_EXTS)
+            ]
+            if not candidates:
+                raise ValueError("No supported ROM (.gba, .gb, .gbc, .sgb) found inside the 7z archive.")
+
+            candidates.sort(key=lambda fi: (0 if fi.filename.lower().endswith(".gba") else 1, fi.filename.lower()))
+            target = candidates[0]
+
+            arch_stat = os.stat(archive_path)
+            key = f"{os.path.abspath(archive_path)}|{arch_stat.st_mtime_ns}|{arch_stat.st_size}"
+            arch_hash = hashlib.md5(key.encode("utf-8")).hexdigest()[:12]
+            cache_dir = os.path.join(tempfile.gettempdir(), "gba_studio_rom_cache", f"7z_{arch_hash}")
+            os.makedirs(cache_dir, exist_ok=True)
+
+            safe_name = os.path.basename(target.filename)
+            extracted_path = os.path.join(cache_dir, safe_name)
+
+            if not os.path.exists(extracted_path) or os.path.getsize(extracted_path) != target.uncompressed:
+                stage_dir = os.path.join(cache_dir, "_stage")
+                shutil.rmtree(stage_dir, ignore_errors=True)
+                os.makedirs(stage_dir, exist_ok=True)
+                try:
+                    sz.extract(path=stage_dir, targets=[target.filename])
+                    staged_file = os.path.join(stage_dir, target.filename)
+                    if not os.path.exists(staged_file):
+                        # Fallback search inside stage_dir
+                        for root_dir, _, files in os.walk(stage_dir):
+                            if safe_name in files:
+                                staged_file = os.path.join(root_dir, safe_name)
+                                break
+                    if not os.path.exists(staged_file):
+                        raise FileNotFoundError("Failed to locate extracted ROM inside 7z staging folder.")
+                    shutil.move(staged_file, extracted_path)
+                finally:
+                    shutil.rmtree(stage_dir, ignore_errors=True)
+
+            return extracted_path
+
     def load_rom(self):
-        filters = "Supported ROMs (*.gba *.gb *.gbc *.sgb *.zip);;GBA ROMs (*.gba);;GB/GBC ROMs (*.gb *.gbc);;ZIP Archives (*.zip);;All Files (*.*)"
+        filters = (
+            "Supported ROMs (*.gba *.gb *.gbc *.sgb *.zip *.7z);;"
+            "GBA ROMs (*.gba);;GB/GBC ROMs (*.gb *.gbc);;"
+            "Archives (*.zip *.7z);;All Files (*.*)"
+        )
         filepath, _ = QFileDialog.getOpenFileName(self, "Load Game", "", filters)
         if filepath:
             self.load_rom_file(filepath)
@@ -81,11 +136,18 @@ class RuntimeActionsMixin:
             return
 
         clean_path = filepath
-        if filepath.lower().endswith(".zip"):
+        lower_path = filepath.lower()
+        if lower_path.endswith(".zip"):
             try:
                 clean_path = self._extract_zip_rom(filepath)
             except (zipfile.BadZipFile, ValueError, OSError) as e:
                 QMessageBox.warning(self, "ZIP Error", f"Failed to load ZIP ROM:\n{e}")
+                return
+        elif lower_path.endswith(".7z"):
+            try:
+                clean_path = self._extract_7z_rom(filepath)
+            except Exception as e:
+                QMessageBox.warning(self, "7z Error", f"Failed to load 7z ROM:\n{e}")
                 return
 
         self.source_rom = filepath
@@ -150,6 +212,8 @@ class RuntimeActionsMixin:
             self.worker.stop()
             self.worker.wait()
 
+        # Reset back to Global settings before probing the new ROM header
+        self.config.deactivate_profile()
         self.video_widget.set_input_hud("IDLE", 0, 0, 0)
 
         save_base = os.path.splitext(os.path.basename(self.current_rom))[0]
@@ -159,6 +223,12 @@ class RuntimeActionsMixin:
             self.config,
             save_base_name=save_base,
         )
+
+        # Load Per-Game Profile if one exists for this ROM's game_code / ID
+        profile_id = self.worker.get_profile_id()
+        profile_loaded = self.config.activate_profile_if_exists(profile_id, title=self.worker.game_title)
+        self._apply_effective_config_to_runtime()
+
         self.worker.frame_ready.connect(self.video_widget.set_frame)
         if hasattr(self, "clip_recorder"):
             self.worker.frame_ready.connect(self.clip_recorder.push_frame)
@@ -180,8 +250,13 @@ class RuntimeActionsMixin:
         self.worker.start()
         self.is_running = True
 
+        osd_parts = []
         if self.active_patch:
-            self.video_widget.show_osd(f"🩹 Soft-Patched: {os.path.basename(self.active_patch)}", 3500)
+            osd_parts.append(f"🩹 {os.path.basename(self.active_patch)}")
+        if profile_loaded:
+            osd_parts.append(f"🎮 Profile: {profile_id}")
+        if osd_parts:
+            self.video_widget.show_osd(" | ".join(osd_parts), 3500)
 
     def reset_emulation(self):
         if self.worker:

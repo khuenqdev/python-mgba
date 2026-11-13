@@ -11,6 +11,82 @@ from .state_browser import SaveStateBrowserDialog
 
 
 class ApplicationActionsMixin:
+    def _apply_effective_config_to_runtime(self):
+        """Re-applies active config (Global or Per-Game Profile) to shaders, audio, sensors, and UI."""
+        self.shader_manager.enabled = bool(self.config.get("shaders", "enabled", False))
+        self.shader_manager.init_default_preset()
+        if self.video_widget.context() is not None:
+            self.shader_manager.compile_all()
+
+        if self.worker:
+            self.worker.update_audio_settings()
+            lvl = int(self.config.get("sensors", "solar_level", 5) or 5)
+            self.worker.solar_level = max(0, min(10, lvl))
+            self.worker.solar_changed.emit(self.worker.solar_level)
+
+        self._sync_ui_with_config()
+        self.video_widget.update()
+
+    def toggle_game_profile(self):
+        if not self.worker or not self.current_rom:
+            self.use_profile_action.setChecked(False)
+            QMessageBox.information(self, "Notice", "Load a ROM first to enable a Per-Game Profile.")
+            return
+
+        pid = self.worker.get_profile_id()
+        if self.use_profile_action.isChecked():
+            self.config.create_profile(pid, title=self.worker.game_title, seed_from_current=False)
+            self._sync_ui_with_config()
+            self.on_game_identified(self.worker.game_title, self.worker.game_code, self.worker.rumble_type)
+            self.video_widget.show_osd(f"🎮 Per-Game Profile Active [{pid}]", 2500)
+        else:
+            reply = QMessageBox.question(
+                self,
+                "Disable & Delete Game Profile",
+                f"Delete the custom profile for [{pid}] and revert to Global settings?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.config.delete_profile(pid)
+                self._apply_effective_config_to_runtime()
+                self.on_game_identified(self.worker.game_title, self.worker.game_code, self.worker.rumble_type)
+                self.video_widget.show_osd("🌐 Reverted to Global Settings", 2500)
+            else:
+                self.use_profile_action.blockSignals(True)
+                self.use_profile_action.setChecked(True)
+                self.use_profile_action.blockSignals(False)
+
+    def copy_global_to_game_profile(self):
+        if not self.worker or not self.current_rom:
+            return
+        pid = self.worker.get_profile_id()
+        self.config.create_profile(pid, title=self.worker.game_title, seed_from_current=True)
+        self._sync_ui_with_config()
+        self.on_game_identified(self.worker.game_title, self.worker.game_code, self.worker.rumble_type)
+        self.video_widget.show_osd(f"📋 Copied Current Settings to [{pid}]", 2500)
+
+    def delete_game_profile(self):
+        if not self.worker or not self.current_rom:
+            return
+        pid = self.worker.get_profile_id()
+        if not self.config.has_profile(pid):
+            QMessageBox.information(self, "Notice", f"No saved profile exists for [{pid}].")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Delete Per-Game Profile",
+            f"Delete saved profile [{pid}] and restore Global settings?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.config.delete_profile(pid)
+            self._apply_effective_config_to_runtime()
+            self.on_game_identified(self.worker.game_title, self.worker.game_code, self.worker.rumble_type)
+            self.video_widget.show_osd(f"🗑 Deleted Profile [{pid}]", 2500)
+
     def toggle_input_overlay(self):
         val = self.input_overlay_action.isChecked()
         self.config.set("video", "show_input_overlay", val)
