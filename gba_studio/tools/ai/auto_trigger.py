@@ -1,5 +1,6 @@
 # auto_trigger.py
 import time
+from collections import deque
 import cv2
 import numpy as np
 
@@ -9,9 +10,10 @@ from .glossary import GlossaryAndCacheStore
 class AutoTranslateDetector:
     """
     Smart scene/dialogue change detector for Auto-Translate.
-    Filters out animated cursors, action-game movement, and fade transitions,
-    waits for dialogue text to settle (debounce), backs off when screens contain
-    no dialogue text, and allows instant zero-API hits from the frame cache.
+    Uses a 16x16 tile motion history to isolate and ignore continuously
+    oscillating regions (animated menu cursors, animated character portraits,
+    background holograms, blinking prompts) while reacting reliably when
+    actual text blocks change and settle.
     """
 
     ROI_MODES = [
@@ -21,6 +23,8 @@ class AutoTranslateDetector:
         ("ruler", "Pixel Ruler Box Only"),
     ]
 
+    BLOCK_SIZE = 16
+
     def __init__(self):
         self.reset()
 
@@ -28,11 +32,11 @@ class AutoTranslateDetector:
         self._prev_gray = None
         self._prev_roi_key = None
         self._last_translated_gray = None
-        self._last_translated_dhash = None
         self._last_change_ts = 0.0
         self._last_api_trigger_ts = 0.0
         self._pending_settle = False
         self._consecutive_skips = 0
+        self._block_history = deque(maxlen=10)
 
     @staticmethod
     def _resolve_roi(frame_data: np.ndarray, roi_mode: str, ruler_rect: tuple | None) -> tuple[int, int, int, int]:
@@ -55,27 +59,20 @@ class AutoTranslateDetector:
         crop = frame_data[y1:y2, x1:x2]
         return cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
 
-    @staticmethod
-    def _compute_dhash(gray: np.ndarray) -> int:
-        small = cv2.resize(gray, (9, 8), interpolation=cv2.INTER_AREA)
-        diff = small[:, 1:] > small[:, :-1]
-        bits = 0
-        for val in diff.flatten():
-            bits = (bits << 1) | int(bool(val))
-        return bits
-
-    @staticmethod
-    def _hamming_distance(a: int | None, b: int | None) -> int:
-        if a is None or b is None:
-            return 64
-        return (a ^ b).bit_count()
-
-    @staticmethod
-    def _changed_pixel_ratio(img_a: np.ndarray, img_b: np.ndarray, threshold: int = 20) -> float:
+    @classmethod
+    def _block_diff_map(cls, img_a: np.ndarray, img_b: np.ndarray, threshold: int = 20) -> np.ndarray | None:
         if img_a is None or img_b is None or img_a.shape != img_b.shape:
-            return 1.0
-        diff = cv2.absdiff(img_a, img_b)
-        return float(np.mean(diff > threshold))
+            return None
+        diff_bin = (cv2.absdiff(img_a, img_b) > threshold).astype(np.float32)
+        h, w = diff_bin.shape
+        bs = cls.BLOCK_SIZE
+        rows = max(1, (h + bs - 1) // bs)
+        cols = max(1, (w + bs - 1) // bs)
+        pad_h = (rows * bs) - h
+        pad_w = (cols * bs) - w
+        if pad_h > 0 or pad_w > 0:
+            diff_bin = np.pad(diff_bin, ((0, pad_h), (0, pad_w)), mode="constant", constant_values=0.0)
+        return diff_bin.reshape(rows, bs, cols, bs).mean(axis=(1, 3))
 
     @staticmethod
     def _has_text_like_contrast(gray: np.ndarray) -> bool:
@@ -86,6 +83,14 @@ class AutoTranslateDetector:
         edge_density = float(np.mean(edges > 0))
         return edge_density >= 0.010
 
+    def _current_osc_mask(self, shape_rc: tuple[int, int]) -> np.ndarray:
+        if len(self._block_history) < 3:
+            return np.zeros(shape_rc, dtype=bool)
+        if self._block_history[0].shape != shape_rc:
+            return np.zeros(shape_rc, dtype=bool)
+        hits = np.sum(self._block_history, axis=0)
+        return hits >= 3
+
     def notify_skipped(self, frame_data: np.ndarray | None, roi_mode: str = "auto", ruler_rect: tuple | None = None):
         """Called when auto-trigger found no new dialogue text; updates baseline and applies backoff."""
         self._consecutive_skips = min(4, self._consecutive_skips + 1)
@@ -95,7 +100,6 @@ class AutoTranslateDetector:
             gray = self._extract_gray_roi(frame_data, rect)
             self._prev_gray = gray
             self._last_translated_gray = gray
-            self._last_translated_dhash = self._compute_dhash(gray)
             self._pending_settle = False
 
     def mark_translated(self, frame_data: np.ndarray, roi_mode: str = "auto",
@@ -107,7 +111,6 @@ class AutoTranslateDetector:
         self._prev_gray = gray
         self._prev_roi_key = rect
         self._last_translated_gray = gray
-        self._last_translated_dhash = self._compute_dhash(gray)
         self._pending_settle = False
         self._consecutive_skips = 0
         if is_api_call:
@@ -117,8 +120,8 @@ class AutoTranslateDetector:
         self,
         frame_data: np.ndarray,
         roi_mode: str = "auto",
-        debounce_ms: int = 900,
-        cooldown_ms: int = 2800,
+        debounce_ms: int = 1200,
+        cooldown_ms: int = 4000,
         ruler_rect: tuple | None = None,
         cache_store: GlossaryAndCacheStore | None = None,
         src_lang: str = "ja",
@@ -140,27 +143,49 @@ class AutoTranslateDetector:
             self._prev_roi_key = rect
             self._prev_gray = gray
             self._last_translated_gray = None
-            self._last_translated_dhash = None
             self._last_change_ts = now
             self._pending_settle = True
             self._consecutive_skips = 0
+            self._block_history.clear()
             return False, False
 
         # Ignore solid fade-in/fade-out screens
         if not self._has_text_like_contrast(gray):
             self._prev_gray = gray
             self._pending_settle = False
+            self._block_history.clear()
             return False, False
 
-        # 1. Motion check (>1.0% pixel delta keeps resetting debounce during walking or cursor animation)
-        motion_ratio = self._changed_pixel_ratio(gray, self._prev_gray, threshold=20)
-        if motion_ratio > 0.010:
+        # 1. Per-block motion & oscillating-animation detection
+        block_motion = self._block_diff_map(gray, self._prev_gray, threshold=20)
+        if block_motion is None:
             self._prev_gray = gray
             self._last_change_ts = now
             self._pending_settle = True
             return False, False
 
-        # 2. Screen is currently stable; wait for full settle debounce
+        raw_active = block_motion > 0.03
+        active_frac = float(np.mean(raw_active))
+
+        if active_frac > 0.55:
+            # Major scene/camera transition: reset oscillation history
+            self._block_history.clear()
+        else:
+            self._block_history.append(raw_active)
+
+        osc_mask = self._current_osc_mask(raw_active.shape)
+        non_osc_active = raw_active & (~osc_mask)
+        non_osc_motion_blocks = int(np.sum(non_osc_active))
+
+        self._prev_gray = gray
+
+        # Reset settle timer only if non-oscillating blocks changed (e.g. text printing or walking)
+        if non_osc_motion_blocks >= 2 or float(np.mean(block_motion * (~osc_mask))) > 0.015:
+            self._last_change_ts = now
+            self._pending_settle = True
+            return False, False
+
+        # 2. Wait for non-oscillating regions to stay settled for debounce_ms
         if not self._pending_settle:
             return False, False
 
@@ -168,17 +193,23 @@ class AutoTranslateDetector:
         if (now - self._last_change_ts) < eff_debounce_sec:
             return False, False
 
-        # 3. Require meaningful difference vs last translated/checked screen
-        #    (>4.5% pixel change AND dHash distance > 4 filters out localized animated menu cursors)
-        dhash = self._compute_dhash(gray)
-        diff_vs_last = self._changed_pixel_ratio(gray, self._last_translated_gray, threshold=20)
-        hamming = self._hamming_distance(dhash, self._last_translated_dhash)
-        if self._last_translated_gray is not None and (diff_vs_last <= 0.045 or hamming <= 4):
-            self._pending_settle = False
-            return False, False
+        # 3. Compare settled screen against last translated screen, ignoring oscillating tiles
+        if self._last_translated_gray is not None:
+            block_vs_last = self._block_diff_map(gray, self._last_translated_gray, threshold=20)
+            if block_vs_last is not None:
+                eff_mask = osc_mask if osc_mask.shape == block_vs_last.shape else np.zeros_like(block_vs_last, dtype=bool)
+                changed_blocks = int(np.sum((block_vs_last > 0.06) & (~eff_mask)))
+                if changed_blocks < 2:
+                    self._pending_settle = False
+                    return False, False
+                diff_ratio_non_osc = changed_blocks / float(max(1, block_vs_last.size))
+            else:
+                diff_ratio_non_osc = 1.0
+        else:
+            diff_ratio_non_osc = 1.0
 
         # Major scene transition resets empty-screen backoff
-        if diff_vs_last > 0.25:
+        if diff_ratio_non_osc > 0.25:
             self._consecutive_skips = 0
 
         # 4. Instant Frame Cache bypasses API cooldown throttling
@@ -196,7 +227,6 @@ class AutoTranslateDetector:
 
         # Commit baseline and fire trigger
         self._last_translated_gray = gray
-        self._last_translated_dhash = dhash
         self._pending_settle = False
         if not is_cache_hit:
             self._last_api_trigger_ts = now

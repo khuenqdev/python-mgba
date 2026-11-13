@@ -353,6 +353,7 @@ class VideoGLWidget(QOpenGLWidget):
         content_rect = QRect(bx + pad_x, by + pad_y, box_w - (pad_x * 2), box_h - (pad_y * 2))
         painter.setClipRect(content_rect)
 
+        draw_flags = Qt.AlignmentFlag.AlignLeft.value | Qt.TextFlag.TextWordWrap.value
         cur_y = by + pad_y
         draw_w = box_w - (pad_x * 2)
         for font, color, text, item_h, gap in entries:
@@ -362,7 +363,7 @@ class VideoGLWidget(QOpenGLWidget):
             painter.setPen(color)
             painter.drawText(
                 QRect(bx + pad_x, cur_y, draw_w, item_h),
-                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.TextWordWrap,
+                draw_flags,
                 text,
             )
             cur_y += item_h + gap
