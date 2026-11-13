@@ -5,7 +5,6 @@ import html
 import math
 import datetime
 import numpy as np
-from PIL import Image
 
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QFileDialog, QMessageBox, 
                              QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
@@ -14,6 +13,8 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QFileDialog, QMessageBox,
 from PyQt6.QtGui import (QImage, QPainter, QAction, QActionGroup, QKeySequence, 
                          QColor, QFont, QPen, QBrush)
 from PyQt6.QtCore import Qt, QTimer, QPoint, QRect, QEvent, QSize
+from PyQt6.QtOpenGLWidgets import QOpenGLWidget
+from PyQt6.QtOpenGL import QOpenGLTexture
 
 from core_worker import EmulatorWorker
 from controller import ControllerManager, ControllerConfigDialog, LIBRETRO_BTNS, QT_KEY_MAP
@@ -21,21 +22,24 @@ from dev_tools import (PaletteViewerDialog, SpriteViewerDialog, TileViewerDialog
                        MapViewerDialog, FrameInspectorDialog, MemoryViewerDialog, 
                        MemorySearchDialog, IORegisterViewerDialog)
 from ai_translator import TranslationWorker
+from shader_manager import RetroArchShaderManager
+from shader_dialog import ShaderConfigDialog
 
 
-class VideoWidget(QWidget):
-    """High-speed rendering surface for emulator video with pixel ruler support."""
-    def __init__(self, parent=None):
+class VideoGLWidget(QOpenGLWidget):
+    """Hardware-accelerated OpenGL rendering surface with RetroArch shader pipeline."""
+    def __init__(self, shader_manager, parent=None):
         super().__init__(parent)
-        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
-        # Allow fluid scaling down to 1x without enforcing minimum dimensions
+        self.sm = shader_manager
         self.setMinimumSize(0, 0)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.setMouseTracking(True) 
+        self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
         self.current_frame_data = None
-        self.qimage = None
-        
+        self.tex_id = None
+        self._need_texture_update = False
+
         # OSD Setup
         self.osd_text = ""
         self.osd_timer = QTimer()
@@ -56,13 +60,116 @@ class VideoWidget(QWidget):
     def minimumSizeHint(self) -> QSize:
         return QSize(0, 0)
 
+    def initializeGL(self):
+        from OpenGL import GL
+
+        # Clear any pre-existing GL errors
+        while GL.glGetError() != GL.GL_NO_ERROR:
+            pass
+
+        # Create clean 240x160 RGB OpenGL texture
+        self.tex_id = int(GL.glGenTextures(1))
+        GL.glBindTexture(GL.GL_TEXTURE_2D, self.tex_id)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_NEAREST)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_NEAREST)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
+        GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
+        GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGB8, 240, 160, 0, GL.GL_RGB, GL.GL_UNSIGNED_BYTE, None)
+        GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 4)  # Always restore default alignment for Qt QPainter
+        GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+
+        # Initialize Shader Manager VBO/VAO & compile shaders
+        self.sm.set_gl_widget(self)
+        self.sm.init_gl()
+
     def set_frame(self, frame_data: np.ndarray):
         self.current_frame_data = frame_data
-        height, width, channel = frame_data.shape
-        bytes_per_line = 3 * width
-        self.qimage = QImage(self.current_frame_data.data, width, height, 
-                             bytes_per_line, QImage.Format.Format_RGB888)
+        self._need_texture_update = True
         self.update()
+
+    def paintGL(self):
+        from OpenGL import GL
+
+        # 1. Zero-copy pixel upload to GPU VRAM
+        if self._need_texture_update and self.current_frame_data is not None and self.tex_id is not None:
+            h, w, _ = self.current_frame_data.shape
+            buf = np.ascontiguousarray(self.current_frame_data, dtype=np.uint8)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, self.tex_id)
+            GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
+            GL.glTexSubImage2D(GL.GL_TEXTURE_2D, 0, 0, 0, w, h, GL.GL_RGB, GL.GL_UNSIGNED_BYTE, buf)
+            GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 4)  # Restore default 4-byte alignment for Qt font glyphs
+            GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+            self._need_texture_update = False
+
+        # 2. Calculate High-DPI aware viewport size
+        dpr = self.devicePixelRatioF()
+        phys_w = max(1, int(self.width() * dpr))
+        phys_h = max(1, int(self.height() * dpr))
+        default_fbo = self.defaultFramebufferObject()
+
+        # 3. Render through RetroArch Shader Chain
+        if self.tex_id is not None:
+            self.sm.render(self.tex_id, 240, 160, phys_w, phys_h, default_fbo)
+
+        # 4. Restore default widget FBO, viewport, and unpack alignment cleanly before QPainter overlay
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, default_fbo)
+        GL.glViewport(0, 0, phys_w, phys_h)
+        GL.glUseProgram(0)
+        GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 4)
+
+        painter = QPainter(self)
+
+        # Pixel Ruler Overlay
+        if self.ruler_enabled:
+            img_w, img_h = 240, 160
+            scale = min(self.width() / img_w, self.height() / img_h)
+            ox = (self.width() - img_w * scale) / 2
+            oy = (self.height() - img_h * scale) / 2
+
+            if self.hover_pos:
+                hx, hy = self.hover_pos
+                sx, sy = ox + hx * scale, oy + hy * scale
+                painter.setPen(QPen(QColor(0, 255, 255, 160), 1))
+                painter.drawLine(int(ox), int(sy), int(ox + img_w * scale), int(sy))
+                painter.drawLine(int(sx), int(oy), int(sx), int(oy + img_h * scale))
+
+                painter.setPen(QColor(0, 255, 255))
+                painter.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+                painter.drawText(int(ox) + 5, int(oy) + 15, f"Cursor: {hx}, {hy}")
+
+            if self.ruler_start and self.ruler_end:
+                x1, y1 = self.ruler_start
+                x2, y2 = self.ruler_end
+                rx, ry = min(x1, x2), min(y1, y2)
+                rw, rh = abs(x2 - x1) + 1, abs(y2 - y1) + 1
+
+                screen_x = ox + rx * scale
+                screen_y = oy + ry * scale
+                screen_w = rw * scale
+                screen_h = rh * scale
+
+                painter.setPen(QPen(QColor(255, 0, 255), 2))
+                painter.setBrush(QColor(255, 0, 255, 60))
+                painter.drawRect(int(screen_x), int(screen_y), int(screen_w), int(screen_h))
+
+                label = f" W: {rw}px \n H: {rh}px "
+                painter.setPen(QColor(255, 255, 255))
+                painter.setFont(QFont("Arial", 11, QFont.Weight.Bold))
+                tr = painter.fontMetrics().boundingRect(label)
+                tr.moveTo(int(screen_x), int(screen_y) - tr.height())
+                painter.fillRect(tr, QColor(0, 0, 0, 180))
+                painter.drawText(tr, Qt.AlignmentFlag.AlignLeft, label)
+
+        # Global OSD Message (Top-Right)
+        if self.osd_text:
+            painter.setPen(QPen(QColor(0, 255, 0)))
+            painter.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+            painter.drawText(self.rect().adjusted(10, 10, -10, -10), 
+                             Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight, 
+                             self.osd_text)
+
+        painter.end()
 
     def show_osd(self, text: str, duration_ms: int = 2000):
         self.osd_text = text
@@ -74,24 +181,17 @@ class VideoWidget(QWidget):
         self.update()
 
     def get_gba_coords(self, pos) -> tuple:
-        if not self.qimage:
-            return 0, 0
-        widget_w, widget_h = self.width(), self.height()
-        img_w, img_h = self.qimage.width(), self.qimage.height()
-        
-        scale = min(widget_w / img_w, widget_h / img_h)
-        offset_x = (widget_w - (img_w * scale)) / 2
-        offset_y = (widget_h - (img_h * scale)) / 2
+        img_w, img_h = 240, 160
+        scale = min(self.width() / img_w, self.height() / img_h)
+        offset_x = (self.width() - (img_w * scale)) / 2
+        offset_y = (self.height() - (img_h * scale)) / 2
         
         gba_x = int((pos.x() - offset_x) / scale)
         gba_y = int((pos.y() - offset_y) / scale)
-        
         return max(0, min(img_w - 1, gba_x)), max(0, min(img_h - 1, gba_y))
 
     def mousePressEvent(self, event):
         self.setFocus()
-
-        # Mouse Gyro Twist Gesture (Right-Click or Middle-Click drag)
         if event.button() in [Qt.MouseButton.RightButton, Qt.MouseButton.MiddleButton]:
             parent_win = self.window()
             if hasattr(parent_win, 'config') and parent_win.config.get("sensors", "mouse_gyro"):
@@ -101,7 +201,6 @@ class VideoWidget(QWidget):
                 self.update()
                 return
 
-        # Pixel Ruler Drag
         if self.ruler_enabled and event.button() == Qt.MouseButton.LeftButton:
             self.ruler_start = self.get_gba_coords(event.position())
             self.ruler_end = self.ruler_start
@@ -140,68 +239,6 @@ class VideoWidget(QWidget):
         parent_win = self.window()
         if hasattr(parent_win, 'worker') and parent_win.worker:
             parent_win.worker.set_gyro_angle(angle)
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor(0, 0, 0))
-
-        if self.qimage:
-            scaled_img = self.qimage.scaled(self.rect().size(), 
-                                            Qt.AspectRatioMode.KeepAspectRatio, 
-                                            Qt.TransformationMode.FastTransformation)
-            x = (self.width() - scaled_img.width()) // 2
-            y = (self.height() - scaled_img.height()) // 2
-            painter.drawImage(x, y, scaled_img)
-
-            img_w, img_h = self.qimage.width(), self.qimage.height()
-            scale = min(self.width() / img_w, self.height() / img_h)
-            ox = (self.width() - img_w * scale) / 2
-            oy = (self.height() - img_h * scale) / 2
-
-            # Pixel Ruler Overlay
-            if self.ruler_enabled:
-                if self.hover_pos:
-                    hx, hy = self.hover_pos
-                    sx, sy = ox + hx * scale, oy + hy * scale
-                    painter.setPen(QPen(QColor(0, 255, 255, 150), 1))
-                    painter.drawLine(int(ox), int(sy), int(ox + img_w * scale), int(sy))
-                    painter.drawLine(int(sx), int(oy), int(sx), int(oy + img_h * scale))
-                    
-                    painter.setPen(QColor(0, 255, 255))
-                    painter.setFont(QFont("Arial", 10, QFont.Weight.Bold))
-                    painter.drawText(int(ox) + 5, int(oy) + 15, f"Cursor: {hx}, {hy}")
-
-                if self.ruler_start and self.ruler_end:
-                    x1, y1 = self.ruler_start
-                    x2, y2 = self.ruler_end
-                    rx, ry = min(x1, x2), min(y1, y2)
-                    rw, rh = abs(x2 - x1) + 1, abs(y2 - y1) + 1
-
-                    screen_x = ox + rx * scale
-                    screen_y = oy + ry * scale
-                    screen_w = rw * scale
-                    screen_h = rh * scale
-
-                    painter.setPen(QPen(QColor(255, 0, 255), 2))
-                    painter.setBrush(QColor(255, 0, 255, 60))
-                    painter.drawRect(int(screen_x), int(screen_y), int(screen_w), int(screen_h))
-
-                    label = f" W: {rw}px \n H: {rh}px "
-                    painter.setPen(QColor(255, 255, 255))
-                    painter.setFont(QFont("Arial", 11, QFont.Weight.Bold))
-                    tr = painter.fontMetrics().boundingRect(label)
-                    tr.moveTo(int(screen_x), int(screen_y) - tr.height())
-                    painter.fillRect(tr, QColor(0, 0, 0, 180))
-                    painter.drawText(tr, Qt.AlignmentFlag.AlignLeft, label)
-
-        # Global OSD Message (Top-Right)
-        if self.osd_text:
-            painter.setPen(QPen(QColor(0, 255, 0)))
-            painter.setFont(QFont("Arial", 15, QFont.Weight.Bold))
-            painter.drawText(self.rect().adjusted(10, 10, -10, -10), 
-                             Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight, 
-                             self.osd_text)
-        painter.end()
 
 
 class SensorHudWidget(QFrame):
@@ -242,30 +279,29 @@ class SensorHudWidget(QFrame):
         self.layout_box.setContentsMargins(6, 0, 6, 0)
         self.layout_box.setSpacing(6)
 
-        # Ignored size policies & 0 minimum width prevent any restriction on window resizing
         self.lbl_game = QLabel()
         self.lbl_game.setStyleSheet("color: #90CAF9;")
         self.lbl_game.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.lbl_game.setMinimumWidth(0)
-        self.layout_box.addWidget(self.lbl_game, 2)
+        self.layout_box.addWidget(self.lbl_game, 3)
 
         self.lbl_solar = QLabel()
         self.lbl_solar.setStyleSheet("color: #FFD54F;")
         self.lbl_solar.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.lbl_solar.setMinimumWidth(0)
-        self.layout_box.addWidget(self.lbl_solar, 1)
+        self.layout_box.addWidget(self.lbl_solar, 3)
 
         self.lbl_rumble = QLabel()
         self.lbl_rumble.setStyleSheet("color: #78909C;")
         self.lbl_rumble.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.lbl_rumble.setMinimumWidth(0)
-        self.layout_box.addWidget(self.lbl_rumble, 1)
+        self.layout_box.addWidget(self.lbl_rumble, 2)
 
         self.lbl_gyro = QLabel()
         self.lbl_gyro.setStyleSheet("color: #4DD0E1;")
         self.lbl_gyro.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.lbl_gyro.setMinimumWidth(0)
-        self.layout_box.addWidget(self.lbl_gyro, 1)
+        self.layout_box.addWidget(self.lbl_gyro, 2)
 
         self.update_display()
 
@@ -282,51 +318,47 @@ class SensorHudWidget(QFrame):
     def update_display(self):
         w = self.width()
 
-        # 1. Game Title Label
-        type_str = f" ({self.hw_type.replace('_', ' ').title()})" if self.hw_type not in ["None", ""] else ""
+        type_str = f" ({self.hw_type.replace('_', ' ').title()})" if (w >= 860 and self.hw_type not in ["None", ""]) else ""
         if w < 380:
             self.lbl_game.setText(f"[{self.game_code}]")
         elif w < 650:
             short_t = self.game_title[:10] + ".." if len(self.game_title) > 10 else self.game_title
             self.lbl_game.setText(f"🎮 [{self.game_code}] {short_t}")
         else:
-            self.lbl_game.setText(f"🎮 Game: [{self.game_code}] {self.game_title}{type_str}")
+            self.lbl_game.setText(f"🎮 [{self.game_code}] {self.game_title}{type_str}")
 
-        # 2. Solar Indicator (Boktai)
-        if w < 480:
+        if w < 500:
             self.lbl_solar.setText(f"☀️ {self.current_solar_level}/10")
         else:
             sun_filled = "■" * self.current_solar_level
             sun_empty = "□" * (10 - self.current_solar_level)
-            self.lbl_solar.setText(f"☀️ Solar: [{sun_filled}{sun_empty}] {self.current_solar_level}/10")
+            self.lbl_solar.setText(f"☀️ [{sun_filled}{sun_empty}] {self.current_solar_level}/10")
 
-        # 3. Rumble Motor Indicator
         if self.rumble_active:
             pct = int(self.rumble_strength * 100)
             filled = max(1, min(5, int(self.rumble_strength * 5)))
             bars = "■" * filled + "□" * (5 - filled)
-            if w < 480:
+            if w < 520:
                 self.lbl_rumble.setText(f"📳 {pct}%")
             else:
-                self.lbl_rumble.setText(f"📳 Rumble: [{bars}] {pct}%")
+                self.lbl_rumble.setText(f"📳 [{bars}] {pct}%")
             self.lbl_rumble.setStyleSheet("color: #FF5252;")
         else:
-            if w < 480:
+            if w < 520:
                 self.lbl_rumble.setText("📳 OFF")
             else:
-                self.lbl_rumble.setText("📳 Rumble: [□□□□□] OFF")
+                self.lbl_rumble.setText("📳 [□□□□□] OFF")
             self.lbl_rumble.setStyleSheet("color: #78909C;")
 
-        # 4. Gyro / Tilt Indicator
         deg = int(self.current_gyro_angle) % 360
-        if w < 480:
+        if w < 520:
             self.lbl_gyro.setText(f"🎯 {deg}°")
         else:
-            idx = max(0, min(10, int((self.current_tilt_x + 1.0) * 5.0)))
-            meter = list("─────●─────")
+            idx = max(0, min(6, int((self.current_tilt_x + 1.0) * 3.0)))
+            meter = list("───●───")
             meter[idx] = "●"
             meter_str = "".join(meter)
-            self.lbl_gyro.setText(f"🎯 Gyro: [{meter_str}] {deg:3d}°")
+            self.lbl_gyro.setText(f"🎯 [{meter_str}] {deg:3d}°")
 
     def on_game_identified(self, title: str, code: str, hw_type: str):
         self.game_title = title
@@ -360,68 +392,6 @@ class SensorHudWidget(QFrame):
         self.update_display()
 
 
-class AITranslationConfigDialog(QDialog):
-    LANGS = [
-        ("Japanese", "ja"),
-        ("English", "en"),
-        ("Vietnamese", "vi")
-    ]
-
-    def __init__(self, config, parent=None):
-        super().__init__(parent)
-        self.config = config
-        self.setWindowTitle("Configure AI Translation")
-        self.resize(380, 200)
-
-        layout = QVBoxLayout(self)
-
-        row_src = QHBoxLayout()
-        row_src.addWidget(QLabel("Source Language (Original):"))
-        self.src_combo = QComboBox()
-        for label, code in self.LANGS:
-            self.src_combo.addItem(label, code)
-        row_src.addWidget(self.src_combo)
-        layout.addLayout(row_src)
-
-        row_tgt = QHBoxLayout()
-        row_tgt.addWidget(QLabel("Target Language (Translate to):"))
-        self.tgt_combo = QComboBox()
-        for label, code in self.LANGS:
-            self.tgt_combo.addItem(label, code)
-        row_tgt.addWidget(self.tgt_combo)
-        layout.addLayout(row_tgt)
-
-        curr_src = self.config.get("ai_translation", "source_lang") or "ja"
-        curr_tgt = self.config.get("ai_translation", "target_lang") or "vi"
-
-        idx_src = self.src_combo.findData(curr_src)
-        if idx_src >= 0:
-            self.src_combo.setCurrentIndex(idx_src)
-
-        idx_tgt = self.tgt_combo.findData(curr_tgt)
-        if idx_tgt >= 0:
-            self.tgt_combo.setCurrentIndex(idx_tgt)
-
-        layout.addStretch()
-
-        btn_row = QHBoxLayout()
-        btn_save = QPushButton("Save Settings")
-        btn_save.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 6px;")
-        btn_save.clicked.connect(self.save_and_close)
-        btn_row.addWidget(btn_save)
-
-        btn_cancel = QPushButton("Cancel")
-        btn_cancel.clicked.connect(self.reject)
-        btn_row.addWidget(btn_cancel)
-        layout.addLayout(btn_row)
-
-    def save_and_close(self):
-        self.config.set("ai_translation", "source_lang", self.src_combo.currentData())
-        self.config.set("ai_translation", "target_lang", self.tgt_combo.currentData())
-        self.config.save()
-        self.accept()
-
-
 class MainWindow(QMainWindow):
     if sys.platform.startswith('win'):
         DEFAULT_CORE = "mgba_libretro.dll"
@@ -453,19 +423,22 @@ class MainWindow(QMainWindow):
         script_dir = os.path.dirname(os.path.abspath(__file__))
         self.core_path = os.path.join(script_dir, self.DEFAULT_CORE)
 
+        # Initialize RetroArch Shader Engine
+        self.shader_manager = RetroArchShaderManager(self.config)
+
         self.controller_manager = ControllerManager(self.config)
         self.gamepad_timer = QTimer(self)
         self.gamepad_timer.timeout.connect(self.poll_gamepad)
         self.gamepad_timer.start(8)
 
-        # Vertical Splitter: Video -> HUD Panel -> Subtitle Panel
+        # Vertical Splitter: OpenGL Video -> HUD Panel -> Subtitle Panel
         self.splitter = QSplitter(Qt.Orientation.Vertical)
         self.splitter.setHandleWidth(3)
         self.splitter.setStyleSheet("QSplitter::handle { background-color: #282828; }")
         self.splitter.splitterMoved.connect(self.on_splitter_moved)
 
-        # 1. Game Screen Widget
-        self.video_widget = VideoWidget()
+        # 1. Hardware-Accelerated OpenGL Video Surface
+        self.video_widget = VideoGLWidget(self.shader_manager)
         self.splitter.addWidget(self.video_widget)
 
         # 2. Separated Sensor & Rumble HUD Panel
@@ -550,7 +523,6 @@ class MainWindow(QMainWindow):
             self.config.set("video", "splitter_sizes", self.splitter.sizes())
 
     def changeEvent(self, event):
-        """Automatically pauses emulation when the window loses focus and resumes when focused."""
         if event.type() == QEvent.Type.ActivationChange:
             pause_enabled = bool(self.config.get("emulation", "pause_on_unfocus", True))
             if not self.isActiveWindow():
@@ -808,8 +780,36 @@ class MainWindow(QMainWindow):
             vol_menu.addAction(act)
             self.vol_actions[vol] = act
 
-        # 5. VIDEO MENU
+        # 5. VIDEO MENU (Shaders, Geometry Scaling, Filters)
         video_menu = menubar.addMenu("Video")
+
+        # RetroArch Shaders Submenu
+        shader_menu = video_menu.addMenu("RetroArch Shaders")
+        
+        self.act_shader_toggle = QAction("Enable Shaders", self, checkable=True)
+        self.act_shader_toggle.setChecked(self.shader_manager.enabled)
+        self.act_shader_toggle.triggered.connect(self.toggle_shaders)
+        shader_menu.addAction(self.act_shader_toggle)
+
+        act_shader_cfg = QAction("Configure Shaders & Parameters...", self)
+        act_shader_cfg.setShortcut(QKeySequence("F8"))
+        act_shader_cfg.triggered.connect(self.open_shader_dialog)
+        shader_menu.addAction(act_shader_cfg)
+        shader_menu.addSeparator()
+
+        sub_presets = shader_menu.addMenu("Quick Presets")
+        presets = [
+            ("GBA Color & LCD Grid", "gba_color"),
+            ("CRT-Easymode", "crt"),
+            ("Scanlines Classic", "scanlines"),
+            ("Sharp Bilinear", "sharp"),
+            ("Stock (Passthrough)", "stock")
+        ]
+        for label, p_id in presets:
+            act = sub_presets.addAction(label)
+            act.triggered.connect(lambda _, pid=p_id: self.apply_quick_shader_preset(pid))
+
+        video_menu.addSeparator()
 
         self.blend_action = QAction("Interframe Blending", self, checkable=True)
         self.blend_action.setChecked(bool(self.config.get("video", "interframe_blending")))
@@ -929,6 +929,29 @@ class MainWindow(QMainWindow):
         reset_settings_act.triggered.connect(self.reset_settings_to_default)
         tools_menu.addAction(reset_settings_act)
 
+    def open_shader_dialog(self):
+        dlg = ShaderConfigDialog(self.shader_manager, self.video_widget, self.config, self)
+        dlg.exec()
+        self.act_shader_toggle.setChecked(self.shader_manager.enabled)
+
+    def toggle_shaders(self):
+        val = self.act_shader_toggle.isChecked()
+        self.shader_manager.enabled = val
+        self.config.set("shaders", "enabled", val)
+        self.config.save()
+        self.video_widget.update()
+        self.video_widget.show_osd(f"Shaders: {'ON' if val else 'OFF'}")
+
+    def apply_quick_shader_preset(self, preset_id: str):
+        self.shader_manager.load_preset_by_name(preset_id)
+        self.shader_manager.enabled = True
+        self.act_shader_toggle.setChecked(True)
+        self.config.set("shaders", "enabled", True)
+        self.config.set("shaders", "preset", preset_id)
+        self.config.save()
+        self.video_widget.update()
+        self.video_widget.show_osd(f"Preset Applied: {preset_id.replace('_', ' ').title()}")
+
     def set_scale(self, scale: int):
         """Applies exact GBA 3:2 geometric scaling with zero pillarboxing and full persistence."""
         self.scale_factor = scale
@@ -942,9 +965,7 @@ class MainWindow(QMainWindow):
         video_w = 240 * scale
         total_h = video_h + hud_h + panel_h
 
-        # Update splitter elements proportionally
         self.splitter.setSizes([video_h, hud_h, panel_h])
-        # Resize window without any minimum width constraint blocking the dimensions
         self.resize(video_w, total_h)
         
         self.config.set("video", "window_width", video_w)
@@ -1232,7 +1253,6 @@ class MainWindow(QMainWindow):
         if current_fs in self.fs_actions:
             self.fs_actions[current_fs].setChecked(True)
 
-        # Sync active scale factor radio item
         if self.scale_factor in self.scale_actions:
             self.scale_actions[self.scale_factor].setChecked(True)
 
@@ -1404,7 +1424,6 @@ class MainWindow(QMainWindow):
         self.worker.error_occurred.connect(self.handle_error)
         self.worker.replay_finished.connect(self.on_replay_finished)
         
-        # Connect Sensors, Dedicated HUD, and Physical Rumble Signals
         self.worker.rumble_triggered.connect(self.sensor_hud.on_rumble_triggered)
         self.worker.rumble_triggered.connect(self.controller_manager.trigger_rumble)
         self.worker.solar_changed.connect(self.sensor_hud.on_solar_updated)
@@ -1490,6 +1509,7 @@ class MainWindow(QMainWindow):
         out_dir = self.config.get("paths", "screenshots")
         os.makedirs(out_dir, exist_ok=True)
         filename = f"screenshot_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        from PIL import Image
         Image.fromarray(self.video_widget.current_frame_data, 'RGB').save(os.path.join(out_dir, filename))
         self.video_widget.show_osd("Screenshot Captured!")
 
@@ -1540,7 +1560,6 @@ class MainWindow(QMainWindow):
         if not self.worker:
             return
 
-        # Fast-Forward Hotkeys: '=' (Toggle / Speed Up) and '-' (Toggle / Slow Down)
         if event.key() in [Qt.Key.Key_Equal, Qt.Key.Key_Plus] and not event.isAutoRepeat():
             if not self.ff_action.isChecked():
                 self.ff_action.setChecked(True)
@@ -1562,7 +1581,6 @@ class MainWindow(QMainWindow):
                     self.cycle_ff_speed(forward=False)
             return
 
-        # Solar Sensor Hotkeys (Boktai)
         if event.key() == Qt.Key.Key_BracketRight:
             self.adjust_solar_sensor(1)
             return
@@ -1570,7 +1588,6 @@ class MainWindow(QMainWindow):
             self.adjust_solar_sensor(-1)
             return
 
-        # Gyro / Tilt Simulation Hotkeys
         if event.key() == Qt.Key.Key_Q:
             new_ang = (self.sensor_hud.current_gyro_angle - 15) % 360
             self.worker.set_gyro_angle(new_ang)
@@ -1664,7 +1681,6 @@ class MainWindow(QMainWindow):
             self.worker.stop()
             self.worker.wait()
             
-        # Persist window geometry, splitter sizes, scale factor, and HUD visibility
         if not self.isMaximized() and not self.isMinimized():
             self.config.set("video", "window_width", self.width())
             self.config.set("video", "window_height", self.height())
@@ -1672,5 +1688,6 @@ class MainWindow(QMainWindow):
                 self.config.set("video", "splitter_sizes", self.splitter.sizes())
         self.config.set("video", "scale", self.scale_factor)
         self.config.set("sensors", "show_hud", self.sensor_hud.isVisible())
+        self.config.set("shaders", "enabled", self.shader_manager.enabled)
         self.config.save()
         event.accept()

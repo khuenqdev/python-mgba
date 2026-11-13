@@ -85,6 +85,7 @@ class EmulatorWorker(QThread):
 
         self.latest_video_frame = None
         self.previous_frame = None
+        self._last_gui_render_time = 0.0
 
         self.standard_buttons = {}
         self.autofire_buttons = {"a": False, "b": False, "l": False, "r": False}
@@ -102,7 +103,6 @@ class EmulatorWorker(QThread):
         self._active_rumble_low = 0.0
         self._active_rumble_high = 0.0
 
-        # Persistent C-String references to prevent garbage collection
         self._c_str_cache = {
             b"mgba_force_gbp": b"ON",
             b"mgba_use_bios": b"OFF",
@@ -139,11 +139,8 @@ class EmulatorWorker(QThread):
         except Exception:
             pass
 
-    # =========================================================================
-    # Native Libretro Environment Callbacks
-    # =========================================================================
     def _libretro_environ_cb(self, cmd: int, data: int) -> bool:
-        """Acts as the official Libretro environment provider, configuring mGBA natively."""
+        """Acts as the Libretro environment provider, configuring mGBA natively."""
         if cmd == RETRO_ENVIRONMENT_GET_VARIABLE:
             if not data:
                 return False
@@ -211,7 +208,6 @@ class EmulatorWorker(QThread):
         else:            # RETRO_RUMBLE_WEAK (high frequency motor)
             self._active_rumble_high = norm_val
 
-        # If strength is 0, mGBA has commanded the motor to stop
         if self._active_rumble_low <= 0.0 and self._active_rumble_high <= 0.0:
             self.rumble_triggered.emit(0.0, 0.0, 0)
         else:
@@ -220,7 +216,6 @@ class EmulatorWorker(QThread):
         return True
 
     def _install_libretro_hooks(self):
-        """Attaches our environment and rumble callback hooks directly into the core binary."""
         try:
             self._core_dll = ctypes.CDLL(self.core_path)
             if hasattr(self._core_dll, "retro_set_environment"):
@@ -244,19 +239,14 @@ class EmulatorWorker(QThread):
         self._c_str_cache[b"mgba_use_bios"] = b"OFF" if skip_bios else b"ON"
 
         try:
-            # 1. Initialize Emulator wrapper
             self.emu = Emulator(self.core_path)
-
-            # 2. Hook environment callbacks so mGBA enables GBP and native rumble
             self._install_libretro_hooks()
-
-            # 3. Load game ROM
             self.emu.load_game(self.rom_path)
 
             print(f"\n=======================================================")
             print(f"[ROM IDENTIFICATION] Title: {self.game_title} | Code: {self.game_code}")
             print(f"[ROM IDENTIFICATION] Hardware Profile: {self.rumble_type}")
-            print(f"[RUMBLE CONFIG] Native Emulation Active (Audio guessing disabled)")
+            print(f"[RUMBLE CONFIG] Native Libretro Emulation Active")
             print(f"=======================================================\n")
 
             self.game_identified.emit(self.game_title, self.game_code, self.rumble_type)
@@ -290,6 +280,7 @@ class EmulatorWorker(QThread):
 
         next_time = time.perf_counter()
         frame_counter = 0
+        self._last_gui_render_time = time.perf_counter()
 
         while self._is_running:
             if self.is_paused and not self.step_requested:
@@ -394,7 +385,21 @@ class EmulatorWorker(QThread):
                     else:
                         self.previous_frame = frame_data.copy()
 
-                self.frame_ready.emit(frame_data)
+                # =============================================================
+                # FAST-FORWARD GUI EVENT QUEUE THROTTLING
+                # Caps display updates to ~60 FPS during fast forward so Qt's
+                # event loop is never saturated and the UI never freezes.
+                # =============================================================
+                now_ts = time.perf_counter()
+                should_emit_gui = True
+                if self.fast_forward and not was_single_step:
+                    if (now_ts - self._last_gui_render_time) < 0.016:
+                        should_emit_gui = False
+                    else:
+                        self._last_gui_render_time = now_ts
+
+                if should_emit_gui:
+                    self.frame_ready.emit(frame_data)
 
             # Audio Processing
             is_ff = self.fast_forward
@@ -420,14 +425,22 @@ class EmulatorWorker(QThread):
                 except Exception:
                     pass
 
+            # =============================================================
+            # CLOCK PACING FOR NORMAL & FAST-FORWARD SPEED
+            # Caps emulation speed to fps_target precisely, eliminating 
+            # uncontrolled 1000+ FPS spinlocks that cause "Not Responding".
+            # =============================================================
             if not played_audio:
                 now = time.perf_counter()
                 sleep_time = next_time - now
-                if sleep_time > 0 and not is_ff and not was_single_step:
+                if sleep_time > 0.001 and not was_single_step:
                     time.sleep(sleep_time)
                     next_time += frame_time
                 else:
-                    next_time = now + frame_time
+                    if sleep_time < -0.05:
+                        next_time = now + frame_time
+                    else:
+                        next_time += frame_time
 
         if stream:
             stream.stop()
