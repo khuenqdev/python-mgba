@@ -1,34 +1,20 @@
-# gui.py
-import os
-import sys
-import html
-import math
-import datetime
-import numpy as np
+# sensor_hud.py
+from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QSizePolicy
+from PyQt6.QtCore import QTimer, QSize
 
-from PyQt6.QtWidgets import (QMainWindow, QWidget, QFileDialog, QMessageBox, 
-                             QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
-                             QComboBox, QPushButton, QTextEdit, QSplitter, 
-                             QFrame, QSizePolicy)
-from PyQt6.QtGui import (QImage, QPainter, QAction, QActionGroup, QKeySequence, 
-                         QColor, QFont, QPen, QBrush)
-from PyQt6.QtCore import Qt, QTimer, QPoint, QRect, QEvent, QSize
-from PyQt6.QtOpenGLWidgets import QOpenGLWidget
-from PyQt6.QtOpenGL import QOpenGLTexture
 
-from ..core.core_worker import EmulatorWorker
-from .controller import ControllerManager, ControllerConfigDialog, LIBRETRO_BTNS, QT_KEY_MAP
-from ..tools.dev_tools import (PaletteViewerDialog, SpriteViewerDialog, TileViewerDialog,
-                               MapViewerDialog, FrameInspectorDialog, MemoryViewerDialog,
-                               MemorySearchDialog, IORegisterViewerDialog)
-from ..tools.ai_translator import TranslationWorker
-from .shader_manager import RetroArchShaderManager
-from .shader_dialog import ShaderConfigDialog
-from ..paths import PROJECT_ROOT
+def format_playtime(total_seconds: float) -> str:
+    sec = max(0, int(total_seconds))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
 
 
 class SensorHudWidget(QFrame):
     """Dynamically responsive status bar with fluid multi-tier scaling."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFrameShape(QFrame.Shape.StyledPanel)
@@ -56,6 +42,8 @@ class SensorHudWidget(QFrame):
         self.current_tilt_x = 0.0
         self.current_tilt_y = 0.0
         self.current_gyro_angle = 0.0
+        self.total_playtime_seconds = 0.0
+        self.launch_count = 0
 
         self._rumble_off_timer = QTimer(self)
         self._rumble_off_timer.setSingleShot(True)
@@ -89,6 +77,12 @@ class SensorHudWidget(QFrame):
         self.lbl_gyro.setMinimumWidth(0)
         self.layout_box.addWidget(self.lbl_gyro, 2)
 
+        self.lbl_playtime = QLabel()
+        self.lbl_playtime.setStyleSheet("color: #A5D6A7;")
+        self.lbl_playtime.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.lbl_playtime.setMinimumWidth(0)
+        self.layout_box.addWidget(self.lbl_playtime, 2)
+
         self.update_display()
 
     def minimumSizeHint(self) -> QSize:
@@ -104,7 +98,7 @@ class SensorHudWidget(QFrame):
     def update_display(self):
         w = self.width()
 
-        type_str = f" ({self.hw_type.replace('_', ' ').title()})" if (w >= 860 and self.hw_type not in ["None", ""]) else ""
+        type_str = f" ({self.hw_type.replace('_', ' ').title()})" if (w >= 920 and self.hw_type not in ["None", ""]) else ""
         if w < 380:
             self.lbl_game.setText(f"[{self.game_code}]")
         elif w < 650:
@@ -113,7 +107,7 @@ class SensorHudWidget(QFrame):
         else:
             self.lbl_game.setText(f"🎮 [{self.game_code}] {self.game_title}{type_str}")
 
-        if w < 500:
+        if w < 540:
             self.lbl_solar.setText(f"☀️ {self.current_solar_level}/10")
         else:
             sun_filled = "■" * self.current_solar_level
@@ -124,20 +118,20 @@ class SensorHudWidget(QFrame):
             pct = int(self.rumble_strength * 100)
             filled = max(1, min(5, int(self.rumble_strength * 5)))
             bars = "■" * filled + "□" * (5 - filled)
-            if w < 520:
+            if w < 560:
                 self.lbl_rumble.setText(f"📳 {pct}%")
             else:
                 self.lbl_rumble.setText(f"📳 [{bars}] {pct}%")
             self.lbl_rumble.setStyleSheet("color: #FF5252;")
         else:
-            if w < 520:
+            if w < 560:
                 self.lbl_rumble.setText("📳 OFF")
             else:
                 self.lbl_rumble.setText("📳 [□□□□□] OFF")
             self.lbl_rumble.setStyleSheet("color: #78909C;")
 
         deg = int(self.current_gyro_angle) % 360
-        if w < 520:
+        if w < 560:
             self.lbl_gyro.setText(f"🎯 {deg}°")
         else:
             idx = max(0, min(6, int((self.current_tilt_x + 1.0) * 3.0)))
@@ -146,10 +140,23 @@ class SensorHudWidget(QFrame):
             meter_str = "".join(meter)
             self.lbl_gyro.setText(f"🎯 [{meter_str}] {deg:3d}°")
 
+        pt_str = format_playtime(self.total_playtime_seconds)
+        if w < 440:
+            self.lbl_playtime.setText(f"⏱ {pt_str}")
+        elif self.launch_count > 0:
+            self.lbl_playtime.setText(f"⏱ {pt_str} (#{self.launch_count})")
+        else:
+            self.lbl_playtime.setText(f"⏱ {pt_str}")
+
     def on_game_identified(self, title: str, code: str, hw_type: str):
         self.game_title = title
         self.game_code = code
         self.hw_type = hw_type
+        self.update_display()
+
+    def on_playtime_updated(self, total_seconds: float, launch_count: int = 0):
+        self.total_playtime_seconds = max(0.0, float(total_seconds))
+        self.launch_count = max(0, int(launch_count))
         self.update_display()
 
     def on_solar_updated(self, level: int):
@@ -176,5 +183,3 @@ class SensorHudWidget(QFrame):
         self.current_tilt_y = y
         self.current_gyro_angle = angle
         self.update_display()
-
-

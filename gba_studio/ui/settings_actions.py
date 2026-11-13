@@ -178,6 +178,11 @@ class SettingsActionsMixin:
         self.active_tool_window = NetplayLinkDialog(self, self)
         self.active_tool_window.show()
 
+    def open_game_stats_dialog(self):
+        from .stats_dialog import GameStatsDialog
+        self.active_tool_window = GameStatsDialog(self, self)
+        self.active_tool_window.show()
+
     def open_graphic_editor(self):
         if not self.worker:
             QMessageBox.warning(self, "Notice", "Emulation must be running to edit graphics.")

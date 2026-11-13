@@ -3,6 +3,7 @@ import os
 import re
 import json
 import copy
+import glob
 import datetime
 
 CONFIG_FILE = "mgba_config.json"
@@ -67,8 +68,8 @@ DEFAULT_CONFIG = {
         "target_lang": "vi",
         "overlay_enabled": True,
         "auto_translate": False,
-        "auto_debounce_ms": 900,
-        "auto_cooldown_ms": 2800,
+        "auto_debounce_ms": 1200,
+        "auto_cooldown_ms": 4000,
         "auto_roi_mode": "auto"
     },
     "netplay": {
@@ -235,7 +236,7 @@ class EmulatorConfig:
             self.save()
 
     # =========================================================================
-    # PER-GAME CONFIGURATION PROFILES
+    # PER-GAME CONFIGURATION PROFILES & PLAYTIME STATISTICS
     # =========================================================================
     def get_profile_path(self, profile_id: str) -> str:
         profiles_dir = self.global_settings.get("paths", {}).get("profiles", "profiles") or "profiles"
@@ -243,10 +244,44 @@ class EmulatorConfig:
         safe_id = re.sub(r"[^\w\-]", "_", str(profile_id or "DEFAULT")).strip("_") or "DEFAULT"
         return os.path.join(profiles_dir, f"{safe_id}.json")
 
+    def _read_profile_file(self, profile_id: str) -> dict:
+        path = self.get_profile_path(profile_id)
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            return raw if isinstance(raw, dict) else {}
+        except Exception as e:
+            print(f"[PROFILE WARNING] Failed to read {path}: {e}")
+            return {}
+
+    def _write_profile_file(self, profile_id: str, payload: dict):
+        path = self.get_profile_path(profile_id)
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=4)
+            os.replace(tmp, path)
+        except Exception as e:
+            print(f"[PROFILE WARNING] Failed to write {path}: {e}")
+
+    @staticmethod
+    def _has_custom_config_flag(raw: dict) -> bool:
+        if not raw:
+            return False
+        meta = raw.get("_meta", {})
+        if isinstance(meta, dict) and "use_custom_config" in meta:
+            return bool(meta["use_custom_config"])
+        # Legacy profile files without explicit flag are custom profiles if overrides exist
+        overrides = raw.get("overrides")
+        return bool(isinstance(overrides, dict) and overrides)
+
     def has_profile(self, profile_id: str) -> bool:
         if not profile_id:
             return False
-        return os.path.exists(self.get_profile_path(profile_id))
+        raw = self._read_profile_file(profile_id)
+        return self._has_custom_config_flag(raw)
 
     def deactivate_profile(self):
         self.active_profile_id = None
@@ -259,16 +294,13 @@ class EmulatorConfig:
         if not profile_id:
             return False
 
-        path = self.get_profile_path(profile_id)
-        if not os.path.exists(path):
+        raw = self._read_profile_file(profile_id)
+        if not self._has_custom_config_flag(raw):
             return False
 
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-
-            overrides = raw.get("overrides", raw) if isinstance(raw, dict) else {}
-            cleaned = {}
+        overrides = raw.get("overrides", {})
+        cleaned = {}
+        if isinstance(overrides, dict):
             for sec, sec_val in overrides.items():
                 if sec == "_meta" or sec in GLOBAL_ONLY_TOP_SECTIONS or not isinstance(sec_val, dict):
                     continue
@@ -279,15 +311,11 @@ class EmulatorConfig:
                 if filtered:
                     cleaned[sec] = filtered
 
-            self.active_profile_id = profile_id
-            self.active_profile_title = title or raw.get("_meta", {}).get("game_title", "")
-            self.profile_overrides = cleaned
-            self._rebuild_effective_settings()
-            return True
-        except Exception as e:
-            print(f"[PROFILE WARNING] Failed to load profile {path}: {e}")
-            self.deactivate_profile()
-            return False
+        self.active_profile_id = profile_id
+        self.active_profile_title = title or raw.get("_meta", {}).get("game_title", "")
+        self.profile_overrides = cleaned
+        self._rebuild_effective_settings()
+        return True
 
     def create_profile(self, profile_id: str, title: str = "", seed_from_current: bool = False) -> str:
         self.active_profile_id = profile_id
@@ -313,32 +341,173 @@ class EmulatorConfig:
     def save_active_profile(self):
         if not self.active_profile_id:
             return
-        path = self.get_profile_path(self.active_profile_id)
+        existing = self._read_profile_file(self.active_profile_id)
+        stats = existing.get("stats") if isinstance(existing.get("stats"), dict) else {}
         payload = {
             "_meta": {
                 "profile_id": self.active_profile_id,
                 "game_title": self.active_profile_title,
                 "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                "use_custom_config": True,
             },
+            "stats": stats,
             "overrides": self.profile_overrides,
         }
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=4)
-        except Exception as e:
-            print(f"[PROFILE WARNING] Failed to save profile {path}: {e}")
+        self._write_profile_file(self.active_profile_id, payload)
 
     def delete_profile(self, profile_id: str) -> bool:
         path = self.get_profile_path(profile_id)
         if self.active_profile_id == profile_id:
             self.deactivate_profile()
-        if os.path.exists(path):
+        if not os.path.exists(path):
+            return False
+
+        raw = self._read_profile_file(profile_id)
+        stats = raw.get("stats")
+        if isinstance(stats, dict) and stats:
+            # Preserve playtime/launch statistics when removing custom config overrides
+            meta = raw.get("_meta", {}) if isinstance(raw.get("_meta"), dict) else {}
+            meta["use_custom_config"] = False
+            meta["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+            self._write_profile_file(profile_id, {
+                "_meta": meta,
+                "stats": stats,
+                "overrides": {},
+            })
+            return True
+
+        try:
+            os.remove(path)
+            return True
+        except OSError as e:
+            print(f"[PROFILE WARNING] Failed to delete profile {path}: {e}")
+            return False
+
+    # =========================================================================
+    # PER-GAME PLAYTIME & STATISTICS API
+    # =========================================================================
+    @staticmethod
+    def _default_stats() -> dict:
+        return {
+            "playtime_seconds": 0.0,
+            "launch_count": 0,
+            "first_played": "",
+            "last_played": "",
+            "last_session_seconds": 0.0,
+        }
+
+    def get_game_stats(self, profile_id: str) -> dict:
+        if not profile_id:
+            return self._default_stats()
+        raw = self._read_profile_file(profile_id)
+        stats = self._default_stats()
+        if isinstance(raw.get("stats"), dict):
+            stats.update(raw["stats"])
+        return stats
+
+    def record_game_launch(self, profile_id: str, title: str = "") -> dict:
+        if not profile_id:
+            return self._default_stats()
+
+        now_iso = datetime.datetime.now().isoformat(timespec="seconds")
+        raw = self._read_profile_file(profile_id)
+        meta = raw.get("_meta", {}) if isinstance(raw.get("_meta"), dict) else {}
+        stats = self._default_stats()
+        if isinstance(raw.get("stats"), dict):
+            stats.update(raw["stats"])
+
+        stats["launch_count"] = int(stats.get("launch_count", 0) or 0) + 1
+        if not stats.get("first_played"):
+            stats["first_played"] = now_iso
+        stats["last_played"] = now_iso
+        stats["last_session_seconds"] = 0.0
+
+        meta["profile_id"] = profile_id
+        if title:
+            meta["game_title"] = title
+        meta["updated_at"] = now_iso
+        if "use_custom_config" not in meta:
+            meta["use_custom_config"] = self._has_custom_config_flag(raw)
+
+        payload = {
+            "_meta": meta,
+            "stats": stats,
+            "overrides": raw.get("overrides", {}) if isinstance(raw.get("overrides"), dict) else {},
+        }
+        self._write_profile_file(profile_id, payload)
+        return stats
+
+    def add_game_playtime(self, profile_id: str, delta_seconds: float, title: str = "",
+                          session_total: float | None = None) -> dict:
+        if not profile_id or delta_seconds <= 0:
+            return self.get_game_stats(profile_id)
+
+        now_iso = datetime.datetime.now().isoformat(timespec="seconds")
+        raw = self._read_profile_file(profile_id)
+        meta = raw.get("_meta", {}) if isinstance(raw.get("_meta"), dict) else {}
+        stats = self._default_stats()
+        if isinstance(raw.get("stats"), dict):
+            stats.update(raw["stats"])
+
+        stats["playtime_seconds"] = round(float(stats.get("playtime_seconds", 0.0) or 0.0) + float(delta_seconds), 1)
+        stats["last_played"] = now_iso
+        if not stats.get("first_played"):
+            stats["first_played"] = now_iso
+        if session_total is not None:
+            stats["last_session_seconds"] = round(float(session_total), 1)
+
+        meta["profile_id"] = profile_id
+        if title:
+            meta["game_title"] = title
+        meta["updated_at"] = now_iso
+        if "use_custom_config" not in meta:
+            meta["use_custom_config"] = self._has_custom_config_flag(raw)
+
+        payload = {
+            "_meta": meta,
+            "stats": stats,
+            "overrides": raw.get("overrides", {}) if isinstance(raw.get("overrides"), dict) else {},
+        }
+        self._write_profile_file(profile_id, payload)
+        return stats
+
+    def reset_game_stats(self, profile_id: str):
+        if not profile_id:
+            return
+        raw = self._read_profile_file(profile_id)
+        if not raw:
+            return
+        meta = raw.get("_meta", {}) if isinstance(raw.get("_meta"), dict) else {}
+        meta["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+        raw["_meta"] = meta
+        raw["stats"] = self._default_stats()
+        self._write_profile_file(profile_id, raw)
+
+    def list_all_game_stats(self) -> list:
+        profiles_dir = self.global_settings.get("paths", {}).get("profiles", "profiles") or "profiles"
+        os.makedirs(profiles_dir, exist_ok=True)
+        rows = []
+        for path in sorted(glob.glob(os.path.join(profiles_dir, "*.json"))):
             try:
-                os.remove(path)
-                return True
-            except OSError as e:
-                print(f"[PROFILE WARNING] Failed to delete profile {path}: {e}")
-        return False
+                with open(path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                if not isinstance(raw, dict):
+                    continue
+                meta = raw.get("_meta", {}) if isinstance(raw.get("_meta"), dict) else {}
+                stats = self._default_stats()
+                if isinstance(raw.get("stats"), dict):
+                    stats.update(raw["stats"])
+                pid = meta.get("profile_id") or os.path.splitext(os.path.basename(path))[0]
+                rows.append({
+                    "profile_id": pid,
+                    "game_title": meta.get("game_title", pid),
+                    "use_custom_config": self._has_custom_config_flag(raw),
+                    **stats,
+                })
+            except Exception:
+                continue
+        rows.sort(key=lambda r: float(r.get("playtime_seconds", 0.0) or 0.0), reverse=True)
+        return rows
 
     # =========================================================================
     # RECENT FILES (ALWAYS GLOBAL)

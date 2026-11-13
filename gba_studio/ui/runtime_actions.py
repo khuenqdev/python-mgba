@@ -202,6 +202,16 @@ class RuntimeActionsMixin:
             QMessageBox.critical(self, "Core Error", f"Core not found:\n{self.core_path}")
             return
 
+        if hasattr(self, "_flush_playtime"):
+            self._flush_playtime()
+        self._active_stats_pid = None
+        self._active_stats_title = ""
+        self._base_playtime_sec = 0.0
+        self._session_playtime_sec = 0.0
+        self._unsaved_playtime_sec = 0.0
+        self._active_launch_count = 0
+        self._launch_stats_recorded = False
+
         if hasattr(self, "clip_recorder") and self.clip_recorder.is_recording:
             self.clip_recorder.stop()
 

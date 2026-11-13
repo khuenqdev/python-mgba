@@ -54,6 +54,18 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
         self.trans_worker = None
         self._auto_paused = False
 
+        # Per-Game Playtime & Stats State
+        self._active_stats_pid = None
+        self._active_stats_title = ""
+        self._base_playtime_sec = 0.0
+        self._session_playtime_sec = 0.0
+        self._unsaved_playtime_sec = 0.0
+        self._active_launch_count = 0
+        self._launch_stats_recorded = False
+        self._playtime_timer = QTimer(self)
+        self._playtime_timer.setInterval(1000)
+        self._playtime_timer.timeout.connect(self._on_playtime_tick)
+
         # Smart Auto-Translate State
         self.auto_trans_detector = AutoTranslateDetector()
         self._auto_cache_store = None
@@ -179,6 +191,42 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
         self._sync_ui_with_config()
         self.update_recent_menu()
         self.video_widget.setFocus()
+
+    # =========================================================================
+    # PER-GAME PLAYTIME TRACKING
+    # =========================================================================
+    def _on_playtime_tick(self):
+        if (
+            not self._active_stats_pid
+            or not self.worker
+            or not getattr(self, "is_running", False)
+            or self.worker.is_paused
+            or self.worker.is_rewinding
+        ):
+            return
+
+        self._session_playtime_sec += 1.0
+        self._unsaved_playtime_sec += 1.0
+        total_now = self._base_playtime_sec + self._session_playtime_sec
+        self.sensor_hud.on_playtime_updated(total_now, self._active_launch_count)
+
+        if self._unsaved_playtime_sec >= 15.0:
+            self._flush_playtime()
+
+    def _flush_playtime(self):
+        if not self._active_stats_pid or self._unsaved_playtime_sec <= 0.0:
+            return
+        stats = self.config.add_game_playtime(
+            self._active_stats_pid,
+            self._unsaved_playtime_sec,
+            title=self._active_stats_title,
+            session_total=self._session_playtime_sec,
+        )
+        self._base_playtime_sec = max(
+            0.0,
+            float(stats.get("playtime_seconds", 0.0) or 0.0) - self._session_playtime_sec,
+        )
+        self._unsaved_playtime_sec = 0.0
 
     # =========================================================================
     # DRAG-AND-DROP SUPPORT
@@ -323,6 +371,20 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
         self.sensor_hud.on_rumble_triggered(1.0, 1.0, 300)
 
     def on_game_identified(self, title: str, code: str, hw_type: str):
+        if self.worker and not self._launch_stats_recorded:
+            self._launch_stats_recorded = True
+            pid = self.worker.get_profile_id()
+            self._active_stats_pid = pid
+            self._active_stats_title = title or pid
+            stats = self.config.record_game_launch(pid, title=self._active_stats_title)
+            self._base_playtime_sec = float(stats.get("playtime_seconds", 0.0) or 0.0)
+            self._session_playtime_sec = 0.0
+            self._unsaved_playtime_sec = 0.0
+            self._active_launch_count = int(stats.get("launch_count", 1) or 1)
+            self.sensor_hud.on_playtime_updated(self._base_playtime_sec, self._active_launch_count)
+            if not self._playtime_timer.isActive():
+                self._playtime_timer.start()
+
         display_title = f"mGBA - {title} [{code}]"
         if self.player_slot > 1:
             display_title += f" [Peer {self.player_slot}]"
@@ -506,6 +568,10 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
 
     def closeEvent(self, event):
         self.is_running = False
+        if hasattr(self, "_playtime_timer"):
+            self._playtime_timer.stop()
+        self._flush_playtime()
+
         if hasattr(self, "gamepad_timer"):
             self.gamepad_timer.stop()
 
