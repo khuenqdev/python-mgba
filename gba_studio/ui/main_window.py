@@ -5,6 +5,7 @@ import sys
 from PyQt6.QtWidgets import QMainWindow, QTextEdit, QSplitter, QSizePolicy, QMessageBox
 from PyQt6.QtCore import Qt, QTimer, QEvent
 
+from ..core.clip_recorder import ClipRecorder
 from .controller import ControllerManager
 from ..tools.dev_tools import MemoryViewerDialog
 from .shader_manager import RetroArchShaderManager
@@ -79,6 +80,13 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
         # 1. Hardware-Accelerated OpenGL Video Surface
         self.video_widget = VideoGLWidget(self.shader_manager)
         self.splitter.addWidget(self.video_widget)
+
+        # Initialize Clip Recorder (GIF / MP4)
+        self.clip_recorder = ClipRecorder(self)
+        self.clip_recorder.status_changed.connect(self.video_widget.set_clip_status)
+        self.clip_recorder.export_finished.connect(self.on_clip_export_finished)
+        self.clip_recorder.export_error.connect(self.on_clip_export_error)
+        self.clip_recorder.recording_stopped.connect(self._sync_clip_menu_idle)
 
         # 2. Separated Sensor & Rumble HUD Panel
         self.sensor_hud = SensorHudWidget()
@@ -314,6 +322,20 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
             self.toggle_fullscreen()
             return
 
+        # Keep Clip & Input HUD shortcuts active when menubar is hidden in Fullscreen
+        if self.isFullScreen() and not event.isAutoRepeat():
+            cs_mods = Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier
+            if event.modifiers() == cs_mods:
+                if event.key() == Qt.Key.Key_G:
+                    self.toggle_clip_gif()
+                    return
+                if event.key() == Qt.Key.Key_M:
+                    self.toggle_clip_mp4()
+                    return
+                if event.key() == Qt.Key.Key_I:
+                    self.input_overlay_action.trigger()
+                    return
+
         if not self.worker:
             return
 
@@ -457,6 +479,13 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
         self.is_running = False
         if hasattr(self, "gamepad_timer"):
             self.gamepad_timer.stop()
+
+        if hasattr(self, "clip_recorder"):
+            if self.clip_recorder.is_recording:
+                self.clip_recorder.stop(wait=True)
+            for th in list(self.clip_recorder._export_threads):
+                th.wait()
+
         if self.worker:
             self.worker.set_rewinding(False)
             self.worker.stop()

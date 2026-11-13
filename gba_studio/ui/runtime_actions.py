@@ -143,9 +143,14 @@ class RuntimeActionsMixin:
             QMessageBox.critical(self, "Core Error", f"Core not found:\n{self.core_path}")
             return
 
+        if hasattr(self, "clip_recorder") and self.clip_recorder.is_recording:
+            self.clip_recorder.stop()
+
         if self.worker:
             self.worker.stop()
             self.worker.wait()
+
+        self.video_widget.set_input_hud("IDLE", 0, 0, 0)
 
         save_base = os.path.splitext(os.path.basename(self.current_rom))[0]
         self.worker = EmulatorWorker(
@@ -155,6 +160,9 @@ class RuntimeActionsMixin:
             save_base_name=save_base,
         )
         self.worker.frame_ready.connect(self.video_widget.set_frame)
+        if hasattr(self, "clip_recorder"):
+            self.worker.frame_ready.connect(self.clip_recorder.push_frame)
+        self.worker.input_hud_updated.connect(self.video_widget.set_input_hud)
         self.worker.error_occurred.connect(self.handle_error)
         self.worker.replay_finished.connect(self.on_replay_finished)
         self.worker.rewind_status.connect(self.video_widget.show_osd)
@@ -198,9 +206,8 @@ class RuntimeActionsMixin:
         if self.worker:
             self.worker.fast_forward = self.ff_action.isChecked()
             spd = float(self.config.get("emulation", "fast_forward_ratio") or 2.0)
-            self.video_widget.show_osd(
-                f"Fast Forward: {'ON (' + str(spd) + 'x)' if self.worker.fast_forward else 'OFF'}"
-            )
+            state_txt = f"ON ({spd}x)" if self.worker.fast_forward else "OFF"
+            self.video_widget.show_osd(f"Fast Forward: {state_txt}")
 
     def cycle_ff_speed(self, forward: bool = True):
         speeds = [1.5, 2.0, 3.0, 4.0, 8.0, 10.0]

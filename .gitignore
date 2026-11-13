@@ -23,6 +23,8 @@ screenshots/
 *.png
 *.jpg
 *.jpeg
+*.gif
+*.mp4
 exports/
 
 # Machine-specific user config containing local paths
@@ -60,6 +62,8 @@ saves/
 replays/
 samples/
 states/
+models/
+records/
 
 # =============================================================================
 # 7. IDE & OS Metadata

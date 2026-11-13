@@ -264,7 +264,7 @@ class MenuBuilderMixin:
             vol_menu.addAction(act)
             self.vol_actions[vol] = act
 
-        # 5. VIDEO MENU (Shaders, Fullscreen, Geometry Scaling, Filters)
+        # 5. VIDEO MENU (Shaders, Fullscreen, Input HUD, Clip Recorder, Scaling)
         video_menu = menubar.addMenu("Video")
 
         self.fullscreen_action = QAction("Fullscreen (Alt+Enter / F11)", self, checkable=True)
@@ -275,6 +275,12 @@ class MenuBuilderMixin:
         self.integer_scale_action.setChecked(bool(self.config.get("video", "integer_scaling", False)))
         self.integer_scale_action.triggered.connect(self.toggle_integer_scaling)
         video_menu.addAction(self.integer_scale_action)
+
+        self.input_overlay_action = QAction("Always Show Live Input & Frame HUD", self, checkable=True)
+        self.input_overlay_action.setShortcut(QKeySequence("Ctrl+Shift+I"))
+        self.input_overlay_action.setChecked(bool(self.config.get("video", "show_input_overlay", False)))
+        self.input_overlay_action.triggered.connect(self.toggle_input_overlay)
+        video_menu.addAction(self.input_overlay_action)
 
         video_menu.addSeparator()
 
@@ -329,6 +335,36 @@ class MenuBuilderMixin:
         screenshot_action.setShortcut(QKeySequence("F12"))
         screenshot_action.triggered.connect(self.take_screenshot)
         video_menu.addAction(screenshot_action)
+
+        clip_menu = video_menu.addMenu("Clip Recorder (GIF / MP4)")
+
+        self.act_record_gif = QAction("🎬 Record Animated GIF (30 FPS)", self, checkable=True)
+        self.act_record_gif.setShortcut(QKeySequence("Ctrl+Shift+G"))
+        self.act_record_gif.triggered.connect(self.toggle_clip_gif)
+        clip_menu.addAction(self.act_record_gif)
+
+        self.act_record_mp4 = QAction("🎥 Record MP4 Video (60 FPS)", self, checkable=True)
+        self.act_record_mp4.setShortcut(QKeySequence("Ctrl+Shift+M"))
+        self.act_record_mp4.triggered.connect(self.toggle_clip_mp4)
+        clip_menu.addAction(self.act_record_mp4)
+
+        self.act_stop_clip = QAction("⏹ Stop Clip Recording", self)
+        self.act_stop_clip.setEnabled(False)
+        self.act_stop_clip.triggered.connect(self.stop_clip_recording)
+        clip_menu.addAction(self.act_stop_clip)
+
+        clip_menu.addSeparator()
+        clip_scale_menu = clip_menu.addMenu("Clip Export Scale")
+        self.clip_scale_group = QActionGroup(self)
+        self.clip_scale_group.setExclusive(True)
+        self.clip_scale_actions = {}
+
+        for sc in range(1, 5):
+            sc_act = QAction(f"{sc}x ({240*sc}×{160*sc})", self, checkable=True)
+            sc_act.triggered.connect(lambda checked, s=sc: self.set_clip_scale(s))
+            self.clip_scale_group.addAction(sc_act)
+            clip_scale_menu.addAction(sc_act)
+            self.clip_scale_actions[sc] = sc_act
 
         video_menu.addSeparator()
 

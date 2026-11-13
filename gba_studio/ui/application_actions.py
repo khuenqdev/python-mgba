@@ -11,6 +11,83 @@ from .state_browser import SaveStateBrowserDialog
 
 
 class ApplicationActionsMixin:
+    def toggle_input_overlay(self):
+        val = self.input_overlay_action.isChecked()
+        self.config.set("video", "show_input_overlay", val)
+        self.video_widget.update()
+        self.video_widget.show_osd(f"Input & TAS Frame HUD: {'Always ON' if val else 'Rec/Replay Only'}")
+
+    def toggle_clip_gif(self):
+        if self.clip_recorder.is_recording:
+            self.stop_clip_recording()
+        else:
+            self._start_clip_recording("gif")
+
+    def toggle_clip_mp4(self):
+        if self.clip_recorder.is_recording:
+            self.stop_clip_recording()
+        else:
+            self._start_clip_recording("mp4")
+
+    def _start_clip_recording(self, fmt: str):
+        if not self.worker or not self.current_rom:
+            self.act_record_gif.setChecked(False)
+            self.act_record_mp4.setChecked(False)
+            QMessageBox.information(self, "Notice", "Load and run a ROM before recording a clip.")
+            return
+
+        scale = int(self.config.get("video", "clip_scale", 2) or 2)
+        records_dir = self.config.get("paths", "records") or "records"
+        rom_name = os.path.splitext(os.path.basename(self.current_rom))[0]
+
+        ok, msg = self.clip_recorder.start(fmt, scale, records_dir, rom_name)
+        if not ok:
+            self.act_record_gif.setChecked(False)
+            self.act_record_mp4.setChecked(False)
+            QMessageBox.warning(self, "Clip Recorder", msg)
+            return
+
+        self.act_record_gif.setChecked(fmt == "gif")
+        self.act_record_mp4.setChecked(fmt == "mp4")
+        self.act_record_gif.setEnabled(fmt == "gif")
+        self.act_record_mp4.setEnabled(fmt == "mp4")
+        self.act_stop_clip.setEnabled(True)
+        self.video_widget.show_osd(f"🔴 Recording {fmt.upper()} Clip ({scale}x)...", 2500)
+
+    def stop_clip_recording(self):
+        if self.clip_recorder.is_recording:
+            self.clip_recorder.stop()
+            self.video_widget.show_osd("💾 Saving Clip...", 2500)
+        self._sync_clip_menu_idle()
+
+    def _sync_clip_menu_idle(self):
+        if hasattr(self, "act_record_gif"):
+            self.act_record_gif.blockSignals(True)
+            self.act_record_gif.setChecked(False)
+            self.act_record_gif.setEnabled(True)
+            self.act_record_gif.blockSignals(False)
+        if hasattr(self, "act_record_mp4"):
+            self.act_record_mp4.blockSignals(True)
+            self.act_record_mp4.setChecked(False)
+            self.act_record_mp4.setEnabled(True)
+            self.act_record_mp4.blockSignals(False)
+        if hasattr(self, "act_stop_clip"):
+            self.act_stop_clip.setEnabled(False)
+
+    def on_clip_export_finished(self, filepath: str):
+        self._sync_clip_menu_idle()
+        self.video_widget.show_osd(f"✅ Saved Clip: {os.path.basename(filepath)}", 4000)
+
+    def on_clip_export_error(self, err_msg: str):
+        self._sync_clip_menu_idle()
+        QMessageBox.warning(self, "Clip Recorder Error", err_msg)
+
+    def set_clip_scale(self, scale: int):
+        self.config.set("video", "clip_scale", scale)
+        if hasattr(self, "clip_scale_actions") and scale in self.clip_scale_actions:
+            self.clip_scale_actions[scale].setChecked(True)
+        self.video_widget.show_osd(f"Clip Export Scale: {scale}x")
+
     def open_state_browser(self):
         if not self.current_rom:
             QMessageBox.information(self, "Notice", "Please load a ROM first to view its save state slots.")

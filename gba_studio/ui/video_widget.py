@@ -4,8 +4,23 @@ import numpy as np
 
 from PyQt6.QtWidgets import QSizePolicy
 from PyQt6.QtGui import QPainter, QColor, QFont, QPen
-from PyQt6.QtCore import Qt, QTimer, QPoint, QSize
+from PyQt6.QtCore import Qt, QTimer, QPoint, QSize, QRect
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
+
+
+# Matches HUD_BTN_BITS order in core_worker.py (bits 0..9)
+OVERLAY_BUTTON_LABELS = [
+    (4, "▲"),
+    (5, "▼"),
+    (6, "◀"),
+    (7, "▶"),
+    (2, "L"),
+    (3, "R"),
+    (1, "B"),
+    (0, "A"),
+    (9, "SL"),
+    (8, "ST"),
+]
 
 
 class VideoGLWidget(QOpenGLWidget):
@@ -28,6 +43,15 @@ class VideoGLWidget(QOpenGLWidget):
         self.osd_timer = QTimer()
         self.osd_timer.setSingleShot(True)
         self.osd_timer.timeout.connect(self.clear_osd)
+
+        # Live Input / TAS Frame HUD State
+        self.input_hud_mode = "IDLE"
+        self.input_hud_frame = 0
+        self.input_hud_max_frame = 0
+        self.input_hud_mask = 0
+
+        # Clip Recording Badge (e.g. "● REC GIF 00:04")
+        self.clip_rec_label = ""
 
         # Pixel Ruler State
         self.ruler_enabled = False
@@ -68,6 +92,20 @@ class VideoGLWidget(QOpenGLWidget):
         self._need_texture_update = True
         self.update()
 
+    def set_input_hud(self, mode: str, frame_num: int, max_frame: int, btn_mask: int):
+        self.input_hud_mode = mode
+        self.input_hud_frame = frame_num
+        self.input_hud_max_frame = max_frame
+        self.input_hud_mask = btn_mask
+
+        show_always = bool(self.sm.config.get("video", "show_input_overlay", False)) if self.sm and self.sm.config else False
+        if show_always or mode != "IDLE":
+            self.update()
+
+    def set_clip_status(self, label: str):
+        self.clip_rec_label = label
+        self.update()
+
     def _get_viewport_transform(self) -> tuple[float, float, float]:
         """Returns (logical_scale, offset_x, offset_y) matching the GL viewport."""
         dpr = self.devicePixelRatioF() or 1.0
@@ -84,6 +122,88 @@ class VideoGLWidget(QOpenGLWidget):
         ox = (self.width() - (240.0 * scale)) / 2.0
         oy = (self.height() - (160.0 * scale)) / 2.0
         return scale, ox, oy
+
+    def _draw_input_hud(self, painter: QPainter):
+        show_always = bool(self.sm.config.get("video", "show_input_overlay", False)) if self.sm and self.sm.config else False
+        if self.input_hud_mode == "IDLE" and not show_always:
+            return
+
+        compact = self.width() < 400
+        font_sz = 7 if compact else 9
+        pill_h = 15 if compact else 19
+        pad_x = 4 if compact else 7
+        gap = 2 if compact else 4
+
+        font = QFont("Cascadia Code, Consolas, Courier New, monospace", font_sz, QFont.Weight.Bold)
+        painter.setFont(font)
+        fm = painter.fontMetrics()
+
+        if self.input_hud_mode == "RECORDING":
+            status_txt = f"● REC F:{self.input_hud_frame:05d}"
+            status_col = QColor(255, 82, 82)
+        elif self.input_hud_mode == "PLAYBACK":
+            status_txt = f"▶ PLAY {self.input_hud_frame:04d}/{self.input_hud_max_frame:04d}"
+            status_col = QColor(77, 208, 225)
+        elif self.input_hud_mode == "REWIND":
+            status_txt = f"⏪ REW F:{self.input_hud_frame:05d}"
+            status_col = QColor(255, 213, 79)
+        else:
+            status_txt = f"F:{self.input_hud_frame:05d}"
+            status_col = QColor(144, 202, 249)
+
+        status_w = fm.horizontalAdvance(status_txt) + (6 if compact else 10)
+        pill_widths = []
+        total_pills_w = 0
+        for _, lbl in OVERLAY_BUTTON_LABELS:
+            pw = max(14 if compact else 20, fm.horizontalAdvance(lbl) + (6 if compact else 10))
+            pill_widths.append(pw)
+            total_pills_w += pw + gap
+
+        total_w = pad_x * 2 + status_w + 6 + total_pills_w
+        bar_h = pill_h + 8
+        bx = 8
+        by = max(4, self.height() - bar_h - 8)
+
+        painter.setPen(QPen(QColor(60, 72, 92, 200), 1))
+        painter.setBrush(QColor(12, 16, 22, 195))
+        painter.drawRoundedRect(bx, by, total_w, bar_h, 5, 5)
+
+        py = by + 4
+        painter.setPen(status_col)
+        painter.drawText(QRect(bx + pad_x, py, status_w, pill_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, status_txt)
+
+        cx = bx + pad_x + status_w + 4
+        for (bit_idx, lbl), pw in zip(OVERLAY_BUTTON_LABELS, pill_widths):
+            pressed = bool(self.input_hud_mask & (1 << bit_idx))
+            if pressed:
+                painter.setPen(QPen(QColor(0, 230, 118), 1))
+                painter.setBrush(QColor(0, 200, 100, 210))
+                txt_col = QColor(10, 15, 12)
+            else:
+                painter.setPen(QPen(QColor(55, 65, 80, 180), 1))
+                painter.setBrush(QColor(26, 31, 40, 180))
+                txt_col = QColor(120, 135, 150)
+
+            rect = QRect(cx, py, pw, pill_h)
+            painter.drawRoundedRect(rect, 3, 3)
+            painter.setPen(txt_col)
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, lbl)
+            cx += pw + gap
+
+    def _draw_clip_badge(self, painter: QPainter):
+        if not self.clip_rec_label:
+            return
+        font = QFont("Cascadia Code, Consolas, Courier New, monospace", 9, QFont.Weight.Bold)
+        painter.setFont(font)
+        fm = painter.fontMetrics()
+        tw = fm.horizontalAdvance(self.clip_rec_label) + 16
+        th = 22
+        rect = QRect(8, 8, tw, th)
+        painter.setPen(QPen(QColor(255, 82, 82, 220), 1))
+        painter.setBrush(QColor(25, 12, 16, 210))
+        painter.drawRoundedRect(rect, 5, 5)
+        painter.setPen(QColor(255, 110, 110))
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, self.clip_rec_label)
 
     def paintGL(self):
         from OpenGL import GL
@@ -151,6 +271,9 @@ class VideoGLWidget(QOpenGLWidget):
                 tr.moveTo(int(screen_x), int(screen_y) - tr.height())
                 painter.fillRect(tr, QColor(0, 0, 0, 180))
                 painter.drawText(tr, Qt.AlignmentFlag.AlignLeft, label)
+
+        self._draw_clip_badge(painter)
+        self._draw_input_hud(painter)
 
         # Global OSD Message (Top-Right)
         if self.osd_text:

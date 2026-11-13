@@ -37,6 +37,8 @@ DEFAULT_CONFIG = {
         "frameskip": 0,
         "interframe_blending": False,
         "integer_scaling": False,
+        "show_input_overlay": False,
+        "clip_scale": 2,
         "scale": 3,
         "window_width": 720,
         "window_height": 649,
@@ -59,6 +61,7 @@ DEFAULT_CONFIG = {
         "states": "states",
         "cheats": "cheats",
         "exports": "exports",
+        "records": "records",
         "translations": "translations",
         "replays": "replays"
     },

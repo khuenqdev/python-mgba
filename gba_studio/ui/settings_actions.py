@@ -30,8 +30,13 @@ class SettingsActionsMixin:
         self.auto_patch_action.setChecked(bool(self.config.get("emulation", "auto_soft_patch", True)))
         self.blend_action.setChecked(bool(self.config.get("video", "interframe_blending")))
         self.integer_scale_action.setChecked(bool(self.config.get("video", "integer_scaling", False)))
+        self.input_overlay_action.setChecked(bool(self.config.get("video", "show_input_overlay", False)))
         self.pause_unfocus_action.setChecked(bool(self.config.get("emulation", "pause_on_unfocus", True)))
         self.act_shader_toggle.setChecked(bool(self.config.get("shaders", "enabled", False)))
+
+        clip_scale = int(self.config.get("video", "clip_scale", 2) or 2)
+        if clip_scale in self.clip_scale_actions:
+            self.clip_scale_actions[clip_scale].setChecked(True)
 
         self.current_slot = int(self.config.get("emulation", "state_slot") or 1)
         if self.current_slot in self.slot_actions:
