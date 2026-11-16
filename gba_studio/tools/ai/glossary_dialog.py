@@ -349,7 +349,7 @@ class TranslationGlossaryDialog(QDialog):
 
 
 class AITranslationConfigDialog(QDialog):
-    """Configures AI translation languages, smart auto-trigger, and glossary access."""
+    """Configures AI translation languages, Groq API Key (JSON config), smart auto-trigger, and glossary."""
 
     def __init__(self, config, parent=None, rom_path: str = "", game_code: str = ""):
         super().__init__(parent)
@@ -357,7 +357,7 @@ class AITranslationConfigDialog(QDialog):
         self.rom_path = rom_path
         self.game_code = game_code
         self.setWindowTitle("Configure AI Translation")
-        self.resize(450, 340)
+        self.resize(470, 410)
         self._init_ui()
 
     def _init_ui(self):
@@ -387,11 +387,31 @@ class AITranslationConfigDialog(QDialog):
         tgt_row.addWidget(self.tgt_combo)
         layout.addLayout(tgt_row)
 
+        # Groq API Key stored in mgba_config.json
+        cred_grp = QGroupBox("API Credentials (Saved in mgba_config.json)")
+        cred_lay = QHBoxLayout(cred_grp)
+        cred_lay.addWidget(QLabel("Groq API Key:"))
+        self.groq_key_edit = QLineEdit()
+        self.groq_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.groq_key_edit.setPlaceholderText("gsk_...")
+        self.groq_key_edit.setText(str(self.config.get("credentials", "groq_api_key", "") or ""))
+        cred_lay.addWidget(self.groq_key_edit, 1)
+
+        self.btn_show_key = QPushButton("👁")
+        self.btn_show_key.setCheckable(True)
+        self.btn_show_key.setFixedWidth(32)
+        self.btn_show_key.toggled.connect(
+            lambda ch: self.groq_key_edit.setEchoMode(
+                QLineEdit.EchoMode.Normal if ch else QLineEdit.EchoMode.Password
+            )
+        )
+        cred_lay.addWidget(self.btn_show_key)
+        layout.addWidget(cred_grp)
+
         self.overlay_cb = QCheckBox("Show Floating Subtitle Overlay in Fullscreen Mode")
         self.overlay_cb.setChecked(bool(self.config.get("ai_translation", "overlay_enabled", True)))
         layout.addWidget(self.overlay_cb)
 
-        # Smart Auto-Trigger Group
         auto_grp = QGroupBox("Smart Auto-Translate Detector")
         auto_lay = QVBoxLayout(auto_grp)
 
@@ -417,7 +437,7 @@ class AITranslationConfigDialog(QDialog):
         self.debounce_spin.setRange(250, 3000)
         self.debounce_spin.setSingleStep(100)
         self.debounce_spin.setSuffix(" ms")
-        self.debounce_spin.setValue(int(self.config.get("ai_translation", "auto_debounce_ms", 900) or 900))
+        self.debounce_spin.setValue(int(self.config.get("ai_translation", "auto_debounce_ms", 1200) or 1200))
         timing_row.addWidget(self.debounce_spin)
 
         timing_row.addWidget(QLabel("API Cooldown:"))
@@ -425,7 +445,7 @@ class AITranslationConfigDialog(QDialog):
         self.cooldown_spin.setRange(500, 10000)
         self.cooldown_spin.setSingleStep(200)
         self.cooldown_spin.setSuffix(" ms")
-        self.cooldown_spin.setValue(int(self.config.get("ai_translation", "auto_cooldown_ms", 2800) or 2800))
+        self.cooldown_spin.setValue(int(self.config.get("ai_translation", "auto_cooldown_ms", 4000) or 4000))
         timing_row.addWidget(self.cooldown_spin)
         auto_lay.addLayout(timing_row)
 
@@ -448,6 +468,7 @@ class AITranslationConfigDialog(QDialog):
         dlg.exec()
 
     def _save(self):
+        self.config.set("credentials", "groq_api_key", self.groq_key_edit.text().strip())
         self.config.set("ai_translation", "source_lang", self.src_combo.currentData())
         self.config.set("ai_translation", "target_lang", self.tgt_combo.currentData())
         self.config.set("ai_translation", "overlay_enabled", self.overlay_cb.isChecked())

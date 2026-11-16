@@ -302,12 +302,18 @@ class ApplicationActionsMixin:
         if not self.isFullScreen():
             self._pre_fs_geometry = self.saveGeometry()
             self._pre_fs_splitter = self.splitter.sizes()
+            self._pre_fs_h_splitter = self.main_h_splitter.sizes() if hasattr(self, "main_h_splitter") else None
             self._pre_fs_hud_visible = self.sensor_hud.isVisible()
             self._pre_fs_trans_visible = self.translation_panel.isVisible()
+            self._pre_fs_ra_panel_visible = (
+                self.achievements_panel.isVisible() if hasattr(self, "achievements_panel") else False
+            )
 
             self.menuBar().hide()
             self.sensor_hud.hide()
             self.translation_panel.hide()
+            if hasattr(self, "achievements_panel"):
+                self.achievements_panel.hide()
             self.showFullScreen()
             self.fullscreen_action.setChecked(True)
             self.video_widget.setFocus()
@@ -318,9 +324,13 @@ class ApplicationActionsMixin:
             self.menuBar().show()
             self.sensor_hud.setVisible(bool(getattr(self, "_pre_fs_hud_visible", True)))
             self.translation_panel.setVisible(bool(getattr(self, "_pre_fs_trans_visible", True)))
+            if hasattr(self, "achievements_panel"):
+                self.achievements_panel.setVisible(bool(getattr(self, "_pre_fs_ra_panel_visible", True)))
 
             if getattr(self, "_pre_fs_splitter", None):
                 self.splitter.setSizes(self._pre_fs_splitter)
+            if getattr(self, "_pre_fs_h_splitter", None) and hasattr(self, "main_h_splitter"):
+                self.main_h_splitter.setSizes(self._pre_fs_h_splitter)
             if getattr(self, "_pre_fs_geometry", None):
                 self.restoreGeometry(self._pre_fs_geometry)
 
@@ -358,10 +368,16 @@ class ApplicationActionsMixin:
         video_w = 240 * scale
         total_h = video_h + hud_h + panel_h
 
-        self.splitter.setSizes([video_h, hud_h, panel_h])
-        self.resize(video_w, total_h)
+        ra_w = 0
+        if hasattr(self, "achievements_panel") and self.achievements_panel.isVisible():
+            ra_w = max(250, self.achievements_panel.width() or 300)
 
-        self.config.set("video", "window_width", video_w)
+        self.splitter.setSizes([video_h, hud_h, panel_h])
+        if hasattr(self, "main_h_splitter"):
+            self.main_h_splitter.setSizes([video_w, ra_w])
+        self.resize(video_w + ra_w, total_h)
+
+        self.config.set("video", "window_width", video_w + ra_w)
         self.config.set("video", "window_height", total_h)
         self.config.set("video", "splitter_sizes", [video_h, hud_h, panel_h])
         self.config.save()
@@ -554,7 +570,6 @@ class ApplicationActionsMixin:
                     cache.clear()
                 cache[sig] = boxes
 
-        # Refresh store contents in-place without resetting detector / OCR baselines
         if getattr(self, "_auto_cache_store", None) is not None:
             self._auto_cache_store.load()
 

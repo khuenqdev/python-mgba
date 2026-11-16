@@ -7,6 +7,7 @@ from PyQt6.QtCore import Qt, QTimer, QEvent
 
 from ..core.clip_recorder import ClipRecorder
 from ..core.netplay import NetplayEngine
+from ..core.retroachievements import RetroAchievementsManager
 from .controller import ControllerManager
 from ..tools.dev_tools import MemoryViewerDialog
 from ..tools.ai_translator import AutoTranslateDetector
@@ -15,6 +16,7 @@ from ..paths import PROJECT_ROOT
 
 from .video_widget import VideoGLWidget
 from .sensor_hud import SensorHudWidget
+from .ra_panel import AchievementsPanelWidget
 
 from .menu_actions import MenuBuilderMixin
 from .application_actions import ApplicationActionsMixin
@@ -79,8 +81,10 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
         # Fullscreen restoration cache
         self._pre_fs_geometry = None
         self._pre_fs_splitter = None
+        self._pre_fs_h_splitter = None
         self._pre_fs_hud_visible = None
         self._pre_fs_trans_visible = None
+        self._pre_fs_ra_panel_visible = None
 
         slot_tag = f" [Peer {self.player_slot}]" if self.player_slot > 1 else ""
         self.setWindowTitle(f"mGBA (PyQt6 Replica){slot_tag}")
@@ -89,7 +93,7 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
         script_dir = str(PROJECT_ROOT)
         self.core_path = os.path.join(script_dir, self.DEFAULT_CORE)
 
-        # Initialize RetroArch Shader Engine & Netplay/Link Engine
+        # Initialize RetroArch Shader Engine, Netplay & RetroAchievements
         self.shader_manager = RetroArchShaderManager(self.config)
         self.netplay_engine = NetplayEngine(self)
         self.netplay_engine.state_sync_received.connect(self._on_netplay_state_received)
@@ -100,12 +104,14 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
             lambda err: self.video_widget.show_osd(f"🌐 Netplay Error: {err}", 3500)
         )
 
+        self.ra_manager = RetroAchievementsManager(self.config, self)
+
         self.controller_manager = ControllerManager(self.config)
         self.gamepad_timer = QTimer(self)
         self.gamepad_timer.timeout.connect(self.poll_gamepad)
         self.gamepad_timer.start(8)
 
-        # Vertical Splitter: OpenGL Video -> HUD Panel -> Subtitle Panel
+        # Left Vertical Splitter: OpenGL Video -> HUD Panel -> Subtitle Panel
         self.splitter = QSplitter(Qt.Orientation.Vertical)
         self.splitter.setHandleWidth(3)
         self.splitter.setStyleSheet("QSplitter::handle { background-color: #282828; }")
@@ -114,6 +120,7 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
         # 1. Hardware-Accelerated OpenGL Video Surface
         self.video_widget = VideoGLWidget(self.shader_manager)
         self.splitter.addWidget(self.video_widget)
+        self.ra_manager.achievement_unlocked.connect(self.video_widget.show_achievement_popup)
 
         # Initialize Clip Recorder (GIF / MP4)
         self.clip_recorder = ClipRecorder(self)
@@ -155,6 +162,22 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
         self.splitter.setStretchFactor(1, 0)
         self.splitter.setStretchFactor(2, 2)
 
+        # Outer Horizontal Splitter: [Left Game + Subtitles] | [Right RetroAchievements Panel]
+        self.main_h_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.main_h_splitter.setHandleWidth(3)
+        self.main_h_splitter.setStyleSheet("QSplitter::handle { background-color: #282828; }")
+        self.main_h_splitter.addWidget(self.splitter)
+
+        self.achievements_panel = AchievementsPanelWidget(self.ra_manager)
+        self.achievements_panel.setAcceptDrops(False)
+        self.achievements_panel.open_settings_requested.connect(self.open_ra_settings_dialog)
+        show_ra_panel = bool(self.config.get("retroachievements", "show_panel", True))
+        self.achievements_panel.setVisible(show_ra_panel)
+        self.main_h_splitter.addWidget(self.achievements_panel)
+
+        self.main_h_splitter.setStretchFactor(0, 4)
+        self.main_h_splitter.setStretchFactor(1, 1)
+
         saved_w = self.config.get("video", "window_width")
         saved_h = self.config.get("video", "window_height")
         saved_splitter = self.config.get("video", "splitter_sizes")
@@ -163,14 +186,18 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
         default_panel_h = 75 if self.scale_factor <= 2 else 115
         default_vid_h = 160 * self.scale_factor
         default_vid_w = 240 * self.scale_factor
+        ra_side_w = 300 if show_ra_panel else 0
 
         if saved_w and saved_h:
             try:
-                self.resize(int(saved_w), int(saved_h))
+                win_w = int(saved_w)
+                if show_ra_panel and win_w <= default_vid_w:
+                    win_w += ra_side_w
+                self.resize(win_w, int(saved_h))
             except Exception:
-                self.resize(default_vid_w, default_vid_h + default_hud_h + default_panel_h)
+                self.resize(default_vid_w + ra_side_w, default_vid_h + default_hud_h + default_panel_h)
         else:
-            self.resize(default_vid_w, default_vid_h + default_hud_h + default_panel_h)
+            self.resize(default_vid_w + ra_side_w, default_vid_h + default_hud_h + default_panel_h)
 
         if saved_splitter and isinstance(saved_splitter, list) and len(saved_splitter) == 3:
             try:
@@ -185,12 +212,31 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
         else:
             self.splitter.setSizes([default_vid_h, default_hud_h, default_panel_h])
 
-        self.setCentralWidget(self.splitter)
+        if show_ra_panel:
+            self.main_h_splitter.setSizes([max(240, self.width() - ra_side_w), ra_side_w])
+        else:
+            self.main_h_splitter.setSizes([self.width(), 0])
+
+        self.setCentralWidget(self.main_h_splitter)
 
         self._create_menus()
         self._sync_ui_with_config()
         self.update_recent_menu()
         self.video_widget.setFocus()
+
+    def _apply_ra_panel_visibility(self, visible: bool):
+        was_visible = self.achievements_panel.isVisible()
+        self.achievements_panel.setVisible(visible)
+        if visible:
+            panel_w = 300
+            if not was_visible and not self.isMaximized() and not self.isFullScreen():
+                self.resize(self.width() + panel_w, self.height())
+            self.main_h_splitter.setSizes([max(240, self.width() - panel_w), panel_w])
+        else:
+            if was_visible and not self.isMaximized() and not self.isFullScreen():
+                cur_panel_w = self.achievements_panel.width() or 300
+                self.resize(max(240, self.width() - cur_panel_w), self.height())
+            self.main_h_splitter.setSizes([self.width(), 0])
 
     # =========================================================================
     # PER-GAME PLAYTIME TRACKING
@@ -284,6 +330,9 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
                 self.apply_soft_patch(path)
             elif kind == "state":
                 if self.worker:
+                    if self.worker.is_ra_hardcore_active():
+                        self.video_widget.show_osd("🔥 Save State Loading disabled in RA Hardcore Mode")
+                        return
                     ok = self.worker.load_state(path)
                     self.video_widget.show_osd(
                         f"Loaded State: {os.path.basename(path)}" if ok else "Failed to load state!"
@@ -323,6 +372,9 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
                     QMessageBox.information(self, "Notice", "Load a ROM first before dropping a replay file.")
             elif kind == "cheat":
                 if self.worker:
+                    if self.worker.is_ra_hardcore_active():
+                        self.video_widget.show_osd("🔥 Cheats disabled in RA Hardcore Mode")
+                        return
                     if self.worker.cheat_engine.load_cht_file(path):
                         self.video_widget.show_osd(f"Loaded Cheats: {os.path.basename(path)}")
                     else:
@@ -437,7 +489,7 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
             and not event.isAutoRepeat()
         ):
             self.worker.set_rewinding(True)
-            if bool(self.config.get("emulation", "rewind_enabled", True)):
+            if bool(self.config.get("emulation", "rewind_enabled", True)) and not self.worker.is_ra_hardcore_active():
                 self.video_widget.show_osd("⏪ Rewinding...", 1500)
             return
 
@@ -577,6 +629,9 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
 
         if hasattr(self, "auto_trans_timer"):
             self.auto_trans_timer.stop()
+
+        if hasattr(self, "ra_manager") and self.ra_manager:
+            self.ra_manager.stop_session()
 
         if hasattr(self, "netplay_engine") and self.netplay_engine:
             self.netplay_engine.stop()

@@ -84,13 +84,15 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
     # Watchpoint Hit Signal
     watchpoint_hit = pyqtSignal(dict)
 
-    def __init__(self, core_path: str, rom_path: str, config, save_base_name: str = None, netplay=None):
+    def __init__(self, core_path: str, rom_path: str, config, save_base_name: str = None,
+                 netplay=None, ra_manager=None):
         super().__init__()
         self.core_path = os.path.abspath(core_path)
         self.rom_path = os.path.abspath(rom_path) if rom_path else ""
         self.config = config
         self.save_base_name = save_base_name
         self.netplay = netplay
+        self.ra_manager = ra_manager
 
         self.emu = None
         self._is_running = False
@@ -154,6 +156,9 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
         self.game_title = "Unknown"
         self.rumble_type = "None"
         self._parse_rom_header()
+
+    def is_ra_hardcore_active(self) -> bool:
+        return bool(self.ra_manager and self.ra_manager.active and self.ra_manager.hardcore)
 
     def get_profile_id(self) -> str:
         if self.game_code and self.game_code not in ("UNKNOWN", ""):
@@ -277,6 +282,9 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
             self.dsp.update_settings()
 
     def set_rewinding(self, active: bool):
+        if active and self.is_ra_hardcore_active():
+            self.rewind_status.emit("Rewind disabled in RA Hardcore mode")
+            return
         if active and not bool(self.config.get("emulation", "rewind_enabled", True)):
             self.rewind_status.emit("Rewind is disabled in settings")
             return
@@ -300,6 +308,20 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
         elif hasattr(vid_obj, "data"):
             return np.array(vid_obj.data, copy=False)
         return np.array(vid_obj, copy=False)
+
+    def _read_ra_ram_unlocked(self) -> tuple[bytes, bytes]:
+        if not self.emu:
+            return b"", b""
+        try:
+            mem = self.emu.get_memory(2)  # SYSTEM_RAM = [EWRAM 256KB | IWRAM 32KB]
+            if mem and hasattr(mem, "data"):
+                raw = bytes(mem.data)
+                if len(raw) >= (256 + 32) * 1024:
+                    return raw[:256 * 1024], raw[256 * 1024:(256 + 32) * 1024]
+                return raw, b""
+        except Exception:
+            pass
+        return b"", b""
 
     def _execute_tas_seek(self, generator, req_tuple):
         target_frame, anchor_frame, anchor_comp, dense_masks = req_tuple
@@ -334,8 +356,9 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
             pressed_btns = tas_mask_to_buttons(mask)
 
             with QMutexLocker(self.mutex):
-                self.cheat_engine.apply_cheats()
-                self.watch_engine.apply_freezes_unlocked()
+                if not self.is_ra_hardcore_active():
+                    self.cheat_engine.apply_cheats()
+                    self.watch_engine.apply_freezes_unlocked()
                 for lib_id, b_name in ID_TO_BTN.items():
                     if self.emu and hasattr(self.emu, "set_button"):
                         self.emu.set_button(0, lib_id, b_name in pressed_btns)
@@ -501,13 +524,14 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
             if was_single_step:
                 self.step_requested = False
 
-            if self.reset_requested and bool(self.config.get("emulation", "rewind_enabled", True)):
+            if self.reset_requested and bool(self.config.get("emulation", "rewind_enabled", True)) and not self.is_ra_hardcore_active():
                 self._push_rewind_snapshot(self.replay_frame_counter)
 
             hud_mode = "IDLE"
             hud_max_frame = 0
             btn_mask = 0
             wp_hit_info = None
+            ra_ewram, ra_iwram = b"", b""
 
             with QMutexLocker(self.mutex):
                 if self.reset_requested and hasattr(self.emu, "reset"):
@@ -517,8 +541,9 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
                     self.cheat_engine.mark_dirty()
                     self.reset_requested = False
 
-                self.cheat_engine.apply_cheats()
-                self.watch_engine.apply_freezes_unlocked()
+                if not self.is_ra_hardcore_active():
+                    self.cheat_engine.apply_cheats()
+                    self.watch_engine.apply_freezes_unlocked()
 
                 if self.recorder.is_playing:
                     hud_mode = "PLAYBACK"
@@ -624,15 +649,20 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
                     print(f"Core step error: {e}")
                     break
 
-                # Check Write Watchpoints after frame execution
+                if self.ra_manager and self.ra_manager.active:
+                    ra_ewram, ra_iwram = self._read_ra_ram_unlocked()
+
                 wp_hit_info = self.watch_engine.check_watchpoints_unlocked(current_frame_num)
                 if wp_hit_info is not None:
                     self.is_paused = True
 
+            if self.ra_manager and self.ra_manager.active and (ra_ewram or ra_iwram):
+                self.ra_manager.evaluate_frame(ra_ewram, ra_iwram)
+
             if wp_hit_info is not None:
                 self.watchpoint_hit.emit(wp_hit_info)
 
-            rewind_enabled = bool(self.config.get("emulation", "rewind_enabled", True))
+            rewind_enabled = bool(self.config.get("emulation", "rewind_enabled", True)) and not self.is_ra_hardcore_active()
             rewind_interval = max(1, int(self.config.get("emulation", "rewind_interval", 10) or 10))
             if rewind_enabled and not self.recorder.is_playing and (frame_counter % rewind_interval == 0):
                 self._push_rewind_snapshot(current_frame_num)

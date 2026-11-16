@@ -37,7 +37,6 @@ def _has_dialogue_or_menu_text(raw_lines: list, src_lang: str) -> bool:
     if not _has_meaningful_text(joined):
         return False
     if src_lang == "ja":
-        # Require at least 2 Japanese kana/kanji characters OR >= 4 alphabetic characters
         jp_chars = re.findall(r'[\u3040-\u309f\u30a0-\u30ff\u4e00-\u9faf]', joined)
         alpha_chars = re.findall(r'[A-Za-z]', joined)
         return len(jp_chars) >= 2 or len(alpha_chars) >= 4
@@ -189,7 +188,7 @@ class TranslationWorker(QThread):
         precomputed_engine = "None"
         local_ocr_sig = ""
 
-        # 1. Local OCR Text-Change Gate (prevents API spam in action games & animated menus)
+        # 1. Local OCR Text-Change Gate
         if self.auto_triggered:
             img_np = self.preprocess_image(self.frame_data, scale=SCALE)
             precomputed_ocr, precomputed_engine = self._run_local_ocr_raw(img_np, src_lang, models_dir)
@@ -205,14 +204,12 @@ class TranslationWorker(QThread):
                     self.skipped.emit("Auto-skip: No meaningful text")
                     return
 
-                # Skip if on-screen text is >= 82% identical to the previous screen (animated cursor/portrait)
                 if self.last_auto_ocr_sig:
                     sim = SequenceMatcher(None, local_ocr_sig, self.last_auto_ocr_sig).ratio()
                     if sim >= 0.82:
                         self.skipped.emit("Auto-skip: Text unchanged")
                         return
 
-                # Reuse in-memory session translation if exact normalized text was already seen
                 if local_ocr_sig in self.auto_ocr_cache:
                     cached_boxes = self.auto_ocr_cache[local_ocr_sig]
                     self.result_ocr_sig = local_ocr_sig
@@ -222,7 +219,11 @@ class TranslationWorker(QThread):
         game_name = os.path.splitext(os.path.basename(self.rom_path))[0]
         csv_path = os.path.join(trans_dir, f"{game_name}_translations.csv")
 
-        groq_api_key = os.environ.get("GROQ_API_KEY", "").strip()
+        # Read Groq API Key from JSON config (fallback to env only if blank)
+        groq_api_key = str(self.config.get("credentials", "groq_api_key") or "").strip()
+        if not groq_api_key:
+            groq_api_key = os.environ.get("GROQ_API_KEY", "").strip()
+
         criteria = get_or_create_game_criteria(self.rom_path, src_lang, tgt_lang, groq_api_key, trans_dir)
         glossary_prompt = store.format_glossary_prompt()
 
@@ -245,7 +246,7 @@ class TranslationWorker(QThread):
             else:
                 print("[AI Translator] Groq Vision rate limited or unavailable. Falling back to local OCR...")
 
-        # 3. Offline Fallback (reuse precomputed OCR if auto-triggered already scanned it)
+        # 3. Offline Fallback
         if precomputed_ocr is not None and precomputed_engine != "None":
             results, ocr_engine_name = precomputed_ocr, precomputed_engine
         else:

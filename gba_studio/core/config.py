@@ -8,7 +8,7 @@ import datetime
 
 CONFIG_FILE = "mgba_config.json"
 
-GLOBAL_ONLY_TOP_SECTIONS = {"recent_files", "paths", "netplay"}
+GLOBAL_ONLY_TOP_SECTIONS = {"recent_files", "paths", "netplay", "credentials", "retroachievements"}
 GLOBAL_ONLY_KEY_PAIRS = {
     ("video", "window_width"),
     ("video", "window_height"),
@@ -19,6 +19,19 @@ GLOBAL_ONLY_KEY_PAIRS = {
 PER_GAME_SECTIONS = ("audio", "emulation", "sensors", "video", "shaders", "ai_translation", "input")
 
 DEFAULT_CONFIG = {
+    "credentials": {
+        "groq_api_key": "",
+        "ra_username": "",
+        "ra_password": "",
+        "ra_token": "",
+        "ra_web_api_key": ""
+    },
+    "retroachievements": {
+        "enabled": False,
+        "hardcore": False,
+        "show_panel": True,
+        "popup_notifications": True
+    },
     "audio": {
         "mute": False,
         "volume": 0.5,
@@ -164,6 +177,12 @@ class EmulatorConfig:
             except Exception as e:
                 print(f"Config load error: {e}")
 
+        # One-time migration if GROQ_API_KEY existed in environment/.env
+        if not str(self.global_settings.get("credentials", {}).get("groq_api_key", "")).strip():
+            env_key = os.environ.get("GROQ_API_KEY", "").strip()
+            if env_key:
+                self.global_settings.setdefault("credentials", {})["groq_api_key"] = env_key
+
         self._rebuild_effective_settings()
         self.save()
 
@@ -273,7 +292,6 @@ class EmulatorConfig:
         meta = raw.get("_meta", {})
         if isinstance(meta, dict) and "use_custom_config" in meta:
             return bool(meta["use_custom_config"])
-        # Legacy profile files without explicit flag are custom profiles if overrides exist
         overrides = raw.get("overrides")
         return bool(isinstance(overrides, dict) and overrides)
 
@@ -365,7 +383,6 @@ class EmulatorConfig:
         raw = self._read_profile_file(profile_id)
         stats = raw.get("stats")
         if isinstance(stats, dict) and stats:
-            # Preserve playtime/launch statistics when removing custom config overrides
             meta = raw.get("_meta", {}) if isinstance(raw.get("_meta"), dict) else {}
             meta["use_custom_config"] = False
             meta["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")

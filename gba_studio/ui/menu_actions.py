@@ -490,6 +490,7 @@ class MenuBuilderMixin:
 
         tools_menu.addSeparator()
         tools_menu.addAction("Configure Controls & Motion Feedback...", self.open_controller_config)
+        tools_menu.addAction("🔑 API Keys & Credentials...", self.open_ra_settings_dialog)
 
         profile_menu = tools_menu.addMenu("Per-Game Profile")
 
@@ -508,8 +509,38 @@ class MenuBuilderMixin:
         self.delete_profile_action.triggered.connect(self.delete_game_profile)
         profile_menu.addAction(self.delete_profile_action)
 
+        stats_act = QAction("📊 Playtime & Game Statistics...", self)
+        stats_act.triggered.connect(self.open_game_stats_dialog)
+        tools_menu.addAction(stats_act)
+
         tools_menu.addSeparator()
 
         reset_settings_act = QAction("Reset Settings to Default...", self)
         reset_settings_act.triggered.connect(self.reset_settings_to_default)
         tools_menu.addAction(reset_settings_act)
+
+        # 9. RETROACHIEVEMENTS MENU
+        ra_menu = menubar.addMenu("RetroAchievements")
+
+        self.act_ra_enabled = QAction("🏆 Enable RetroAchievements", self, checkable=True)
+        self.act_ra_enabled.setChecked(bool(self.config.get("retroachievements", "enabled", False)))
+        self.act_ra_enabled.triggered.connect(self.toggle_ra_enabled)
+        ra_menu.addAction(self.act_ra_enabled)
+
+        self.act_ra_hardcore = QAction("🔥 Hardcore Mode", self, checkable=True)
+        self.act_ra_hardcore.setChecked(bool(self.config.get("retroachievements", "hardcore", False)))
+        self.act_ra_hardcore.triggered.connect(self.toggle_ra_hardcore)
+        ra_menu.addAction(self.act_ra_hardcore)
+
+        self.act_ra_panel = QAction("📋 Show Achievements Right Panel", self, checkable=True)
+        self.act_ra_panel.setChecked(bool(self.config.get("retroachievements", "show_panel", True)))
+        self.act_ra_panel.triggered.connect(self.toggle_ra_panel)
+        ra_menu.addAction(self.act_ra_panel)
+
+        self.act_ra_popup = QAction("🔔 Fullscreen Achievement Popups", self, checkable=True)
+        self.act_ra_popup.setChecked(bool(self.config.get("retroachievements", "popup_notifications", True)))
+        self.act_ra_popup.triggered.connect(self.toggle_ra_popup)
+        ra_menu.addAction(self.act_ra_popup)
+
+        ra_menu.addSeparator()
+        ra_menu.addAction("⚙ Account & Credentials Settings...", self.open_ra_settings_dialog)

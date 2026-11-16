@@ -234,6 +234,7 @@ class RuntimeActionsMixin:
             self.config,
             save_base_name=save_base,
             netplay=getattr(self, "netplay_engine", None),
+            ra_manager=getattr(self, "ra_manager", None),
         )
 
         profile_id = self.worker.get_profile_id()
@@ -264,6 +265,9 @@ class RuntimeActionsMixin:
 
         if hasattr(self, "netplay_engine") and self.netplay_engine:
             self.netplay_engine.set_local_rom_info(self.worker.game_title, self.worker.game_code)
+
+        if hasattr(self, "ra_manager") and self.ra_manager:
+            self.ra_manager.start_game_session(self.current_rom, fallback_title=self.worker.game_title)
 
         osd_parts = []
         if self.active_patch:
@@ -396,6 +400,9 @@ class RuntimeActionsMixin:
     def quick_load_state(self, slot: int):
         if not self.worker or not self.current_rom:
             return
+        if self.worker.is_ra_hardcore_active():
+            self.video_widget.show_osd("🔥 Save State Loading disabled in RA Hardcore Mode")
+            return
         path = self.get_state_path(slot)
         if path and os.path.exists(path):
             self.worker.load_state(path)
@@ -417,6 +424,9 @@ class RuntimeActionsMixin:
 
     def load_state_from_file(self):
         if not self.worker or not self.current_rom:
+            return
+        if self.worker.is_ra_hardcore_active():
+            QMessageBox.warning(self, "Hardcore Mode", "Loading save states is disabled while RetroAchievements Hardcore Mode is active.")
             return
         state_dir = self.config.get("paths", "states")
         filepath, _ = QFileDialog.getOpenFileName(self, "Load State from File", state_dir, "Save States (*.state *.ss*)")

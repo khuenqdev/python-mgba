@@ -1,9 +1,12 @@
 # video_widget.py
+import os
 import math
+import time
+from collections import deque
 import numpy as np
 
 from PyQt6.QtWidgets import QSizePolicy
-from PyQt6.QtGui import QPainter, QColor, QFont, QFontMetrics, QPen
+from PyQt6.QtGui import QPainter, QColor, QFont, QFontMetrics, QPen, QPixmap
 from PyQt6.QtCore import Qt, QTimer, QPoint, QSize, QRect
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 
@@ -55,6 +58,15 @@ class VideoGLWidget(QOpenGLWidget):
 
         # Fullscreen Floating Subtitle Overlay State
         self.subtitle_boxes = []
+
+        # RetroArch-Style Achievement Unlock Toast Queue
+        self._ach_queue = deque()
+        self._active_ach_toast = None
+        self._ach_toast_start = 0.0
+        self._ach_toast_duration = 4.6
+        self._ach_anim_timer = QTimer(self)
+        self._ach_anim_timer.setInterval(33)
+        self._ach_anim_timer.timeout.connect(self._tick_ach_toast)
 
         # Pixel Ruler State
         self.ruler_enabled = False
@@ -121,6 +133,146 @@ class VideoGLWidget(QOpenGLWidget):
             parent_win = self.window()
             if parent_win and parent_win.isFullScreen():
                 self.update()
+
+    # =========================================================================
+    # RETROARCH-STYLE ACHIEVEMENT UNLOCK TOAST
+    # =========================================================================
+    def show_achievement_popup(self, payload: dict):
+        if self.sm and self.sm.config:
+            if not bool(self.sm.config.get("retroachievements", "popup_notifications", True)):
+                return
+
+        badge_pix = None
+        bp = payload.get("badge_path", "")
+        if bp and os.path.exists(bp):
+            px = QPixmap(bp)
+            if not px.isNull():
+                badge_pix = px
+
+        entry = {
+            "title": str(payload.get("title", "Achievement Unlocked")),
+            "description": str(payload.get("description", "")),
+            "points": int(payload.get("points", 0) or 0),
+            "hardcore": bool(payload.get("hardcore", False)),
+            "pixmap": badge_pix,
+        }
+        self._ach_queue.append(entry)
+        if self._active_ach_toast is None:
+            self._start_next_ach_toast()
+
+    def _start_next_ach_toast(self):
+        if not self._ach_queue:
+            self._active_ach_toast = None
+            self._ach_anim_timer.stop()
+            self.update()
+            return
+        self._active_ach_toast = self._ach_queue.popleft()
+        self._ach_toast_start = time.monotonic()
+        if not self._ach_anim_timer.isActive():
+            self._ach_anim_timer.start()
+        self.update()
+
+    def _tick_ach_toast(self):
+        if self._active_ach_toast is None:
+            self._ach_anim_timer.stop()
+            return
+        elapsed = time.monotonic() - self._ach_toast_start
+        if elapsed >= self._ach_toast_duration:
+            self._start_next_ach_toast()
+        else:
+            self.update()
+
+    def _draw_achievement_toast(self, painter: QPainter):
+        if self._active_ach_toast is None:
+            return
+
+        elapsed = time.monotonic() - self._ach_toast_start
+        dur = self._ach_toast_duration
+        in_dur = 0.28
+        out_dur = 0.35
+
+        if elapsed < in_dur:
+            t = elapsed / in_dur
+            ease = 1.0 - ((1.0 - t) ** 3)
+            alpha = ease
+            slide_y = int(-80 + (96 * ease))
+        elif elapsed > (dur - out_dur):
+            t = max(0.0, (dur - elapsed) / out_dur)
+            alpha = t
+            slide_y = int(-80 + (96 * t))
+        else:
+            alpha = 1.0
+            slide_y = 16
+
+        toast = self._active_ach_toast
+        hc = toast["hardcore"]
+
+        box_w = max(270, min(420, int(self.width() * 0.44)))
+        box_h = 74
+        bx = 16
+        by = slide_y
+
+        painter.save()
+        painter.setOpacity(max(0.0, min(1.0, alpha)))
+
+        accent = QColor(255, 213, 79) if hc else QColor(76, 175, 80)
+        painter.setPen(QPen(accent, 2))
+        painter.setBrush(QColor(15, 19, 28, 238))
+        painter.drawRoundedRect(bx, by, box_w, box_h, 8, 8)
+
+        # Badge Icon
+        icon_sz = 52
+        ix = bx + 11
+        iy = by + (box_h - icon_sz) // 2
+        icon_rect = QRect(ix, iy, icon_sz, icon_sz)
+        painter.setPen(QPen(accent, 1))
+        painter.setBrush(QColor(10, 12, 18))
+        painter.drawRoundedRect(icon_rect, 4, 4)
+
+        if toast["pixmap"] is not None:
+            painter.drawPixmap(icon_rect.adjusted(2, 2, -2, -2), toast["pixmap"])
+        else:
+            painter.setFont(self._make_font(["Segoe UI Emoji", "Segoe UI", "Arial"], 20, QFont.Weight.Bold))
+            painter.setPen(accent)
+            painter.drawText(icon_rect, Qt.AlignmentFlag.AlignCenter, "🏆")
+
+        # Text Area
+        tx = ix + icon_sz + 12
+        tw = (bx + box_w) - tx - 10
+
+        hdr_font = self._make_font(["Segoe UI", "Arial", "Sans Serif"], 8, QFont.Weight.Bold)
+        title_font = self._make_font(["Segoe UI", "Arial", "Sans Serif"], 10, QFont.Weight.Bold)
+        desc_font = self._make_font(["Segoe UI", "Arial", "Sans Serif"], 8, QFont.Weight.Normal)
+
+        hdr_txt = "🏆 HARDCORE ACHIEVEMENT UNLOCKED!" if hc else "🏆 ACHIEVEMENT UNLOCKED!"
+        painter.setFont(hdr_font)
+        painter.setPen(accent)
+        painter.drawText(
+            QRect(tx, by + 8, tw, 15),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            hdr_txt,
+        )
+
+        pts = toast["points"]
+        title_str = f"{toast['title']} ({pts} pts)" if pts > 0 else toast["title"]
+        fm_t = QFontMetrics(title_font)
+        painter.setFont(title_font)
+        painter.setPen(QColor(245, 248, 255))
+        painter.drawText(
+            QRect(tx, by + 24, tw, 18),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            fm_t.elidedText(title_str, Qt.TextElideMode.ElideRight, tw),
+        )
+
+        painter.setFont(desc_font)
+        painter.setPen(QColor(176, 190, 197))
+        painter.drawText(
+            QRect(tx, by + 43, tw, 24),
+            Qt.AlignmentFlag.AlignLeft.value | Qt.TextFlag.TextWordWrap.value,
+            toast["description"],
+        )
+
+        painter.restore()
 
     def _get_viewport_transform(self) -> tuple[float, float, float]:
         """Returns (logical_scale, offset_x, offset_y) matching the GL viewport."""
@@ -440,6 +592,7 @@ class VideoGLWidget(QOpenGLWidget):
         self._draw_clip_badge(painter)
         self._draw_input_hud(painter)
         self._draw_subtitle_overlay(painter)
+        self._draw_achievement_toast(painter)
 
         # Global OSD Message (Top-Right)
         if self.osd_text:

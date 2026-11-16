@@ -43,6 +43,12 @@ class SettingsActionsMixin:
         self.pause_unfocus_action.setChecked(bool(self.config.get("emulation", "pause_on_unfocus", True)))
         self.act_shader_toggle.setChecked(bool(self.config.get("shaders", "enabled", False)))
 
+        if hasattr(self, "act_ra_enabled"):
+            self.act_ra_enabled.setChecked(bool(self.config.get("retroachievements", "enabled", False)))
+            self.act_ra_hardcore.setChecked(bool(self.config.get("retroachievements", "hardcore", False)))
+            self.act_ra_panel.setChecked(bool(self.config.get("retroachievements", "show_panel", True)))
+            self.act_ra_popup.setChecked(bool(self.config.get("retroachievements", "popup_notifications", True)))
+
         clip_scale = int(self.config.get("video", "clip_scale", 2) or 2)
         if clip_scale in self.clip_scale_actions:
             self.clip_scale_actions[clip_scale].setChecked(True)
@@ -87,6 +93,53 @@ class SettingsActionsMixin:
             self.use_profile_action.blockSignals(False)
 
         self._build_keymap()
+
+    # =========================================================================
+    # RETROACHIEVEMENTS SETTINGS ACTIONS
+    # =========================================================================
+    def toggle_ra_enabled(self):
+        val = self.act_ra_enabled.isChecked()
+        self.config.set("retroachievements", "enabled", val)
+        if val and self.current_rom and self.worker:
+            self.ra_manager.start_game_session(self.current_rom, fallback_title=self.worker.game_title)
+        else:
+            self.ra_manager.stop_session()
+        self.video_widget.show_osd(f"🏆 RetroAchievements: {'ON' if val else 'OFF'}")
+
+    def toggle_ra_hardcore(self):
+        val = self.act_ra_hardcore.isChecked()
+        self.config.set("retroachievements", "hardcore", val)
+        if self.current_rom and self.worker and bool(self.config.get("retroachievements", "enabled", False)):
+            self.ra_manager.start_game_session(self.current_rom, fallback_title=self.worker.game_title)
+        self.video_widget.show_osd(f"🔥 RA Hardcore Mode: {'ON' if val else 'OFF'}")
+
+    def toggle_ra_panel(self):
+        val = self.act_ra_panel.isChecked()
+        self.config.set("retroachievements", "show_panel", val)
+        if self.isFullScreen():
+            self._pre_fs_ra_panel_visible = val
+            return
+        if hasattr(self, "_apply_ra_panel_visibility"):
+            self._apply_ra_panel_visibility(val)
+        self.video_widget.show_osd(f"Achievements Panel: {'Shown' if val else 'Hidden'}")
+
+    def toggle_ra_popup(self):
+        val = self.act_ra_popup.isChecked()
+        self.config.set("retroachievements", "popup_notifications", val)
+        self.video_widget.show_osd(f"Achievement Popups: {'ON' if val else 'OFF'}")
+
+    def open_ra_settings_dialog(self):
+        from .ra_dialog import RetroAchievementsSettingsDialog
+        dlg = RetroAchievementsSettingsDialog(self, self)
+        if dlg.exec():
+            self._sync_ui_with_config()
+            if not self.isFullScreen() and hasattr(self, "_apply_ra_panel_visibility"):
+                self._apply_ra_panel_visibility(bool(self.config.get("retroachievements", "show_panel", True)))
+            if self.current_rom and self.worker:
+                if bool(self.config.get("retroachievements", "enabled", False)):
+                    self.ra_manager.start_game_session(self.current_rom, fallback_title=self.worker.game_title)
+                else:
+                    self.ra_manager.stop_session()
 
     def toggle_ff_pitch_corrected(self):
         val = self.ff_pitch_action.isChecked()
@@ -216,6 +269,9 @@ class SettingsActionsMixin:
     def open_cheats_manager(self):
         if not self.worker:
             QMessageBox.warning(self, "Error", "Emulation must be running to manage cheats.")
+            return
+        if self.worker.is_ra_hardcore_active():
+            QMessageBox.warning(self, "Hardcore Mode", "Cheats are disabled while RetroAchievements Hardcore Mode is active.")
             return
         from ..core.cheats import CheatManagerWindow
         self.active_tool_window = CheatManagerWindow(self.worker.cheat_engine, self.config, self)
