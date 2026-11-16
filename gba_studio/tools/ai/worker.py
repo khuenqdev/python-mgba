@@ -21,6 +21,7 @@ from .vision import TranslatedBox, get_or_create_game_criteria, run_groq_vision
 from .ocr import _clean_meiki_chars_furigana, _classify_and_group_ocr_lines
 from .local import LocalQwenTranslator
 from .glossary import GlossaryAndCacheStore
+from .inpaint import align_vision_boxes_with_ocr
 
 
 def _normalize_ocr_signature(text: str) -> str:
@@ -124,6 +125,23 @@ class TranslationWorker(QThread):
 
         return results, ocr_engine_name
 
+    def _raw_ocr_to_240(self, results: list, scale: int) -> tuple[list, list]:
+        merged_rows = self._merge_horizontal_row_fragments(results)
+        lines_240 = []
+        for (bbox, raw_text, _) in merged_rows:
+            xs = [pt[0] / float(scale) for pt in bbox]
+            ys = [pt[1] / float(scale) for pt in bbox]
+            x1, y1 = max(0.0, min(xs)), max(0.0, min(ys))
+            x2, y2 = min(239.0, max(xs)), min(159.0, max(ys))
+            lines_240.append({
+                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                "w": x2 - x1, "h": y2 - y1,
+                "cx": (x1 + x2) / 2.0, "cy": (y1 + y2) / 2.0,
+                "text": raw_text.strip()
+            })
+        semantic_blocks = _classify_and_group_ocr_lines(lines_240)
+        return lines_240, semantic_blocks
+
     def _apply_store_overrides(self, store: GlossaryAndCacheStore, boxes: list, src_lang: str, tgt_lang: str):
         for b in boxes:
             if b.speaker_orig:
@@ -155,6 +173,7 @@ class TranslationWorker(QThread):
 
         src_lang = self.config.get("ai_translation", "source_lang") or "ja"
         tgt_lang = self.config.get("ai_translation", "target_lang") or "vi"
+        inpaint_enabled = bool(self.config.get("ai_translation", "inpaint_enabled", True))
 
         app_dir = str(PROJECT_ROOT)
         models_dir = os.path.join(app_dir, "models")
@@ -166,24 +185,26 @@ class TranslationWorker(QThread):
         store = GlossaryAndCacheStore(self.rom_path, trans_dir=trans_dir, game_code=self.game_code)
         frame_hash = store.hash_frame(self.frame_data)
 
-        # 0. Instant Frame + Cache Hit (Zero API / LLM latency)
+        # 0. Instant Frame + Cache Hit
         cached_frame_items = store.resolve_cached_frame(frame_hash, src_lang, tgt_lang)
         if cached_frame_items:
-            boxes = [
-                TranslatedBox(
+            boxes = []
+            for it in cached_frame_items:
+                is_stub = (it.get("x") == 10 and it.get("w") == 220 and it.get("h") == 18)
+                boxes.append(TranslatedBox(
                     it["x"], it["y"], it["w"], it["h"],
                     it["original"], it["translated"],
                     category=it["category"],
                     speaker_orig=it["speaker_orig"],
                     speaker_trans=it["speaker_trans"],
-                )
-                for it in cached_frame_items
-            ]
+                    has_box=not is_stub,
+                ))
             self.result_ocr_sig = _normalize_ocr_signature("".join(b.original for b in boxes))
             self.finished.emit(boxes, f"Translated {len(boxes)} block(s) via Instant Cache [{store.game_id}]")
             return
 
         SCALE = 4
+        img_np = None
         precomputed_ocr = None
         precomputed_engine = "None"
         local_ocr_sig = ""
@@ -219,7 +240,6 @@ class TranslationWorker(QThread):
         game_name = os.path.splitext(os.path.basename(self.rom_path))[0]
         csv_path = os.path.join(trans_dir, f"{game_name}_translations.csv")
 
-        # Read Groq API Key from JSON config (fallback to env only if blank)
         groq_api_key = str(self.config.get("credentials", "groq_api_key") or "").strip()
         if not groq_api_key:
             groq_api_key = os.environ.get("GROQ_API_KEY", "").strip()
@@ -233,6 +253,15 @@ class TranslationWorker(QThread):
                 self.frame_data, src_lang, tgt_lang, groq_api_key, criteria, glossary_text=glossary_prompt
             )
             if vision_boxes:
+                if inpaint_enabled:
+                    if precomputed_ocr is None:
+                        if img_np is None:
+                            img_np = self.preprocess_image(self.frame_data, scale=SCALE)
+                        precomputed_ocr, precomputed_engine = self._run_local_ocr_raw(img_np, src_lang, models_dir)
+                    if precomputed_ocr:
+                        lines_240, semantic_blocks = self._raw_ocr_to_240(precomputed_ocr, SCALE)
+                        align_vision_boxes_with_ocr(vision_boxes, lines_240, semantic_blocks)
+
                 self._apply_store_overrides(store, vision_boxes, src_lang, tgt_lang)
                 store.save_frame_layout(frame_hash, vision_boxes)
                 store.save_cache()
@@ -250,7 +279,8 @@ class TranslationWorker(QThread):
         if precomputed_ocr is not None and precomputed_engine != "None":
             results, ocr_engine_name = precomputed_ocr, precomputed_engine
         else:
-            img_np = self.preprocess_image(self.frame_data, scale=SCALE)
+            if img_np is None:
+                img_np = self.preprocess_image(self.frame_data, scale=SCALE)
             results, ocr_engine_name = self._run_local_ocr_raw(img_np, src_lang, models_dir)
 
         if not results:
@@ -260,21 +290,7 @@ class TranslationWorker(QThread):
                 self.error.emit("No text detected on screen.")
             return
 
-        merged_rows = self._merge_horizontal_row_fragments(results)
-        lines_240 = []
-        for (bbox, raw_text, _) in merged_rows:
-            xs = [pt[0] / float(SCALE) for pt in bbox]
-            ys = [pt[1] / float(SCALE) for pt in bbox]
-            x1, y1 = max(0.0, min(xs)), max(0.0, min(ys))
-            x2, y2 = min(239.0, max(xs)), min(159.0, max(ys))
-            lines_240.append({
-                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                "w": x2 - x1, "h": y2 - y1,
-                "cx": (x1 + x2) / 2.0, "cy": (y1 + y2) / 2.0,
-                "text": raw_text.strip()
-            })
-
-        semantic_blocks = _classify_and_group_ocr_lines(lines_240)
+        _, semantic_blocks = self._raw_ocr_to_240(results, SCALE)
 
         llm_model_path = find_best_llm_model(models_dir)
         using_local_llm = os.path.exists(llm_model_path) and (get_llama_instance(llm_model_path) is not None)
@@ -316,7 +332,8 @@ class TranslationWorker(QThread):
                 orig, translated_text,
                 category=cat,
                 speaker_orig=speaker_orig,
-                speaker_trans=speaker_trans
+                speaker_trans=speaker_trans,
+                has_box=True,
             ))
 
         store.save_frame_layout(frame_hash, translated_boxes)
@@ -363,9 +380,7 @@ class TranslationWorker(QThread):
 
                 if abs(line_cy - box_cy) < (max(line_h, box_h) * 0.45) or overlap_h > (box_h * 0.35):
                     line["boxes"].append(box)
-                    line["x1"] = min(line["x1"], box["x1"])
                     line["y1"] = min(line["y1"], box["y1"])
-                    line["x2"] = max(line["x2"], box["x2"])
                     line["y2"] = max(line["y2"], box["y2"])
                     merged = True
                     break
@@ -373,21 +388,39 @@ class TranslationWorker(QThread):
             if not merged:
                 lines.append({
                     "y1": box["y1"], "y2": box["y2"],
-                    "x1": box["x1"], "x2": box["x2"],
                     "boxes": [box]
                 })
 
+        # Split horizontally separated UI columns on the same Y-row
         final_boxes = []
         for line in lines:
-            line["boxes"].sort(key=lambda b: b["x1"])
-            combined = "".join(b["text"] for b in line["boxes"]).strip()
-            if combined:
-                final_boxes.append((
-                    [[line["x1"], line["y1"]], [line["x2"], line["y1"]],
-                     [line["x2"], line["y2"]], [line["x1"], line["y2"]]],
-                    combined,
-                    1.0
-                ))
+            row_items = sorted(line["boxes"], key=lambda b: b["x1"])
+            segments = []
+            for item in row_items:
+                item_h = max(8.0, item["y2"] - item["y1"])
+                if not segments:
+                    segments.append([item])
+                else:
+                    prev = segments[-1][-1]
+                    prev_h = max(8.0, prev["y2"] - prev["y1"])
+                    x_gap = item["x1"] - prev["x2"]
+                    if x_gap <= max(prev_h, item_h) * 0.90:
+                        segments[-1].append(item)
+                    else:
+                        segments.append([item])
+
+            for seg in segments:
+                combined = "".join(b["text"] for b in seg).strip()
+                if combined:
+                    sx1 = min(b["x1"] for b in seg)
+                    sy1 = min(b["y1"] for b in seg)
+                    sx2 = max(b["x2"] for b in seg)
+                    sy2 = max(b["y2"] for b in seg)
+                    final_boxes.append((
+                        [[sx1, sy1], [sx2, sy1], [sx2, sy2], [sx1, sy2]],
+                        combined,
+                        1.0
+                    ))
         return final_boxes
 
     def _export_csv_mirror(self, filepath: str, store: GlossaryAndCacheStore):

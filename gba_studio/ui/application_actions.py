@@ -33,6 +33,18 @@ class ApplicationActionsMixin:
         self.video_widget.update()
         self.video_widget.show_osd(f"Fullscreen Subtitle Overlay: {'ON' if val else 'OFF'}")
 
+    def toggle_translation_inpaint(self):
+        val = self.act_trans_inpaint.isChecked()
+        self.config.set("ai_translation", "inpaint_enabled", val)
+        if self.video_widget.subtitle_boxes:
+            self.video_widget.set_translation_boxes(
+                self.video_widget.subtitle_boxes,
+                source_frame=getattr(self, "_last_trans_frame", None),
+            )
+        else:
+            self.video_widget.update()
+        self.video_widget.show_osd(f"🎨 In-Place Textbox Inpainting: {'ON' if val else 'OFF'}")
+
     def toggle_auto_translate(self):
         val = self.act_auto_translate.isChecked()
         self.config.set("ai_translation", "auto_translate", val)
@@ -549,13 +561,14 @@ class ApplicationActionsMixin:
             QMessageBox.warning(self, "AI Translation Error", err)
 
     def on_ai_translation_finished(self, boxes: list, msg: str):
-        self.video_widget.set_translation_boxes(boxes or [])
+        src_frame = getattr(self, "_last_trans_frame", None)
+        self.video_widget.set_translation_boxes(boxes or [], source_frame=src_frame)
 
         roi_mode = str(self.config.get("ai_translation", "auto_roi_mode", "auto") or "auto")
-        if getattr(self, "_last_trans_frame", None) is not None:
+        if src_frame is not None:
             is_api = ("Instant Cache" not in msg) and ("Text Cache" not in msg)
             self.auto_trans_detector.mark_translated(
-                self._last_trans_frame,
+                src_frame,
                 roi_mode=roi_mode,
                 ruler_rect=self._get_ruler_rect(),
                 is_api_call=is_api,
@@ -647,10 +660,18 @@ class ApplicationActionsMixin:
         )
         if dlg.exec():
             self.act_trans_overlay.setChecked(bool(self.config.get("ai_translation", "overlay_enabled", True)))
+            if hasattr(self, "act_trans_inpaint"):
+                self.act_trans_inpaint.setChecked(bool(self.config.get("ai_translation", "inpaint_enabled", True)))
             self.act_auto_translate.setChecked(bool(self.config.get("ai_translation", "auto_translate", False)))
             self.auto_trans_detector.reset()
             self._sync_auto_translate_timer()
-            self.video_widget.update()
+            if self.video_widget.subtitle_boxes:
+                self.video_widget.set_translation_boxes(
+                    self.video_widget.subtitle_boxes,
+                    source_frame=getattr(self, "_last_trans_frame", None),
+                )
+            else:
+                self.video_widget.update()
 
     def trigger_instant_scene_dump(self):
         if not self.worker or not self.current_rom:

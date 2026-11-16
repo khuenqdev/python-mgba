@@ -80,6 +80,8 @@ DEFAULT_CONFIG = {
         "source_lang": "ja",
         "target_lang": "vi",
         "overlay_enabled": True,
+        "inpaint_enabled": True,
+        "inpaint_auto_clear": True,
         "auto_translate": False,
         "auto_debounce_ms": 1200,
         "auto_cooldown_ms": 4000,
@@ -177,7 +179,6 @@ class EmulatorConfig:
             except Exception as e:
                 print(f"Config load error: {e}")
 
-        # One-time migration if GROQ_API_KEY existed in environment/.env
         if not str(self.global_settings.get("credentials", {}).get("groq_api_key", "")).strip():
             env_key = os.environ.get("GROQ_API_KEY", "").strip()
             if env_key:

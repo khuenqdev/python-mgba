@@ -23,7 +23,8 @@ _LAST_GROQ_CALL_TIME = 0.0
 class TranslatedBox:
     """Represents a categorized UI text element ('dialogue', 'menu', or 'label')."""
     def __init__(self, x, y, w, h, original, translated,
-                 category: str = "dialogue", speaker_orig: str = "", speaker_trans: str = ""):
+                 category: str = "dialogue", speaker_orig: str = "", speaker_trans: str = "",
+                 has_box: bool = True):
         self.x = int(x)
         self.y = int(y)
         self.w = int(w)
@@ -33,6 +34,7 @@ class TranslatedBox:
         self.category = category if category in ("dialogue", "menu", "label") else "dialogue"
         self.speaker_orig = speaker_orig.strip()
         self.speaker_trans = speaker_trans.strip()
+        self.has_box = bool(has_box)
 
 
 def get_or_create_game_criteria(rom_path: str, src_lang: str, tgt_lang: str, api_key: str, trans_dir: str) -> str:
@@ -110,6 +112,24 @@ def get_or_create_game_criteria(rom_path: str, src_lang: str, tgt_lang: str, api
     return UNIVERSAL_GBA_CRITERIA
 
 
+def _parse_box_coords(item: dict) -> tuple[int, int, int, int, bool]:
+    raw_box = item.get("box") or item.get("bbox")
+    if isinstance(raw_box, (list, tuple)) and len(raw_box) == 4:
+        try:
+            bx, by, bw, bh = [int(round(float(v))) for v in raw_box]
+            if 0 <= bx < 236 and 0 <= by < 156 and bw >= 6 and bh >= 6:
+                return (
+                    max(0, min(234, bx)),
+                    max(0, min(154, by)),
+                    max(8, min(240 - max(0, bx), bw)),
+                    max(8, min(160 - max(0, by), bh)),
+                    True,
+                )
+        except (ValueError, TypeError):
+            pass
+    return 10, 10, 220, 18, False
+
+
 def _items_to_boxes(items: list) -> list:
     boxes = []
     for idx, it in enumerate(items):
@@ -126,12 +146,17 @@ def _items_to_boxes(items: list) -> list:
         if not _has_meaningful_text(orig) or not trans:
             continue
 
+        bx, by, bw, bh, has_box = _parse_box_coords(it)
+        if not has_box:
+            by = min(140, 10 + idx * 20)
+
         boxes.append(TranslatedBox(
-            10, 10 + idx * 20, 220, 18,
+            bx, by, bw, bh,
             orig, trans,
             category=cat,
             speaker_orig=sp_ja,
-            speaker_trans=sp_tr
+            speaker_trans=sp_tr,
+            has_box=has_box,
         ))
     return boxes
 
@@ -159,7 +184,6 @@ def _parse_structured_items(content: str) -> list:
             except Exception:
                 pass
 
-        # Recover individual completed JSON objects if the array was truncated
         recovered = []
         for obj_m in re.finditer(r'\{[^{}]*\}', clean, re.DOTALL):
             try:
@@ -179,7 +203,7 @@ def _parse_structured_items(content: str) -> list:
             trans = parts[1].strip()
             if _has_meaningful_text(orig) and trans:
                 cat = "dialogue" if re.search(r'[「」。、…！？]', orig) else "menu"
-                boxes.append(TranslatedBox(10, 10 + idx * 20, 220, 18, orig, trans, category=cat))
+                boxes.append(TranslatedBox(10, 10 + idx * 20, 220, 18, orig, trans, category=cat, has_box=False))
 
     return boxes
 
@@ -211,20 +235,20 @@ def run_groq_vision(frame_data: np.ndarray, src_lang: str, tgt_lang: str, api_ke
     glossary_section = f"\n\n{glossary_text}" if glossary_text else ""
 
     prompt = (
-        f"Analyze the ENTIRE GBA game screen from top to bottom and localize EVERY meaningful {src_name} or UI text block into {tgt_name}.\n"
+        f"Analyze the ENTIRE GBA game screen (240x160 native pixels) from top to bottom and localize EVERY meaningful {src_name} or UI text block into {tgt_name}.\n"
         "IMPORTANT: Include ALL panels on screen — main menus, dimmed/grayed-out options, AND bottom 'Information' / help / description boxes!\n\n"
         "Classify each element into ONE of 3 types:\n"
-        "1. \"dialogue\": Speech boxes, story narration scrolls, OR help/information/description panels (such as an 'Information' box explaining a setting).\n"
-        "   - UNWRAP AND MERGE multi-line sentences inside the same box into ONE complete sentence before translating! Never split a sentence across visual line breaks.\n"
-        "   - If a speaker nameplate appears above/beside a quote (e.g. \"曹操 ソウソウ\"), strip its furigana reading into \"speaker\" (\"曹操\"), put the translated name in \"speaker_tr\" (\"Tào Tháo\"), and do NOT output the speaker as a separate item.\n"
+        "1. \"dialogue\": Speech boxes, story narration scrolls, OR help/information/description panels.\n"
+        "   - UNWRAP AND MERGE multi-line sentences inside the same box into ONE complete sentence before translating.\n"
+        "   - If a speaker nameplate appears above/beside a quote, strip its furigana reading into \"speaker\", put the translated name in \"speaker_tr\", and do NOT output the speaker as a separate item.\n"
         "   - Strip inline furigana readings attached to Kanji in \"ja\".\n"
-        "2. \"menu\": Selectable menu choices, setting options, or command lists (including grayed-out or unselected columns).\n"
-        "   - Keep each option as a SEPARATE item in top-to-bottom order. Translate using natural game UI/settings terminology.\n"
-        "3. \"label\": Panel headers (e.g. 'Configuration', 'Information'), chapter banners, map locations, or HUD/button tags.\n"
-        "   - Translate concisely as short UI labels. Ignore decorative dot bubbles like \"....\".\n\n"
+        "2. \"menu\": Selectable menu choices, setting options, or command lists (including grayed-out options).\n"
+        "   - Keep each option as a SEPARATE item in top-to-bottom order.\n"
+        "3. \"label\": Panel headers, chapter banners, map locations, or HUD/button tags. Ignore decorative dot bubbles like \"....\".\n\n"
+        "For EVERY item, also include \"box\": [x, y, w, h] giving its approximate pixel bounding box in native 240x160 GBA coordinates (including speaker nameplate if inside the same dialogue box).\n\n"
         f"STYLE CRITERIA:\n{criteria}{glossary_section}\n\n"
         "Return a JSON object with key \"items\":\n"
-        "{\"items\": [{\"type\": \"dialogue|menu|label\", \"speaker\": \"\", \"speaker_tr\": \"\", \"ja\": \"...\", \"tr\": \"...\"}]}"
+        "{\"items\": [{\"type\": \"dialogue|menu|label\", \"speaker\": \"\", \"speaker_tr\": \"\", \"ja\": \"...\", \"tr\": \"...\", \"box\": [x, y, w, h]}]}"
     )
 
     headers = {
@@ -233,7 +257,7 @@ def run_groq_vision(frame_data: np.ndarray, src_lang: str, tgt_lang: str, api_ke
         "User-Agent": "Mozilla/5.0"
     }
 
-    for model_id in ["qwen/qwen3.8-27b", "qwen/qwen3.6-27b"]:
+    for model_id in ["qwen/qwen3.8-27b"]:
         try:
             payload = {
                 "model": model_id,
@@ -249,7 +273,7 @@ def run_groq_vision(frame_data: np.ndarray, src_lang: str, tgt_lang: str, api_ke
                 "reasoning_effort": "none",
                 "response_format": {"type": "json_object"},
                 "temperature": 0.1,
-                "max_completion_tokens": 1500
+                "max_completion_tokens": 1600
             }
 
             req = urllib.request.Request(

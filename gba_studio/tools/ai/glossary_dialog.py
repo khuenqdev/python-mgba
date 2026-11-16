@@ -349,7 +349,7 @@ class TranslationGlossaryDialog(QDialog):
 
 
 class AITranslationConfigDialog(QDialog):
-    """Configures AI translation languages, Groq API Key (JSON config), smart auto-trigger, and glossary."""
+    """Configures AI translation languages, Groq API Key, in-place inpainting, and auto-trigger."""
 
     def __init__(self, config, parent=None, rom_path: str = "", game_code: str = ""):
         super().__init__(parent)
@@ -357,7 +357,7 @@ class AITranslationConfigDialog(QDialog):
         self.rom_path = rom_path
         self.game_code = game_code
         self.setWindowTitle("Configure AI Translation")
-        self.resize(470, 410)
+        self.resize(470, 470)
         self._init_ui()
 
     def _init_ui(self):
@@ -387,7 +387,6 @@ class AITranslationConfigDialog(QDialog):
         tgt_row.addWidget(self.tgt_combo)
         layout.addLayout(tgt_row)
 
-        # Groq API Key stored in mgba_config.json
         cred_grp = QGroupBox("API Credentials (Saved in mgba_config.json)")
         cred_lay = QHBoxLayout(cred_grp)
         cred_lay.addWidget(QLabel("Groq API Key:"))
@@ -408,9 +407,22 @@ class AITranslationConfigDialog(QDialog):
         cred_lay.addWidget(self.btn_show_key)
         layout.addWidget(cred_grp)
 
-        self.overlay_cb = QCheckBox("Show Floating Subtitle Overlay in Fullscreen Mode")
+        disp_grp = QGroupBox("Display & Visual Replacement")
+        disp_lay = QVBoxLayout(disp_grp)
+
+        self.inpaint_cb = QCheckBox("In-Place Visual Inpainting (Replace Text Directly in Textbox)")
+        self.inpaint_cb.setChecked(bool(self.config.get("ai_translation", "inpaint_enabled", True)))
+        disp_lay.addWidget(self.inpaint_cb)
+
+        self.inpaint_clear_cb = QCheckBox("Auto-Clear Inpainting When Textbox Closes")
+        self.inpaint_clear_cb.setChecked(bool(self.config.get("ai_translation", "inpaint_auto_clear", True)))
+        disp_lay.addWidget(self.inpaint_clear_cb)
+
+        self.overlay_cb = QCheckBox("Show Floating Subtitle Overlay in Fullscreen Mode (Fallback)")
         self.overlay_cb.setChecked(bool(self.config.get("ai_translation", "overlay_enabled", True)))
-        layout.addWidget(self.overlay_cb)
+        disp_lay.addWidget(self.overlay_cb)
+
+        layout.addWidget(disp_grp)
 
         auto_grp = QGroupBox("Smart Auto-Translate Detector")
         auto_lay = QVBoxLayout(auto_grp)
@@ -471,6 +483,8 @@ class AITranslationConfigDialog(QDialog):
         self.config.set("credentials", "groq_api_key", self.groq_key_edit.text().strip())
         self.config.set("ai_translation", "source_lang", self.src_combo.currentData())
         self.config.set("ai_translation", "target_lang", self.tgt_combo.currentData())
+        self.config.set("ai_translation", "inpaint_enabled", self.inpaint_cb.isChecked())
+        self.config.set("ai_translation", "inpaint_auto_clear", self.inpaint_clear_cb.isChecked())
         self.config.set("ai_translation", "overlay_enabled", self.overlay_cb.isChecked())
         self.config.set("ai_translation", "auto_translate", self.auto_cb.isChecked())
         self.config.set("ai_translation", "auto_roi_mode", self.roi_combo.currentData())

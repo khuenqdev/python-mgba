@@ -6,12 +6,13 @@ from collections import deque
 import numpy as np
 
 from PyQt6.QtWidgets import QSizePolicy
-from PyQt6.QtGui import QPainter, QColor, QFont, QFontMetrics, QPen, QPixmap
+from PyQt6.QtGui import QPainter, QColor, QFont, QFontMetrics, QPen, QPixmap, QImage
 from PyQt6.QtCore import Qt, QTimer, QPoint, QSize, QRect
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 
+from ..tools.ai.inpaint import build_inpaint_patches, check_textbox_still_present
 
-# Matches HUD_BTN_BITS order in core_worker.py (bits 0..9)
+
 OVERLAY_BUTTON_LABELS = [
     (4, "▲"),
     (5, "▼"),
@@ -41,25 +42,22 @@ class VideoGLWidget(QOpenGLWidget):
         self.tex_id = None
         self._need_texture_update = False
 
-        # OSD Setup
         self.osd_text = ""
         self.osd_timer = QTimer()
         self.osd_timer.setSingleShot(True)
         self.osd_timer.timeout.connect(self.clear_osd)
 
-        # Live Input / TAS Frame HUD State
         self.input_hud_mode = "IDLE"
         self.input_hud_frame = 0
         self.input_hud_max_frame = 0
         self.input_hud_mask = 0
-
-        # Clip Recording Badge
         self.clip_rec_label = ""
 
-        # Fullscreen Floating Subtitle Overlay State
         self.subtitle_boxes = []
+        self.inpaint_patches = []
+        self._inpaint_qimages = []
+        self._inpaint_check_tick = 0
 
-        # RetroArch-Style Achievement Unlock Toast Queue
         self._ach_queue = deque()
         self._active_ach_toast = None
         self._ach_toast_start = 0.0
@@ -68,14 +66,11 @@ class VideoGLWidget(QOpenGLWidget):
         self._ach_anim_timer.setInterval(33)
         self._ach_anim_timer.timeout.connect(self._tick_ach_toast)
 
-        # Pixel Ruler State
         self.ruler_enabled = False
         self.hover_pos = None
         self.ruler_start = None
         self.ruler_end = None
         self.is_dragging = False
-
-        # Mouse Gyro State
         self.mouse_gyro_active = False
         self.gyro_drag_center = None
 
@@ -105,6 +100,15 @@ class VideoGLWidget(QOpenGLWidget):
     def set_frame(self, frame_data: np.ndarray):
         self.current_frame_data = frame_data
         self._need_texture_update = True
+
+        if self.inpaint_patches and self.sm and self.sm.config:
+            if bool(self.sm.config.get("ai_translation", "inpaint_auto_clear", True)):
+                self._inpaint_check_tick += 1
+                if self._inpaint_check_tick % 10 == 0:
+                    if not check_textbox_still_present(frame_data, self.inpaint_patches):
+                        self.inpaint_patches = []
+                        self._inpaint_qimages = []
+
         self.update()
 
     def set_input_hud(self, mode: str, frame_num: int, max_frame: int, btn_mask: int):
@@ -121,22 +125,142 @@ class VideoGLWidget(QOpenGLWidget):
         self.clip_rec_label = label
         self.update()
 
-    def set_translation_boxes(self, boxes: list):
+    def set_translation_boxes(self, boxes: list, source_frame: np.ndarray | None = None):
         self.subtitle_boxes = list(boxes or [])
-        parent_win = self.window()
-        if parent_win and parent_win.isFullScreen():
-            self.update()
+        self.inpaint_patches = []
+        self._inpaint_qimages = []
+
+        inpaint_on = bool(self.sm.config.get("ai_translation", "inpaint_enabled", True)) if self.sm and self.sm.config else True
+        ref_frame = source_frame if source_frame is not None else self.current_frame_data
+
+        if inpaint_on and ref_frame is not None and self.subtitle_boxes:
+            patches = build_inpaint_patches(ref_frame, self.subtitle_boxes)
+            self.inpaint_patches = patches
+            for p in patches:
+                arr = p.patch_rgb
+                h, w, _ = arr.shape
+                qimg = QImage(arr.data, w, h, w * 3, QImage.Format.Format_RGB888).copy()
+                self._inpaint_qimages.append((p, qimg))
+
+        self.update()
 
     def clear_translation_boxes(self):
-        if self.subtitle_boxes:
+        if self.subtitle_boxes or self.inpaint_patches:
             self.subtitle_boxes = []
-            parent_win = self.window()
-            if parent_win and parent_win.isFullScreen():
-                self.update()
+            self.inpaint_patches = []
+            self._inpaint_qimages = []
+            self.update()
 
-    # =========================================================================
-    # RETROARCH-STYLE ACHIEVEMENT UNLOCK TOAST
-    # =========================================================================
+    def _draw_inpaint_overlays(self, painter: QPainter):
+        if not self._inpaint_qimages:
+            return
+        if self.sm and self.sm.config and not bool(self.sm.config.get("ai_translation", "inpaint_enabled", True)):
+            return
+
+        scale, ox, oy = self._get_viewport_transform()
+        if scale <= 0.1:
+            return
+
+        families = ["Segoe UI", "Arial", "Tahoma", "Sans Serif"]
+        flags_wrap = Qt.AlignmentFlag.AlignLeft.value | Qt.TextFlag.TextWordWrap.value
+        flags_center = Qt.AlignmentFlag.AlignCenter.value
+
+        for patch, qimg in self._inpaint_qimages:
+            sx = int(round(ox + patch.gx * scale))
+            sy = int(round(oy + patch.gy * scale))
+            sw = max(10, int(round(patch.gw * scale)))
+            sh = max(10, int(round(patch.gh * scale)))
+            target_rect = QRect(sx, sy, sw, sh)
+            painter.drawImage(target_rect, qimg)
+
+            b = patch.box
+            trans = (getattr(b, "translated", "") or "").strip()
+            if not trans:
+                continue
+
+            cat = getattr(b, "category", "dialogue")
+            sp_orig = (getattr(b, "speaker_orig", "") or "").strip()
+            sp_trans = (getattr(b, "speaker_trans", "") or "").strip()
+            speaker = sp_trans or sp_orig
+
+            pad_x = max(2, int(round((2.5 if cat == "dialogue" else 1.0) * scale)))
+            pad_y = max(1, int(round((1.5 if cat == "dialogue" else 0.5) * scale)))
+            text_rect = target_rect.adjusted(pad_x, pad_y, -pad_x, -pad_y)
+            if text_rect.width() <= 6 or text_rect.height() <= 6:
+                continue
+
+            if patch.is_dark_bg:
+                ink_col, sp_col, shadow_col = QColor(244, 248, 255), QColor(255, 213, 79), QColor(0, 0, 0, 175)
+            else:
+                ink_col, sp_col, shadow_col = QColor(20, 24, 34), QColor(15, 76, 145), None
+
+            painter.save()
+            painter.setClipRect(target_rect)
+
+            if cat in ("menu", "label") and patch.gh <= 22:
+                max_pt = max(6, min(22, int(round(min(3.5 * scale, text_rect.height() * 0.62)))))
+                min_pt = max(5, int(round(2.4 * scale)))
+                chosen_font = None
+                for pt in range(max_pt, min_pt - 1, -1):
+                    f = self._make_font(families, pt, QFont.Weight.Bold)
+                    fm = QFontMetrics(f)
+                    if fm.horizontalAdvance(trans) <= text_rect.width() and fm.height() <= text_rect.height() + 2:
+                        chosen_font = f
+                        break
+                if chosen_font is None:
+                    chosen_font = self._make_font(families, min_pt, QFont.Weight.Bold)
+                    adv = max(1, QFontMetrics(chosen_font).horizontalAdvance(trans))
+                    if adv > text_rect.width():
+                        chosen_font.setStretch(max(68, int((text_rect.width() * 98) / adv)))
+
+                painter.setFont(chosen_font)
+                if shadow_col:
+                    painter.setPen(shadow_col)
+                    painter.drawText(text_rect.translated(1, 1), flags_center, trans)
+                painter.setPen(ink_col)
+                painter.drawText(text_rect, flags_center, trans)
+            else:
+                base_pt = max(6, min(26, int(round(3.9 * scale))))
+                sp_label = f"{speaker}:" if (cat == "dialogue" and speaker) else ""
+                chosen_font = None
+                chosen_sp_h = 0
+                for pt in range(base_pt, 4, -1):
+                    f = self._make_font(families, pt, QFont.Weight.DemiBold)
+                    fm = QFontMetrics(f)
+                    sp_h = 0
+                    if sp_label:
+                        sp_h = fm.boundingRect(QRect(0, 0, text_rect.width(), 500), flags_wrap, sp_label).height() + max(1, int(scale * 0.5))
+                    avail_h = text_rect.height() - sp_h
+                    body_r = fm.boundingRect(QRect(0, 0, text_rect.width(), 1000), flags_wrap, trans)
+                    if avail_h > 0 and body_r.height() <= avail_h + 2 and body_r.width() <= text_rect.width() + 2:
+                        chosen_font, chosen_sp_h = f, sp_h
+                        break
+                if chosen_font is None:
+                    chosen_font = self._make_font(families, 5, QFont.Weight.DemiBold)
+                    if sp_label:
+                        chosen_sp_h = QFontMetrics(chosen_font).boundingRect(QRect(0, 0, text_rect.width(), 200), flags_wrap, sp_label).height()
+
+                body_rect = QRect(text_rect)
+                if sp_label and chosen_sp_h > 0:
+                    sp_font = self._make_font(families, chosen_font.pointSize(), QFont.Weight.Bold)
+                    painter.setFont(sp_font)
+                    sp_rect = QRect(text_rect.x(), text_rect.y(), text_rect.width(), chosen_sp_h)
+                    if shadow_col:
+                        painter.setPen(shadow_col)
+                        painter.drawText(sp_rect.translated(1, 1), flags_wrap, sp_label)
+                    painter.setPen(sp_col)
+                    painter.drawText(sp_rect, flags_wrap, sp_label)
+                    body_rect.setTop(text_rect.y() + chosen_sp_h)
+
+                painter.setFont(chosen_font)
+                if shadow_col:
+                    painter.setPen(shadow_col)
+                    painter.drawText(body_rect.translated(1, 1), flags_wrap, trans)
+                painter.setPen(ink_col)
+                painter.drawText(body_rect, flags_wrap, trans)
+
+            painter.restore()
+
     def show_achievement_popup(self, payload: dict):
         if self.sm and self.sm.config:
             if not bool(self.sm.config.get("retroachievements", "popup_notifications", True)):
@@ -176,8 +300,7 @@ class VideoGLWidget(QOpenGLWidget):
         if self._active_ach_toast is None:
             self._ach_anim_timer.stop()
             return
-        elapsed = time.monotonic() - self._ach_toast_start
-        if elapsed >= self._ach_toast_duration:
+        if (time.monotonic() - self._ach_toast_start) >= self._ach_toast_duration:
             self._start_next_ach_toast()
         else:
             self.update()
@@ -187,44 +310,31 @@ class VideoGLWidget(QOpenGLWidget):
             return
 
         elapsed = time.monotonic() - self._ach_toast_start
-        dur = self._ach_toast_duration
-        in_dur = 0.28
-        out_dur = 0.35
-
+        dur, in_dur, out_dur = self._ach_toast_duration, 0.28, 0.35
         if elapsed < in_dur:
             t = elapsed / in_dur
-            ease = 1.0 - ((1.0 - t) ** 3)
-            alpha = ease
-            slide_y = int(-80 + (96 * ease))
+            alpha = 1.0 - ((1.0 - t) ** 3)
+            slide_y = int(-80 + (96 * alpha))
         elif elapsed > (dur - out_dur):
-            t = max(0.0, (dur - elapsed) / out_dur)
-            alpha = t
-            slide_y = int(-80 + (96 * t))
+            alpha = max(0.0, (dur - elapsed) / out_dur)
+            slide_y = int(-80 + (96 * alpha))
         else:
-            alpha = 1.0
-            slide_y = 16
+            alpha, slide_y = 1.0, 16
 
         toast = self._active_ach_toast
         hc = toast["hardcore"]
-
         box_w = max(270, min(420, int(self.width() * 0.44)))
-        box_h = 74
-        bx = 16
-        by = slide_y
+        box_h, bx, by = 74, 16, slide_y
 
         painter.save()
         painter.setOpacity(max(0.0, min(1.0, alpha)))
-
         accent = QColor(255, 213, 79) if hc else QColor(76, 175, 80)
         painter.setPen(QPen(accent, 2))
         painter.setBrush(QColor(15, 19, 28, 238))
         painter.drawRoundedRect(bx, by, box_w, box_h, 8, 8)
 
-        # Badge Icon
         icon_sz = 52
-        ix = bx + 11
-        iy = by + (box_h - icon_sz) // 2
-        icon_rect = QRect(ix, iy, icon_sz, icon_sz)
+        icon_rect = QRect(bx + 11, by + (box_h - icon_sz) // 2, icon_sz, icon_sz)
         painter.setPen(QPen(accent, 1))
         painter.setBrush(QColor(10, 12, 18))
         painter.drawRoundedRect(icon_rect, 4, 4)
@@ -236,32 +346,28 @@ class VideoGLWidget(QOpenGLWidget):
             painter.setPen(accent)
             painter.drawText(icon_rect, Qt.AlignmentFlag.AlignCenter, "🏆")
 
-        # Text Area
-        tx = ix + icon_sz + 12
+        tx = icon_rect.right() + 12
         tw = (bx + box_w) - tx - 10
-
         hdr_font = self._make_font(["Segoe UI", "Arial", "Sans Serif"], 8, QFont.Weight.Bold)
         title_font = self._make_font(["Segoe UI", "Arial", "Sans Serif"], 10, QFont.Weight.Bold)
         desc_font = self._make_font(["Segoe UI", "Arial", "Sans Serif"], 8, QFont.Weight.Normal)
 
-        hdr_txt = "🏆 HARDCORE ACHIEVEMENT UNLOCKED!" if hc else "🏆 ACHIEVEMENT UNLOCKED!"
         painter.setFont(hdr_font)
         painter.setPen(accent)
         painter.drawText(
             QRect(tx, by + 8, tw, 15),
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-            hdr_txt,
+            "🏆 HARDCORE ACHIEVEMENT UNLOCKED!" if hc else "🏆 ACHIEVEMENT UNLOCKED!",
         )
 
         pts = toast["points"]
         title_str = f"{toast['title']} ({pts} pts)" if pts > 0 else toast["title"]
-        fm_t = QFontMetrics(title_font)
         painter.setFont(title_font)
         painter.setPen(QColor(245, 248, 255))
         painter.drawText(
             QRect(tx, by + 24, tw, 18),
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-            fm_t.elidedText(title_str, Qt.TextElideMode.ElideRight, tw),
+            QFontMetrics(title_font).elidedText(title_str, Qt.TextElideMode.ElideRight, tw),
         )
 
         painter.setFont(desc_font)
@@ -271,11 +377,9 @@ class VideoGLWidget(QOpenGLWidget):
             Qt.AlignmentFlag.AlignLeft.value | Qt.TextFlag.TextWordWrap.value,
             toast["description"],
         )
-
         painter.restore()
 
     def _get_viewport_transform(self) -> tuple[float, float, float]:
-        """Returns (logical_scale, offset_x, offset_y) matching the GL viewport."""
         dpr = self.devicePixelRatioF() or 1.0
         phys_w = max(1, int(self.width() * dpr))
         phys_h = max(1, int(self.height() * dpr))
@@ -318,30 +422,19 @@ class VideoGLWidget(QOpenGLWidget):
         fm = painter.fontMetrics()
 
         if self.input_hud_mode == "RECORDING":
-            status_txt = f"● REC F:{self.input_hud_frame:05d}"
-            status_col = QColor(255, 82, 82)
+            status_txt, status_col = f"● REC F:{self.input_hud_frame:05d}", QColor(255, 82, 82)
         elif self.input_hud_mode == "PLAYBACK":
-            status_txt = f"▶ PLAY {self.input_hud_frame:04d}/{self.input_hud_max_frame:04d}"
-            status_col = QColor(77, 208, 225)
+            status_txt, status_col = f"▶ PLAY {self.input_hud_frame:04d}/{self.input_hud_max_frame:04d}", QColor(77, 208, 225)
         elif self.input_hud_mode == "REWIND":
-            status_txt = f"⏪ REW F:{self.input_hud_frame:05d}"
-            status_col = QColor(255, 213, 79)
+            status_txt, status_col = f"⏪ REW F:{self.input_hud_frame:05d}", QColor(255, 213, 79)
         else:
-            status_txt = f"F:{self.input_hud_frame:05d}"
-            status_col = QColor(144, 202, 249)
+            status_txt, status_col = f"F:{self.input_hud_frame:05d}", QColor(144, 202, 249)
 
         status_w = fm.horizontalAdvance(status_txt) + (6 if compact else 10)
-        pill_widths = []
-        total_pills_w = 0
-        for _, lbl in OVERLAY_BUTTON_LABELS:
-            pw = max(14 if compact else 20, fm.horizontalAdvance(lbl) + (6 if compact else 10))
-            pill_widths.append(pw)
-            total_pills_w += pw + gap
-
-        total_w = pad_x * 2 + status_w + 6 + total_pills_w
+        pill_widths = [max(14 if compact else 20, fm.horizontalAdvance(lbl) + (6 if compact else 10)) for _, lbl in OVERLAY_BUTTON_LABELS]
+        total_w = pad_x * 2 + status_w + 6 + sum(pw + gap for pw in pill_widths)
         bar_h = pill_h + 8
-        bx = 8
-        by = max(4, self.height() - bar_h - 8)
+        bx, by = 8, max(4, self.height() - bar_h - 8)
 
         painter.setPen(QPen(QColor(60, 72, 92, 200), 1))
         painter.setBrush(QColor(12, 16, 22, 195))
@@ -349,16 +442,11 @@ class VideoGLWidget(QOpenGLWidget):
 
         py = by + 4
         painter.setPen(status_col)
-        painter.drawText(
-            QRect(bx + pad_x, py, status_w, pill_h),
-            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-            status_txt,
-        )
+        painter.drawText(QRect(bx + pad_x, py, status_w, pill_h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, status_txt)
 
         cx = bx + pad_x + status_w + 4
         for (bit_idx, lbl), pw in zip(OVERLAY_BUTTON_LABELS, pill_widths):
-            pressed = bool(self.input_hud_mask & (1 << bit_idx))
-            if pressed:
+            if self.input_hud_mask & (1 << bit_idx):
                 painter.setPen(QPen(QColor(0, 230, 118), 1))
                 painter.setBrush(QColor(0, 200, 100, 210))
                 txt_col = QColor(10, 15, 12)
@@ -378,17 +466,15 @@ class VideoGLWidget(QOpenGLWidget):
             return
         font = self._make_font(["Cascadia Code", "Consolas", "Courier New", "Monospace"], 9, QFont.Weight.Bold)
         painter.setFont(font)
-        fm = painter.fontMetrics()
-        tw = fm.horizontalAdvance(self.clip_rec_label) + 16
-        th = 22
-        rect = QRect(8, 8, tw, th)
+        tw = painter.fontMetrics().horizontalAdvance(self.clip_rec_label) + 16
+        rect = QRect(8, 8, tw, 22)
         painter.setPen(QPen(QColor(255, 82, 82, 220), 1))
         painter.setBrush(QColor(25, 12, 16, 210))
         painter.drawRoundedRect(rect, 5, 5)
         painter.setPen(QColor(255, 110, 110))
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, self.clip_rec_label)
 
-    def _build_subtitle_layout(self, inner_max_w: int, shrink_pt: int = 0):
+    def _build_subtitle_layout(self, boxes_to_draw: list, inner_max_w: int, shrink_pt: int = 0):
         families = ["Segoe UI", "Meiryo", "Arial", "Sans Serif"]
         sp_pt = max(9, min(15, int(self.height() / 76)) - shrink_pt)
         dlg_pt = max(10, min(18, int(self.height() / 62)) - shrink_pt)
@@ -397,19 +483,13 @@ class VideoGLWidget(QOpenGLWidget):
         speaker_font = self._make_font(families, sp_pt, QFont.Weight.Bold)
         dialogue_font = self._make_font(families, dlg_pt, QFont.Weight.Bold)
         tag_font = self._make_font(families, tag_pt, QFont.Weight.DemiBold)
+        fm_sp, fm_dlg, fm_tag = QFontMetrics(speaker_font), QFontMetrics(dialogue_font), QFontMetrics(tag_font)
 
-        fm_speaker = QFontMetrics(speaker_font)
-        fm_dialogue = QFontMetrics(dialogue_font)
-        fm_tag = QFontMetrics(tag_font)
-
-        entries = []
-        used_w = 0
-
-        for b in self.subtitle_boxes:
+        entries, used_w = [], 0
+        for b in boxes_to_draw:
             trans = (getattr(b, "translated", "") or "").strip()
             if not trans:
                 continue
-
             cat = getattr(b, "category", "dialogue")
             sp_orig = (getattr(b, "speaker_orig", "") or "").strip()
             sp_trans = (getattr(b, "speaker_trans", "") or "").strip()
@@ -421,52 +501,27 @@ class VideoGLWidget(QOpenGLWidget):
                     sp_line = f"💬 {sp_trans or sp_orig}"
                 else:
                     sp_line = ""
-
                 if sp_line:
-                    sp_rect = fm_speaker.boundingRect(
-                        QRect(0, 0, inner_max_w, 2000),
-                        Qt.TextFlag.TextWordWrap,
-                        sp_line,
-                    )
-                    entries.append((speaker_font, QColor(255, 213, 79), sp_line, sp_rect.height() + 2, 2))
-                    used_w = max(used_w, sp_rect.width() + 8)
-
-                body_rect = fm_dialogue.boundingRect(
-                    QRect(0, 0, inner_max_w, 2000),
-                    Qt.TextFlag.TextWordWrap,
-                    trans,
-                )
-                entries.append((dialogue_font, QColor(235, 245, 255), trans, body_rect.height() + 2, 7))
-                used_w = max(used_w, body_rect.width() + 8)
-
-            elif cat == "menu":
-                line = f"[MENU] {trans}"
-                t_rect = fm_tag.boundingRect(
-                    QRect(0, 0, inner_max_w, 2000),
-                    Qt.TextFlag.TextWordWrap,
-                    line,
-                )
-                entries.append((tag_font, QColor(129, 199, 132), line, t_rect.height() + 2, 4))
-                used_w = max(used_w, t_rect.width() + 8)
-
+                    sp_r = fm_sp.boundingRect(QRect(0, 0, inner_max_w, 2000), Qt.TextFlag.TextWordWrap, sp_line)
+                    entries.append((speaker_font, QColor(255, 213, 79), sp_line, sp_r.height() + 2, 2))
+                    used_w = max(used_w, sp_r.width() + 8)
+                body_r = fm_dlg.boundingRect(QRect(0, 0, inner_max_w, 2000), Qt.TextFlag.TextWordWrap, trans)
+                entries.append((dialogue_font, QColor(235, 245, 255), trans, body_r.height() + 2, 7))
+                used_w = max(used_w, body_r.width() + 8)
             else:
-                line = f"[LABEL] {trans}"
-                t_rect = fm_tag.boundingRect(
-                    QRect(0, 0, inner_max_w, 2000),
-                    Qt.TextFlag.TextWordWrap,
-                    line,
-                )
-                entries.append((tag_font, QColor(255, 213, 79), line, t_rect.height() + 2, 4))
-                used_w = max(used_w, t_rect.width() + 8)
+                tag_lbl = "MENU" if cat == "menu" else "LABEL"
+                tag_col = QColor(129, 199, 132) if cat == "menu" else QColor(255, 213, 79)
+                line = f"[{tag_lbl}] {trans}"
+                t_r = fm_tag.boundingRect(QRect(0, 0, inner_max_w, 2000), Qt.TextFlag.TextWordWrap, line)
+                entries.append((tag_font, tag_col, line, t_r.height() + 2, 4))
+                used_w = max(used_w, t_r.width() + 8)
 
         if not entries:
             return [], 0, 0
-
         total_h = sum(item_h + gap for _, _, _, item_h, gap in entries[:-1]) + entries[-1][3]
         return entries, used_w, total_h
 
     def _draw_subtitle_overlay(self, painter: QPainter):
-        """Renders floating AI translation subtitles ONLY when in Fullscreen mode."""
         parent_win = self.window()
         if not parent_win or not parent_win.isFullScreen():
             return
@@ -475,36 +530,41 @@ class VideoGLWidget(QOpenGLWidget):
         if not overlay_enabled or not self.subtitle_boxes:
             return
 
+        inpaint_on = bool(self.sm.config.get("ai_translation", "inpaint_enabled", True)) if self.sm and self.sm.config else True
+        if inpaint_on and self._inpaint_qimages:
+            inpainted_ids = {id(p.box) for p, _ in self._inpaint_qimages}
+            boxes_to_draw = [b for b in self.subtitle_boxes if id(b) not in inpainted_ids]
+        else:
+            boxes_to_draw = self.subtitle_boxes
+
+        if not boxes_to_draw:
+            return
+
         max_box_w = max(280, min(int(self.width() * 0.82), 1040))
-        pad_x = 18
-        pad_y = 14
+        pad_x, pad_y = 18, 14
         inner_max_w = max_box_w - (pad_x * 2)
         max_allowed_h = int(self.height() * 0.72)
 
-        entries, used_w, total_h = self._build_subtitle_layout(inner_max_w, shrink_pt=0)
+        entries, used_w, total_h = self._build_subtitle_layout(boxes_to_draw, inner_max_w, shrink_pt=0)
         for shrink in (2, 4, 6):
             if not entries or (total_h + pad_y * 2) <= max_allowed_h:
                 break
-            entries, used_w, total_h = self._build_subtitle_layout(inner_max_w, shrink_pt=shrink)
+            entries, used_w, total_h = self._build_subtitle_layout(boxes_to_draw, inner_max_w, shrink_pt=shrink)
 
         if not entries:
             return
 
         box_w = min(max_box_w, max(260, used_w + (pad_x * 2)))
         box_h = min(max_allowed_h, total_h + (pad_y * 2))
-
         bottom_margin = 48 if self._is_input_hud_visible() else 20
-        bx = (self.width() - box_w) // 2
-        by = max(16, self.height() - box_h - bottom_margin)
+        bx, by = (self.width() - box_w) // 2, max(16, self.height() - box_h - bottom_margin)
 
         painter.setPen(QPen(QColor(100, 150, 220, 195), 2))
         painter.setBrush(QColor(12, 16, 24, 224))
         painter.drawRoundedRect(bx, by, box_w, box_h, 10, 10)
 
         painter.save()
-        content_rect = QRect(bx + pad_x, by + pad_y, box_w - (pad_x * 2), box_h - (pad_y * 2))
-        painter.setClipRect(content_rect)
-
+        painter.setClipRect(QRect(bx + pad_x, by + pad_y, box_w - (pad_x * 2), box_h - (pad_y * 2)))
         draw_flags = Qt.AlignmentFlag.AlignLeft.value | Qt.TextFlag.TextWordWrap.value
         cur_y = by + pad_y
         draw_w = box_w - (pad_x * 2)
@@ -513,13 +573,8 @@ class VideoGLWidget(QOpenGLWidget):
                 break
             painter.setFont(font)
             painter.setPen(color)
-            painter.drawText(
-                QRect(bx + pad_x, cur_y, draw_w, item_h),
-                draw_flags,
-                text,
-            )
+            painter.drawText(QRect(bx + pad_x, cur_y, draw_w, item_h), draw_flags, text)
             cur_y += item_h + gap
-
         painter.restore()
 
     def paintGL(self):
@@ -549,19 +604,17 @@ class VideoGLWidget(QOpenGLWidget):
         GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 4)
 
         painter = QPainter(self)
+        self._draw_inpaint_overlays(painter)
 
-        # Pixel Ruler Overlay
         if self.ruler_enabled:
             img_w, img_h = 240, 160
             scale, ox, oy = self._get_viewport_transform()
-
             if self.hover_pos:
                 hx, hy = self.hover_pos
                 sx, sy = ox + hx * scale, oy + hy * scale
                 painter.setPen(QPen(QColor(0, 255, 255, 160), 1))
                 painter.drawLine(int(ox), int(sy), int(ox + img_w * scale), int(sy))
                 painter.drawLine(int(sx), int(oy), int(sx), int(oy + img_h * scale))
-
                 painter.setPen(QColor(0, 255, 255))
                 painter.setFont(QFont("Arial", 10, QFont.Weight.Bold))
                 painter.drawText(int(ox) + 5, int(oy) + 15, f"Cursor: {hx}, {hy}")
@@ -571,11 +624,8 @@ class VideoGLWidget(QOpenGLWidget):
                 x2, y2 = self.ruler_end
                 rx, ry = min(x1, x2), min(y1, y2)
                 rw, rh = abs(x2 - x1) + 1, abs(y2 - y1) + 1
-
-                screen_x = ox + rx * scale
-                screen_y = oy + ry * scale
-                screen_w = rw * scale
-                screen_h = rh * scale
+                screen_x, screen_y = ox + rx * scale, oy + ry * scale
+                screen_w, screen_h = rw * scale, rh * scale
 
                 painter.setPen(QPen(QColor(255, 0, 255), 2))
                 painter.setBrush(QColor(255, 0, 255, 60))

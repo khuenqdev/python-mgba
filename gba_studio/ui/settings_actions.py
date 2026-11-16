@@ -36,6 +36,8 @@ class SettingsActionsMixin:
         self.integer_scale_action.setChecked(bool(self.config.get("video", "integer_scaling", False)))
         self.input_overlay_action.setChecked(bool(self.config.get("video", "show_input_overlay", False)))
         self.act_trans_overlay.setChecked(bool(self.config.get("ai_translation", "overlay_enabled", True)))
+        if hasattr(self, "act_trans_inpaint"):
+            self.act_trans_inpaint.setChecked(bool(self.config.get("ai_translation", "inpaint_enabled", True)))
         if hasattr(self, "act_auto_translate"):
             self.act_auto_translate.setChecked(bool(self.config.get("ai_translation", "auto_translate", False)))
         if hasattr(self, "_sync_auto_translate_timer"):
@@ -94,9 +96,6 @@ class SettingsActionsMixin:
 
         self._build_keymap()
 
-    # =========================================================================
-    # RETROACHIEVEMENTS SETTINGS ACTIONS
-    # =========================================================================
     def toggle_ra_enabled(self):
         val = self.act_ra_enabled.isChecked()
         self.config.set("retroachievements", "enabled", val)

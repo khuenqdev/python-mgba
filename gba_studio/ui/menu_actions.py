@@ -430,13 +430,19 @@ class MenuBuilderMixin:
         self.act_auto_translate.triggered.connect(self.toggle_auto_translate)
         translation_menu.addAction(self.act_auto_translate)
 
+        self.act_trans_inpaint = QAction("🎨 In-Place Textbox Inpainting", self, checkable=True)
+        self.act_trans_inpaint.setShortcut(QKeySequence("Ctrl+Shift+V"))
+        self.act_trans_inpaint.setChecked(bool(self.config.get("ai_translation", "inpaint_enabled", True)))
+        self.act_trans_inpaint.triggered.connect(self.toggle_translation_inpaint)
+        translation_menu.addAction(self.act_trans_inpaint)
+
         self.act_trans_overlay = QAction("Fullscreen Floating Subtitle Overlay", self, checkable=True)
         self.act_trans_overlay.setShortcut(QKeySequence("Ctrl+Shift+O"))
         self.act_trans_overlay.setChecked(bool(self.config.get("ai_translation", "overlay_enabled", True)))
         self.act_trans_overlay.triggered.connect(self.toggle_translation_overlay)
         translation_menu.addAction(self.act_trans_overlay)
 
-        clear_panel_act = QAction("Clear Subtitle Panel", self)
+        clear_panel_act = QAction("Clear Subtitle & Inpaint Overlays", self)
         clear_panel_act.triggered.connect(self.clear_translation_subtitles)
         translation_menu.addAction(clear_panel_act)
 
