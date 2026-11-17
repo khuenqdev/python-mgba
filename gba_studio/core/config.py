@@ -1,5 +1,6 @@
 # config.py
 import os
+import sys
 import re
 import json
 import copy
@@ -56,6 +57,10 @@ DEFAULT_CONFIG = {
         "solar_level": 5,
         "rumble_enabled": True,
         "rumble_strength": 1.0,
+        "rumble_driver": "xinput" if sys.platform.startswith("win") else "sdl2",
+        "sim_rumble_mode": "auto",
+        "sim_rumble_sensitivity": 1.0,
+        "sim_rumble_profile": "balanced",
         "gyro_enabled": True,
         "gyro_sensitivity": 1.0,
         "mouse_gyro": True,

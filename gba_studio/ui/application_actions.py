@@ -144,6 +144,7 @@ class ApplicationActionsMixin:
 
         if self.worker:
             self.worker.update_audio_settings()
+            self.worker.update_rumble_sim_settings()
             lvl = int(self.config.get("sensors", "solar_level", 5) or 5)
             self.worker.solar_level = max(0, min(10, lvl))
             self.worker.solar_changed.emit(self.worker.solar_level)
@@ -448,6 +449,8 @@ class ApplicationActionsMixin:
     def toggle_rumble(self):
         val = self.act_rumble.isChecked()
         self.config.set("sensors", "rumble_enabled", val)
+        if not val and self.worker:
+            self.worker.update_rumble_sim_settings()
         self.video_widget.show_osd(f"Rumble Motor: {'ON' if val else 'OFF'}")
 
     def toggle_mouse_gyro(self):

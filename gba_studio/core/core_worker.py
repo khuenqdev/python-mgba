@@ -15,6 +15,7 @@ except ImportError:
 from pdretro import Emulator
 from .cheats import CheatEngine
 from .audio_dsp import AudioDSP
+from .rumble_sim import SimulatedRumbleEngine
 from .watchpoints import WatchTableAndWatchpointEngine
 from .session_recorder import (
     SessionRecorder,
@@ -115,8 +116,9 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
         self.cheat_engine = CheatEngine(self)
         self.watch_engine = WatchTableAndWatchpointEngine(self)
         self.dsp = AudioDSP(self.config)
+        self.rumble_sim = SimulatedRumbleEngine(self.config)
 
-        # Raw Hardware Audio Capture Tap (for universal sound/music recording)
+        # Raw Hardware Audio Capture Tap
         self.audio_sample_rate = 44100
         self._audio_capture_lock = threading.Lock()
         self._audio_capturing = False
@@ -317,6 +319,17 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
         if hasattr(self, "dsp") and self.dsp:
             self.dsp.update_settings()
 
+    def update_rumble_sim_settings(self):
+        if hasattr(self, "rumble_sim") and self.rumble_sim:
+            self.rumble_sim.update_settings()
+            if not self.rumble_sim.should_run(self.rumble_type):
+                self.rumble_sim.reset()
+                self.rumble_triggered.emit(0.0, 0.0, 0)
+
+    def reload_rumble_profile(self):
+        if hasattr(self, "rumble_sim") and self.rumble_sim:
+            self.rumble_sim.load_profile_for_rom(self.rom_path, self.get_profile_id())
+
     def set_rewinding(self, active: bool):
         if active and self.is_ra_hardcore_active():
             self.rewind_status.emit("Rewind disabled in RA Hardcore mode")
@@ -327,6 +340,7 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
         self.is_rewinding = bool(active)
         if active:
             self._notified_rewind_empty = False
+            self.rumble_sim.reset()
 
     def request_tas_seek(self, target_frame: int, anchor_frame: int, anchor_state_bytes: bytes, dense_masks: list):
         with QMutexLocker(self.mutex):
@@ -349,7 +363,7 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
         if not self.emu:
             return b"", b""
         try:
-            mem = self.emu.get_memory(2)  # SYSTEM_RAM = [EWRAM 256KB | IWRAM 32KB]
+            mem = self.emu.get_memory(2)
             if mem and hasattr(mem, "data"):
                 raw = bytes(mem.data)
                 if len(raw) >= (256 + 32) * 1024:
@@ -358,6 +372,18 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
         except Exception:
             pass
         return b"", b""
+
+    def _read_sysram_u32_unlocked(self) -> np.ndarray | None:
+        if not self.emu:
+            return None
+        try:
+            mem = self.emu.get_memory(2)
+            if mem and hasattr(mem, "data"):
+                arr = np.frombuffer(mem.data, dtype="<u4")
+                return arr.copy()
+        except Exception:
+            pass
+        return None
 
     def _execute_tas_seek(self, generator, req_tuple):
         target_frame, anchor_frame, anchor_comp, dense_masks = req_tuple
@@ -453,6 +479,8 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
         self.solar_level = int(self.config.get("sensors", "solar_level", 5) or 5)
         self.dsp.update_settings()
         self.dsp.reset_stretcher()
+        self.rumble_sim.update_settings()
+        self.rumble_sim.load_profile_for_rom(self.rom_path, self.get_profile_id())
 
         buf_max = max(30, int(self.config.get("emulation", "rewind_buffer_size", 300) or 300))
         if self.rewind_buffer.maxlen != buf_max:
@@ -473,7 +501,15 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
             print("\n=======================================================")
             print(f"[ROM IDENTIFICATION] Title: {self.game_title} | Code: {self.game_code}")
             print(f"[ROM IDENTIFICATION] Hardware Profile: {self.rumble_type}")
-            print("[RUMBLE CONFIG] Native Libretro Emulation Active")
+            if self.rumble_sim.should_run(self.rumble_type):
+                sfx_cnt = len(self.rumble_sim.profile_store._active_entries)
+                print(
+                    f"[RUMBLE CONFIG] Simulated Rumble Active "
+                    f"(Mode: {self.rumble_sim.mode}, Profile: {self.rumble_sim.profile}, "
+                    f"ROM SFX Rules: {sfx_cnt})"
+                )
+            else:
+                print("[RUMBLE CONFIG] Native Libretro Emulation Active")
             print("=======================================================\n")
 
             self.game_identified.emit(self.game_title, self.game_code, self.rumble_type)
@@ -553,6 +589,9 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
                 continue
 
             if self.is_paused and not self.step_requested:
+                if self.rumble_sim._was_active:
+                    self.rumble_sim.reset()
+                    self.rumble_triggered.emit(0.0, 0.0, 0)
                 time.sleep(0.02)
                 next_time = time.perf_counter()
                 continue
@@ -569,6 +608,7 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
             btn_mask = 0
             wp_hit_info = None
             ra_ewram, ra_iwram = b"", b""
+            sysram_u32 = None
 
             with QMutexLocker(self.mutex):
                 if self.reset_requested and hasattr(self.emu, "reset"):
@@ -576,6 +616,7 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
                     self.emu.reset()
                     self.replay_frame_counter = 0
                     self.cheat_engine.mark_dirty()
+                    self.rumble_sim.reset()
                     self.reset_requested = False
 
                 if not self.is_ra_hardcore_active():
@@ -689,6 +730,9 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
                 if self.ra_manager and self.ra_manager.active:
                     ra_ewram, ra_iwram = self._read_ra_ram_unlocked()
 
+                if not self.fast_forward and not was_single_step and self.rumble_sim.has_rom_profile() and self.rumble_sim.should_run(self.rumble_type):
+                    sysram_u32 = self._read_sysram_u32_unlocked()
+
                 wp_hit_info = self.watch_engine.check_watchpoints_unlocked(current_frame_num)
                 if wp_hit_info is not None:
                     self.is_paused = True
@@ -724,8 +768,10 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
                 else:
                     self._last_gui_render_time = now_ts
 
+            raw_frame_for_sim = None
             if render_this_frame:
                 frame_data = self._extract_video_array(vid_obj)
+                raw_frame_for_sim = frame_data
                 self.latest_video_frame = frame_data
 
                 if self.config.get("video", "interframe_blending") and not was_single_step:
@@ -760,11 +806,13 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
             if aud_obj is not None:
                 raw_audio = getattr(aud_obj, "data", aud_obj)
 
+            stereo_audio_for_sim = None
             if raw_audio is not None and len(raw_audio) > 0:
                 try:
                     audio_arr = np.frombuffer(raw_audio, dtype=np.int16)
                     if len(audio_arr) % 2 == 0:
                         stereo_audio = audio_arr.reshape(-1, 2)
+                        stereo_audio_for_sim = stereo_audio
 
                         if self._audio_capturing and not was_single_step:
                             with self._audio_capture_lock:
@@ -783,6 +831,23 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
                                 played_audio = True
                 except Exception:
                     pass
+
+            if self.rumble_sim.should_run(self.rumble_type):
+                if is_ff or was_single_step:
+                    if self.rumble_sim._was_active:
+                        self.rumble_sim.reset()
+                        self.rumble_triggered.emit(0.0, 0.0, 0)
+                else:
+                    sim_out = self.rumble_sim.process_frame(
+                        raw_frame_for_sim if raw_frame_for_sim is not None else self.latest_video_frame,
+                        stereo_audio_for_sim,
+                        sample_rate,
+                        btn_mask,
+                        current_frame_num,
+                        system_ram_u32=sysram_u32,
+                    )
+                    if sim_out is not None:
+                        self.rumble_triggered.emit(*sim_out)
 
             if not played_audio:
                 now = time.perf_counter()

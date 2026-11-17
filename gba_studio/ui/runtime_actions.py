@@ -7,6 +7,7 @@ import tempfile
 import datetime
 
 from PyQt6.QtWidgets import QFileDialog, QMessageBox
+from PyQt6.QtCore import Qt
 
 from ..core.core_worker import EmulatorWorker
 from ..core.rom_patcher import PatchError, find_matching_patch, prepare_patched_rom
@@ -251,7 +252,10 @@ class RuntimeActionsMixin:
         self.worker.watchpoint_hit.connect(self._on_watchpoint_hit)
 
         self.worker.rumble_triggered.connect(self.sensor_hud.on_rumble_triggered)
-        self.worker.rumble_triggered.connect(self.controller_manager.trigger_rumble)
+        self.worker.rumble_triggered.connect(
+            self.controller_manager.trigger_rumble,
+            Qt.ConnectionType.QueuedConnection,
+        )
         self.worker.solar_changed.connect(self.sensor_hud.on_solar_updated)
         self.worker.tilt_changed.connect(self.sensor_hud.on_tilt_updated)
         self.worker.game_identified.connect(self.sensor_hud.on_game_identified)

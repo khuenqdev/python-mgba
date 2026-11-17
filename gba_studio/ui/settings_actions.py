@@ -77,6 +77,21 @@ class SettingsActionsMixin:
             self.solar_actions[solar_lvl].setChecked(True)
         self.sensor_hud.on_solar_updated(solar_lvl)
 
+        if hasattr(self, "act_rumble"):
+            self.act_rumble.setChecked(bool(self.config.get("sensors", "rumble_enabled", True)))
+        if hasattr(self, "sim_rumble_mode_actions"):
+            sim_mode = str(self.config.get("sensors", "sim_rumble_mode", "auto") or "auto").lower()
+            if sim_mode in self.sim_rumble_mode_actions:
+                self.sim_rumble_mode_actions[sim_mode].setChecked(True)
+        if hasattr(self, "sim_rumble_profile_actions"):
+            sim_prof = str(self.config.get("sensors", "sim_rumble_profile", "balanced") or "balanced").lower()
+            if sim_prof in self.sim_rumble_profile_actions:
+                self.sim_rumble_profile_actions[sim_prof].setChecked(True)
+        if hasattr(self, "sim_rumble_sens_actions"):
+            cur_sens = float(self.config.get("sensors", "sim_rumble_sensitivity", 1.0) or 1.0)
+            closest_sens = min(self.sim_rumble_sens_actions.keys(), key=lambda s: abs(s - cur_sens))
+            self.sim_rumble_sens_actions[closest_sens].setChecked(True)
+
         if hasattr(self, "use_profile_action"):
             has_rom = bool(getattr(self, "worker", None) and getattr(self, "current_rom", None))
             active_pid = getattr(self.config, "active_profile_id", None)
@@ -95,6 +110,34 @@ class SettingsActionsMixin:
             self.use_profile_action.blockSignals(False)
 
         self._build_keymap()
+
+    def open_rumble_profile_dialog(self):
+        if not self.worker or not self.current_rom:
+            QMessageBox.warning(self, "Notice", "Load a ROM first to generate or edit its SFX Rumble Profile.")
+            return
+        from ..tools.rumble_profile_dialog import RumbleProfileDialog
+        self.active_tool_window = RumbleProfileDialog(self, self)
+        self.active_tool_window.show()
+
+    def set_sim_rumble_mode(self, mode: str):
+        self.config.set("sensors", "sim_rumble_mode", mode)
+        if self.worker:
+            self.worker.update_rumble_sim_settings()
+        labels = {"auto": "Auto (Non-Rumble Games)", "always": "Always On", "off": "OFF"}
+        self.video_widget.show_osd(f"📳 Simulated Rumble: {labels.get(mode, mode)}")
+
+    def set_sim_rumble_profile(self, profile: str):
+        self.config.set("sensors", "sim_rumble_profile", profile)
+        if self.worker:
+            self.worker.update_rumble_sim_settings()
+        labels = {"balanced": "Balanced", "impacts_only": "Heavy Hits & Shake", "rpg_magic": "Sensitive RPG/Magic"}
+        self.video_widget.show_osd(f"📳 Sim Rumble Profile: {labels.get(profile, profile)}")
+
+    def set_sim_rumble_sensitivity(self, sens: float):
+        self.config.set("sensors", "sim_rumble_sensitivity", float(sens))
+        if self.worker:
+            self.worker.update_rumble_sim_settings()
+        self.video_widget.show_osd(f"📳 Sim Rumble Sensitivity: {int(round(sens * 100))}%")
 
     def toggle_ra_enabled(self):
         val = self.act_ra_enabled.isChecked()

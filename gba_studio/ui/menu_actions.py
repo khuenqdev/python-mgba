@@ -207,6 +207,59 @@ class MenuBuilderMixin:
         self.act_rumble.triggered.connect(self.toggle_rumble)
         sensors_menu.addAction(self.act_rumble)
 
+        sim_rumble_menu = sensors_menu.addMenu("📳 Simulated Rumble (Non-Rumble Games)")
+
+        act_gen_profile = QAction("🛠 Generate / Edit Game SFX Rumble Profile...", self)
+        act_gen_profile.triggered.connect(self.open_rumble_profile_dialog)
+        sim_rumble_menu.addAction(act_gen_profile)
+        sim_rumble_menu.addSeparator()
+
+        sim_mode_menu = sim_rumble_menu.addMenu("Activation Mode")
+        self.sim_rumble_mode_group = QActionGroup(self)
+        self.sim_rumble_mode_group.setExclusive(True)
+        self.sim_rumble_mode_actions = {}
+        for mode_key, lbl in [
+            ("auto", "Auto (Games Without Native Rumble)"),
+            ("always", "Always On (All Games)"),
+            ("off", "Off (Native Rumble Only)"),
+        ]:
+            act = QAction(lbl, self, checkable=True)
+            act.triggered.connect(lambda checked, m=mode_key: self.set_sim_rumble_mode(m))
+            self.sim_rumble_mode_group.addAction(act)
+            sim_mode_menu.addAction(act)
+            self.sim_rumble_mode_actions[mode_key] = act
+
+        sim_prof_menu = sim_rumble_menu.addMenu("Detection Profile")
+        self.sim_rumble_profile_group = QActionGroup(self)
+        self.sim_rumble_profile_group.setExclusive(True)
+        self.sim_rumble_profile_actions = {}
+        for prof_key, lbl in [
+            ("balanced", "Balanced (Hits, Shakes, Magic & Items)"),
+            ("impacts_only", "Heavy Hits & Screen Shake Only"),
+            ("rpg_magic", "Sensitive RPG / Action (Extra Magic & Hits)"),
+        ]:
+            act = QAction(lbl, self, checkable=True)
+            act.triggered.connect(lambda checked, p=prof_key: self.set_sim_rumble_profile(p))
+            self.sim_rumble_profile_group.addAction(act)
+            sim_prof_menu.addAction(act)
+            self.sim_rumble_profile_actions[prof_key] = act
+
+        sim_sens_menu = sim_rumble_menu.addMenu("Intensity / Sensitivity")
+        self.sim_rumble_sens_group = QActionGroup(self)
+        self.sim_rumble_sens_group.setExclusive(True)
+        self.sim_rumble_sens_actions = {}
+        for sens_val, lbl in [
+            (0.6, "Low (60%)"),
+            (1.0, "Normal (100%)"),
+            (1.4, "High (140%)"),
+            (1.8, "Max (180%)"),
+        ]:
+            act = QAction(lbl, self, checkable=True)
+            act.triggered.connect(lambda checked, s=sens_val: self.set_sim_rumble_sensitivity(s))
+            self.sim_rumble_sens_group.addAction(act)
+            sim_sens_menu.addAction(act)
+            self.sim_rumble_sens_actions[sens_val] = act
+
         self.act_mouse_gyro = QAction("🖱️ Mouse Twist to Gyro (Right-Click Drag)", self, checkable=True)
         self.act_mouse_gyro.setChecked(bool(self.config.get("sensors", "mouse_gyro")))
         self.act_mouse_gyro.triggered.connect(self.toggle_mouse_gyro)

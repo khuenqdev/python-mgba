@@ -1,14 +1,17 @@
 # controller.py
 import os
 import sys
+import time
 import ctypes
 os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
+os.environ.setdefault("SDL_JOYSTICK_RAWINPUT", "0")
+os.environ.setdefault("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")
 import pygame
 
 from PyQt6.QtWidgets import (QDialog, QWidget, QVBoxLayout, QHBoxLayout, 
                              QLabel, QPushButton, QComboBox, QTableWidget, 
                              QTableWidgetItem, QHeaderView, QMessageBox, QGroupBox)
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QObject, pyqtSlot
 
 GBA_BUTTON_NAMES = [
     ("a", "A Button"),
@@ -60,9 +63,7 @@ QT_KEY_MAP = {
     "-": Qt.Key.Key_Minus, "=": Qt.Key.Key_Equal
 }
 
-# =============================================================================
-# Windows Native XInput Vibration Definitions (Explicit 64-bit Safe C-Types)
-# =============================================================================
+
 class XINPUT_VIBRATION(ctypes.Structure):
     _fields_ = [
         ("wLeftMotorSpeed", ctypes.c_ushort),
@@ -70,29 +71,57 @@ class XINPUT_VIBRATION(ctypes.Structure):
     ]
 
 
-class ControllerManager:
-    def __init__(self, config):
+class ControllerManager(QObject):
+    """Thread-safe QObject gamepad input & haptic motor manager running on the GUI thread."""
+
+    def __init__(self, config, parent=None):
+        super().__init__(parent)
         self.config = config
         self.joysticks = {}
         self.initialized = False
         self._xinput_dll = None
+        self._xinput_dll_name = ""
+        self._active_xinput_slots = []
+        self._last_slot_probe_ts = 0.0
+        self._last_rumble_log_ts = 0.0
+        self._last_warn_log_ts = 0.0
+
+        self._cur_low = 0.0
+        self._cur_high = 0.0
+        self._rumble_until = 0.0
+        self._using_sdl_active = False
+
+        # Test trace diagnostics
+        self._trace_active = False
+        self._trace_start_ts = 0.0
+        self._trace_ticks = 0
+
         self._init_subsystem()
         self._init_xinput()
 
-        self._rumble_stop_timer = QTimer()
+        self._rumble_stop_timer = QTimer(self)
         self._rumble_stop_timer.setSingleShot(True)
         self._rumble_stop_timer.timeout.connect(self.stop_rumble)
 
+        self._xinput_keepalive_timer = QTimer(self)
+        self._xinput_keepalive_timer.setInterval(16)
+        self._xinput_keepalive_timer.timeout.connect(self._tick_xinput_keepalive)
+
     def _init_xinput(self):
-        """Loads and configures Windows XInput with explicit 64-bit argument typing."""
         if sys.platform.startswith("win"):
-            for name in ["xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"]:
+            # Prefer xinput9_1_0.dll / xinput1_3.dll over xinput1_4.dll to avoid Win10/11 focus muting
+            for name in ["xinput9_1_0.dll", "xinput1_3.dll", "xinput1_4.dll"]:
                 try:
                     dll = ctypes.windll.LoadLibrary(name)
                     if hasattr(dll, "XInputSetState"):
                         dll.XInputSetState.argtypes = [ctypes.c_uint, ctypes.POINTER(XINPUT_VIBRATION)]
                         dll.XInputSetState.restype = ctypes.c_uint
+                        if hasattr(dll, "XInputEnable"):
+                            dll.XInputEnable.argtypes = [ctypes.c_bool]
+                            dll.XInputEnable.restype = None
+                            dll.XInputEnable(True)
                         self._xinput_dll = dll
+                        self._xinput_dll_name = name
                         print(f"[RUMBLE DEBUG] Loaded native Windows vibration driver: {name}")
                         break
                 except Exception as e:
@@ -111,11 +140,14 @@ class ControllerManager:
             print(f"[CONTROLLER DEBUG] Initialization error: {e}")
 
     def rescan_devices(self):
-        if not self.initialized: return []
+        if not self.initialized:
+            return []
         pygame.joystick.quit()
         pygame.joystick.init()
         self.joysticks.clear()
-        
+        self._active_xinput_slots = []
+        self._last_slot_probe_ts = 0.0
+
         count = pygame.joystick.get_count()
         devices = []
         for i in range(count):
@@ -124,12 +156,72 @@ class ControllerManager:
                 js.init()
                 self.joysticks[i] = js
                 devices.append(f"{i}: {js.get_name()}")
-            except Exception: pass
+            except Exception:
+                pass
         return devices
 
-    def trigger_rumble(self, low_freq: float = 0.8, high_freq: float = 0.8, duration_ms: int = 150):
-        """Sends vibration signals to physical gamepad motors and logs diagnostic state."""
+    def _send_sdl_rumble(self, low: float, high: float, duration_ms: int) -> list:
+        sdl_vibrated = []
+        for idx, js in self.joysticks.items():
+            if hasattr(js, "rumble"):
+                try:
+                    if js.rumble(low, high, duration_ms):
+                        sdl_vibrated.append(f"{idx} ({js.get_name()})")
+                except Exception:
+                    pass
+        return sdl_vibrated
+
+    def _send_xinput_rumble(self, low: float, high: float) -> list:
+        if not self._xinput_dll:
+            return []
+
+        now = time.monotonic()
+        if not self._active_xinput_slots or (now - self._last_slot_probe_ts) >= 5.0:
+            slots_to_try = [0, 1, 2, 3]
+            self._last_slot_probe_ts = now
+        else:
+            slots_to_try = list(self._active_xinput_slots)
+
+        vib = XINPUT_VIBRATION()
+        vib.wLeftMotorSpeed = int(low * 65535)
+        vib.wRightMotorSpeed = int(high * 65535)
+        xinput_slots_success = []
+        for user_idx in slots_to_try:
+            try:
+                if self._xinput_dll.XInputSetState(user_idx, ctypes.byref(vib)) == 0:
+                    xinput_slots_success.append(user_idx)
+            except Exception:
+                pass
+
+        self._active_xinput_slots = xinput_slots_success
+        return xinput_slots_success
+
+    def _tick_xinput_keepalive(self):
+        if time.monotonic() >= self._rumble_until:
+            self._xinput_keepalive_timer.stop()
+            return
+        self._trace_ticks += 1
+        self._send_xinput_rumble(self._cur_low, self._cur_high)
+
+    def get_effective_driver(self, driver_override: str = None) -> str:
+        driver = str(driver_override or self.config.get("sensors", "rumble_driver", "xinput") or "xinput").lower()
+        if driver == "auto":
+            return "xinput" if self._xinput_dll is not None else "sdl2"
+        return driver
+
+    @pyqtSlot(float, float, int)
+    def trigger_rumble(
+        self,
+        low_freq: float = 0.8,
+        high_freq: float = 0.8,
+        duration_ms: int = 150,
+        driver_override: str = None,
+        force_log: bool = False,
+    ):
+        """Sends vibration signals safely on the Main GUI thread (60 Hz XInput keep-alive on Windows)."""
         if not self.config.get("sensors", "rumble_enabled"):
+            if force_log:
+                print("[RUMBLE WARNING] Controller Motor Rumble is disabled in Sensors & Rumble menu.")
             return False
 
         if low_freq <= 0.0 and high_freq <= 0.0:
@@ -139,75 +231,112 @@ class ControllerManager:
         strength = float(self.config.get("sensors", "rumble_strength") or 1.0)
         low = max(0.0, min(1.0, low_freq * strength))
         high = max(0.0, min(1.0, high_freq * strength))
+        dur = max(120, int(duration_ms))
 
-        vibrated = False
+        now = time.monotonic()
+        new_until = now + (dur / 1000.0)
+        if driver_override is None and not force_log and now < self._rumble_until:
+            if (low + high) < (self._cur_low + self._cur_high) and new_until < self._rumble_until:
+                return True
+            new_until = max(new_until, self._rumble_until)
+            dur = max(dur, int((new_until - now) * 1000.0))
+
+        driver = self.get_effective_driver(driver_override)
+
+        if force_log:
+            self._trace_active = True
+            self._trace_start_ts = now
+            self._trace_ticks = 0
+
+        sdl_vibrated = []
         xinput_slots_success = []
 
-        # 1. Native Windows XInput (probe all 4 controller player slots)
-        if self._xinput_dll:
-            vib = XINPUT_VIBRATION()
-            vib.wLeftMotorSpeed = int(low * 65535)
-            vib.wRightMotorSpeed = int(high * 65535)
-            for user_idx in range(4):
-                try:
-                    res = self._xinput_dll.XInputSetState(user_idx, ctypes.byref(vib))
-                    if res == 0:  # ERROR_SUCCESS
-                        vibrated = True
-                        xinput_slots_success.append(user_idx)
-                except Exception:
-                    pass
-
-            if vibrated:
-                self._rumble_stop_timer.start(max(75, duration_ms))
-
-        # 2. Pygame / SDL2 Fallback: Run only if XInput did not claim the device
-        sdl_vibrated = []
-        if not xinput_slots_success:
-            for idx, js in self.joysticks.items():
-                if hasattr(js, 'rumble'):
-                    try:
-                        if js.rumble(low, high, duration_ms):
-                            vibrated = True
-                            sdl_vibrated.append(f"{idx} ({js.get_name()})")
-                    except Exception:
-                        pass
-
-        # Diagnostic Debug Logging
-        if vibrated:
-            status_parts = []
-            if xinput_slots_success:
-                status_parts.append(f"XInput slot(s) {xinput_slots_success}")
+        if driver == "sdl2":
+            self._xinput_keepalive_timer.stop()
+            self._using_sdl_active = True
+            sdl_vibrated = self._send_sdl_rumble(low, high, dur)
             if sdl_vibrated:
-                status_parts.append(f"SDL device(s) {sdl_vibrated}")
-            print(f"[RUMBLE HARDWARE] Motor active -> Low: {low:.2f}, High: {high:.2f}, Dur: {duration_ms}ms on {', '.join(status_parts)}")
+                self._cur_low = low
+                self._cur_high = high
+                self._rumble_until = new_until
+                self._rumble_stop_timer.start(dur)
         else:
-            print(f"[RUMBLE HARDWARE WARNING] Trigger called (L:{low:.2f}, H:{high:.2f}) but no physical gamepad accepted vibration!")
+            self._using_sdl_active = False
+            xinput_slots_success = self._send_xinput_rumble(low, high)
+            if xinput_slots_success:
+                self._cur_low = low
+                self._cur_high = high
+                self._rumble_until = new_until
+                if not self._xinput_keepalive_timer.isActive():
+                    self._xinput_keepalive_timer.start()
+                self._rumble_stop_timer.start(dur)
+            else:
+                sdl_vibrated = self._send_sdl_rumble(low, high, dur)
+                if sdl_vibrated:
+                    self._using_sdl_active = True
+                    self._cur_low = low
+                    self._cur_high = high
+                    self._rumble_until = new_until
+                    self._rumble_stop_timer.start(dur)
+
+        vibrated = bool(sdl_vibrated or xinput_slots_success)
+        if vibrated:
+            if force_log or driver_override is not None or (now - self._last_rumble_log_ts) >= 2.0:
+                self._last_rumble_log_ts = now
+                parts = []
+                if xinput_slots_success:
+                    parts.append(f"{self._xinput_dll_name} 60Hz slot(s) {xinput_slots_success}")
+                if sdl_vibrated:
+                    parts.append(f"SDL2 {sdl_vibrated}")
+                print(f"[RUMBLE HARDWARE] Motor active -> Low: {low:.2f}, High: {high:.2f}, Dur: {dur}ms on {', '.join(parts)}")
+        else:
+            if force_log or (now - self._last_warn_log_ts) >= 15.0:
+                self._last_warn_log_ts = now
+                print(f"[RUMBLE HARDWARE WARNING] Trigger called (L:{low:.2f}, H:{high:.2f}) but no physical gamepad accepted vibration!")
 
         return vibrated
 
     def stop_rumble(self):
+        if self._trace_active:
+            elapsed_ms = int((time.monotonic() - self._trace_start_ts) * 1000)
+            print(f"[RUMBLE TRACE] Stopped after {elapsed_ms}ms ({self._trace_ticks} keep-alive ticks)")
+            self._trace_active = False
+
+        self._xinput_keepalive_timer.stop()
+        self._rumble_stop_timer.stop()
+        self._rumble_until = 0.0
+        self._cur_low = 0.0
+        self._cur_high = 0.0
+
         if self._xinput_dll:
             vib = XINPUT_VIBRATION(0, 0)
-            for user_idx in range(4):
+            slots = self._active_xinput_slots if self._active_xinput_slots else [0]
+            for user_idx in slots:
                 try:
                     self._xinput_dll.XInputSetState(user_idx, ctypes.byref(vib))
                 except Exception:
                     pass
 
-        for js in self.joysticks.values():
-            if hasattr(js, 'stop_rumble'):
-                try: js.stop_rumble()
-                except Exception: pass
+        if self._using_sdl_active:
+            self._using_sdl_active = False
+            for js in self.joysticks.values():
+                if hasattr(js, "stop_rumble"):
+                    try:
+                        js.stop_rumble()
+                    except Exception:
+                        pass
 
     def _read_input_element(self, js, mapped_input, deadzone):
-        if not mapped_input: return False
-        
+        if not mapped_input:
+            return False
+
         if str(mapped_input).startswith("button_"):
             try:
                 btn_num = int(mapped_input.split("_")[1])
                 if btn_num < js.get_numbuttons():
                     return bool(js.get_button(btn_num))
-            except Exception: pass
+            except Exception:
+                pass
 
         elif str(mapped_input).startswith("hat_"):
             try:
@@ -219,7 +348,8 @@ class ControllerManager:
                     elif direction == "down": return (hy < 0)
                     elif direction == "left": return (hx < 0)
                     elif direction == "right": return (hx > 0)
-            except Exception: pass
+            except Exception:
+                pass
 
         elif str(mapped_input).startswith("axis_"):
             try:
@@ -229,36 +359,37 @@ class ControllerManager:
                     val = js.get_axis(axis_num)
                     if sign == "+": return (val > deadzone)
                     elif sign == "-": return (val < -deadzone)
-            except Exception: pass
+            except Exception:
+                pass
         return False
 
     def poll_gamepad_events(self, worker):
-        if not self.initialized or not worker: return
+        if not self.initialized or not worker:
+            return
         pygame.event.pump()
 
         gamepad_cfg = self.config.get("input", "gamepad")
-        if not gamepad_cfg or not gamepad_cfg.get("enabled", True): return
+        if not gamepad_cfg or not gamepad_cfg.get("enabled", True):
+            return
 
         device_idx = gamepad_cfg.get("device_index", 0)
         js = self.joysticks.get(device_idx)
-        if not js: return
+        if not js:
+            return
 
         deadzone = float(gamepad_cfg.get("deadzone", 0.2))
 
-        # 1. Standard Buttons & Solar Hotkeys
         for gba_key, action_id in LIBRETRO_BTNS.items():
             mapped_input = gamepad_cfg.get(gba_key)
             is_pressed = self._read_input_element(js, mapped_input, deadzone)
             worker.set_input(action_id, is_pressed)
 
-        # 2. Autofire (Turbo)
         for af_key in AUTOFIRE_ACTIONS:
             target_btn = af_key.replace("autofire_", "")
             mapped_input = gamepad_cfg.get(af_key)
             is_pressed = self._read_input_element(js, mapped_input, deadzone)
             worker.set_autofire(target_btn, is_pressed)
 
-        # 3. Analog Sticks -> Motion / Gyro / Tilt Sensor Simulation
         num_axes = js.get_numaxes()
         if num_axes >= 2:
             lx = js.get_axis(0)
@@ -280,7 +411,7 @@ class KeyCaptureDialog(QDialog):
         self.mode = mode
         self.joystick = joystick
         self.captured_value = None
-        
+
         self.setWindowTitle("Press Key or Button")
         self.resize(320, 130)
         layout = QVBoxLayout(self)
@@ -340,7 +471,8 @@ class KeyCaptureDialog(QDialog):
     def _poll_controller(self):
         pygame.event.pump()
         js = self.joystick
-        if not js: return
+        if not js:
+            return
 
         for b in range(js.get_numbuttons()):
             if js.get_button(b):
@@ -367,7 +499,7 @@ class ControllerConfigDialog(QDialog):
         self.config = config
         self.cm = controller_manager
         self.setWindowTitle("Configure Controls & Motion Feedback")
-        self.resize(560, 620)
+        self.resize(580, 660)
 
         self._init_ui()
         self.load_current_mappings()
@@ -379,7 +511,7 @@ class ControllerConfigDialog(QDialog):
         top_layout.addWidget(QLabel("Target Device:"))
         self.device_combo = QComboBox()
         self.device_combo.addItem("Keyboard")
-        
+
         devices = self.cm.rescan_devices()
         for dev in devices:
             self.device_combo.addItem(f"Gamepad: {dev}")
@@ -394,10 +526,27 @@ class ControllerConfigDialog(QDialog):
 
         vib_group = QGroupBox("Gamepad Rumble Motor")
         vib_layout = QHBoxLayout(vib_group)
-        btn_test_rumble = QPushButton("⚡ Test Motor Vibration")
-        btn_test_rumble.setStyleSheet("background-color: #E65100; color: white; font-weight: bold; padding: 4px;")
-        btn_test_rumble.clicked.connect(self.test_rumble)
-        vib_layout.addWidget(btn_test_rumble)
+
+        vib_layout.addWidget(QLabel("Driver:"))
+        self.driver_combo = QComboBox()
+        self.driver_combo.addItem("Windows XInput (60Hz Keep-Alive)", "xinput")
+        self.driver_combo.addItem("SDL2 / WGI (Pygame Native)", "sdl2")
+        self.driver_combo.addItem("Auto (XInput on Win, else SDL2)", "auto")
+        cur_drv = str(self.config.get("sensors", "rumble_driver", "xinput") or "xinput").lower()
+        d_idx = self.driver_combo.findData(cur_drv)
+        if d_idx >= 0:
+            self.driver_combo.setCurrentIndex(d_idx)
+        vib_layout.addWidget(self.driver_combo, 1)
+
+        btn_test_xinput = QPushButton("⚡ Test XInput (500ms)")
+        btn_test_xinput.setStyleSheet("background-color: #E65100; color: white; font-weight: bold; padding: 4px 8px;")
+        btn_test_xinput.clicked.connect(lambda: self.test_rumble("xinput"))
+        vib_layout.addWidget(btn_test_xinput)
+
+        btn_test_sdl = QPushButton("⚡ Test SDL2 (500ms)")
+        btn_test_sdl.setStyleSheet("background-color: #1976D2; color: white; font-weight: bold; padding: 4px 8px;")
+        btn_test_sdl.clicked.connect(lambda: self.test_rumble("sdl2"))
+        vib_layout.addWidget(btn_test_sdl)
         layout.addWidget(vib_group)
 
         self.table = QTableWidget(len(GBA_BUTTON_NAMES), 3)
@@ -411,28 +560,38 @@ class ControllerConfigDialog(QDialog):
         btn_save = QPushButton("Save & Apply")
         btn_save.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 6px;")
         btn_save.clicked.connect(self.save_and_close)
-        
+
         btn_close = QPushButton("Cancel")
         btn_close.clicked.connect(self.reject)
-        
+
         bottom_layout.addStretch()
         bottom_layout.addWidget(btn_save)
         bottom_layout.addWidget(btn_close)
         layout.addLayout(bottom_layout)
 
-    def test_rumble(self):
-        print("\n[RUMBLE TEST] Triggering test vibration...")
-        success = self.cm.trigger_rumble(low_freq=1.0, high_freq=1.0, duration_ms=400)
-        
-        # Resolve MainWindow instance through parent hierarchy
+    def test_rumble(self, driver_name: str):
+        if not self.config.get("sensors", "rumble_enabled"):
+            QMessageBox.warning(
+                self,
+                "Rumble Disabled",
+                "Controller Motor Rumble is currently turned OFF.\nEnable it under: Sensors & Rumble → Controller Motor Rumble.",
+            )
+            return
+
+        print(f"\n[RUMBLE TEST] Triggering 500ms test vibration via driver='{driver_name}'...")
+        success = self.cm.trigger_rumble(low_freq=1.0, high_freq=1.0, duration_ms=500, driver_override=driver_name, force_log=True)
+
         parent_win = self.parent() or self.window()
-        if hasattr(parent_win, 'on_manual_rumble_test'):
+        if hasattr(parent_win, "on_manual_rumble_test"):
             parent_win.on_manual_rumble_test()
 
         if success:
-            QMessageBox.information(self, "Rumble Test", "Vibration signal sent successfully to gamepad!")
+            idx = self.driver_combo.findData(driver_name)
+            if idx >= 0:
+                self.driver_combo.setCurrentIndex(idx)
+            QMessageBox.information(self, "Rumble Test", f"500ms vibration signal sent via '{driver_name}'!")
         else:
-            QMessageBox.warning(self, "Rumble Test", "No controller responded to the vibration test. Verify your controller is plugged in and supported.")
+            QMessageBox.warning(self, "Rumble Test", f"No controller responded via '{driver_name}'.")
 
     def rescan_gamepads(self):
         current_text = self.device_combo.currentText()
@@ -442,7 +601,8 @@ class ControllerConfigDialog(QDialog):
         for dev in devices:
             self.device_combo.addItem(f"Gamepad: {dev}")
         idx = self.device_combo.findText(current_text)
-        if idx >= 0: self.device_combo.setCurrentIndex(idx)
+        if idx >= 0:
+            self.device_combo.setCurrentIndex(idx)
         QMessageBox.information(self, "Rescan", f"Found {len(devices)} game controller(s).")
 
     def on_device_changed(self):
@@ -454,7 +614,7 @@ class ControllerConfigDialog(QDialog):
 
         for row, (gba_key, label_name) in enumerate(GBA_BUTTON_NAMES):
             self.table.setItem(row, 0, QTableWidgetItem(label_name))
-            
+
             val = str(bindings.get(gba_key, "Unbound"))
             item_val = QTableWidgetItem(val)
             item_val.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -489,5 +649,6 @@ class ControllerConfigDialog(QDialog):
             current_map["enabled"] = True
 
         self.config.set("input", target_section, current_map)
+        self.config.set("sensors", "rumble_driver", self.driver_combo.currentData())
         self.config.save()
         self.accept()

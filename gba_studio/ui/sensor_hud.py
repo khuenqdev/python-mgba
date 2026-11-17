@@ -38,6 +38,7 @@ class SensorHudWidget(QFrame):
         self.hw_type = "None"
         self.current_solar_level = 5
         self.rumble_active = False
+        self._last_rumble_style = None
         self.rumble_strength = 0.0
         self.current_tilt_x = 0.0
         self.current_tilt_y = 0.0
@@ -118,17 +119,15 @@ class SensorHudWidget(QFrame):
             pct = int(self.rumble_strength * 100)
             filled = max(1, min(5, int(self.rumble_strength * 5)))
             bars = "■" * filled + "□" * (5 - filled)
-            if w < 560:
-                self.lbl_rumble.setText(f"📳 {pct}%")
-            else:
-                self.lbl_rumble.setText(f"📳 [{bars}] {pct}%")
-            self.lbl_rumble.setStyleSheet("color: #FF5252;")
+            self.lbl_rumble.setText(f"📳 {pct}%" if w < 560 else f"📳 [{bars}] {pct}%")
+            if self._last_rumble_style is not True:
+                self.lbl_rumble.setStyleSheet("color: #FF5252;")
+                self._last_rumble_style = True
         else:
-            if w < 560:
-                self.lbl_rumble.setText("📳 OFF")
-            else:
-                self.lbl_rumble.setText("📳 [□□□□□] OFF")
-            self.lbl_rumble.setStyleSheet("color: #78909C;")
+            self.lbl_rumble.setText("📳 OFF" if w < 560 else "📳 [□□□□□] OFF")
+            if self._last_rumble_style is not False:
+                self.lbl_rumble.setStyleSheet("color: #78909C;")
+                self._last_rumble_style = False
 
         deg = int(self.current_gyro_angle) % 360
         if w < 560:
