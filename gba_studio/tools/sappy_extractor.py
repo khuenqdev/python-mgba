@@ -6,11 +6,11 @@ import threading
 import numpy as np
 
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QDialog, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QFileDialog,
-    QMessageBox, QLineEdit, QSpinBox, QComboBox, QProgressBar
+    QMessageBox, QLineEdit, QSpinBox, QComboBox, QTabWidget, QCheckBox
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 
 # Standard GBA M4A / Sappy 49-entry wait/note-length table (24 PPQN)
 M4A_WAIT_TABLE = [
@@ -39,7 +39,22 @@ def _validate_song_header(rom_data: bytes, hdr_off: int) -> dict | None:
     reverb = rom_data[hdr_off + 3]
     vg_ptr = struct.unpack_from("<I", rom_data, hdr_off + 4)[0]
 
-    if not (1 <= track_count <= 16) or block_count > 16:
+    # Standard M4A dummy song header (`mus_dummy`: {0, 0, 0, 0, 0})
+    if track_count == 0:
+        if vg_ptr == 0 or _is_rom_ptr(vg_ptr, rom_len):
+            return {
+                "is_dummy": True,
+                "header_offset": hdr_off,
+                "track_count": 0,
+                "block_count": block_count,
+                "priority": priority,
+                "reverb": reverb,
+                "voicegroup_ptr": vg_ptr,
+                "track_ptrs": [],
+            }
+        return None
+
+    if track_count > 16 or block_count > 64:
         return None
     if (vg_ptr & 3) != 0 or not _is_rom_ptr(vg_ptr, rom_len):
         return None
@@ -54,6 +69,7 @@ def _validate_song_header(rom_data: bytes, hdr_off: int) -> dict | None:
         track_ptrs.append(tp)
 
     return {
+        "is_dummy": False,
         "header_offset": hdr_off,
         "track_count": track_count,
         "block_count": block_count,
@@ -64,77 +80,200 @@ def _validate_song_header(rom_data: bytes, hdr_off: int) -> dict | None:
     }
 
 
+def _try_parse_song_table_at(rom_data: bytes, start_off: int, max_entries: int = 1024) -> list:
+    """Attempts to parse an M4A song table starting at a 4-byte aligned ROM offset."""
+    rom_len = len(rom_data)
+    if start_off < 0 or (start_off & 3) != 0 or start_off + 8 > rom_len:
+        return []
+
+    songs = []
+    unique_headers = set()
+    zero_streak = 0
+
+    for k in range(max_entries):
+        pos = start_off + (k * 8)
+        if pos + 8 > rom_len:
+            break
+        hdr_ptr, grp_word = struct.unpack_from("<II", rom_data, pos)
+        ms = grp_word & 0xFFFF
+        me = (grp_word >> 16) & 0xFFFF
+
+        if hdr_ptr == 0 and grp_word == 0:
+            zero_streak += 1
+            if zero_streak > 4:
+                break
+            continue
+
+        if ms >= 32 or me >= 32:
+            break
+        if (hdr_ptr & 3) != 0 or not _is_rom_ptr(hdr_ptr, rom_len):
+            break
+
+        zero_streak = 0
+        parsed_hdr = _validate_song_header(rom_data, _ptr_to_off(hdr_ptr))
+        if parsed_hdr is None:
+            break
+
+        if not parsed_hdr.get("is_dummy"):
+            unique_headers.add(parsed_hdr["header_offset"])
+            songs.append({
+                "song_id": k,
+                "entry_offset": pos,
+                "player_group": ms,
+                **parsed_hdr,
+            })
+
+    if len(songs) >= 3 and len(unique_headers) >= 2:
+        return songs
+    return []
+
+
+def _find_tables_via_thumb_code(rom_data: bytes) -> list:
+    """Finds M4A song tables via `m4aSongNumStart` / `SelectSong` Thumb literal pools."""
+    rom_len = len(rom_data)
+    found_offsets = set()
+    # Common Thumb signature: lsl r0, r0, #16 ; lsr rX, r0, #16 (00 04 00 0C or 00 04 04 0C)
+    for sig in (b"\x00\x04\x04\x0C", b"\x00\x04\x00\x0C"):
+        pos = 0
+        while True:
+            idx = rom_data.find(sig, pos)
+            if idx == -1:
+                break
+            pos = idx + 2
+            # Scan next 64 bytes for LDR Rd, [PC, #imm] (0x48xx..0x4Fxx)
+            win_end = min(rom_len - 2, idx + 64)
+            for pc_off in range(idx, win_end, 2):
+                insn = struct.unpack_from("<H", rom_data, pc_off)[0]
+                if (insn & 0xF800) == 0x4800:
+                    imm = (insn & 0xFF) * 4
+                    pool_off = ((pc_off + 4) & ~3) + imm
+                    if pool_off + 4 <= rom_len:
+                        ptr = struct.unpack_from("<I", rom_data, pool_off)[0]
+                        if (ptr & 3) == 0 and _is_rom_ptr(ptr, rom_len):
+                            found_offsets.add(_ptr_to_off(ptr))
+
+    tables = []
+    for off in sorted(found_offsets):
+        songs = _try_parse_song_table_at(rom_data, off)
+        if songs:
+            tables.append({"table_offset": off, "songs": songs})
+    return tables
+
+
 def scan_sappy_song_tables(rom_data: bytes) -> list:
     """
-    Scans a GBA ROM for Nintendo M4A / Sappy `song_table` structures.
-    Returns a list of dicts: {table_offset, songs: [...]}.
+    Scans a GBA ROM for Nintendo M4A / Sappy `song_table` structures across
+    both 4-byte alignment phases (offset % 8 == 0 and 4), allowing dummy slots.
     """
     rom_len = len(rom_data)
     if rom_len < 0x200:
         return []
 
-    words = np.frombuffer(rom_data[:rom_len - (rom_len % 4)], dtype="<u4")
-    # Song table entries are 8 bytes: word[even] = header_ptr, word[odd] = player_group | (pad << 16)
-    hdr_words = words[0::2]
-    grp_words = words[1::2]
-    valid_entry = (
-        (hdr_words >= 0x08000100)
-        & (hdr_words < 0x08000000 + rom_len)
-        & ((hdr_words & 3) == 0)
-        & ((grp_words & 0xFFFF) < 32)
-    )
-
     tables = []
-    n_entries = len(valid_entry)
-    i = 0
-    while i < n_entries:
-        if not valid_entry[i]:
-            i += 1
+    seen_offsets = set()
+
+    # 1. Fast Thumb `m4aSongNumStart` literal-pool signature scan
+    for t in _find_tables_via_thumb_code(rom_data):
+        off = t["table_offset"]
+        if off not in seen_offsets:
+            seen_offsets.add(off)
+            tables.append(t)
+
+    # 2. Full 4-byte-aligned structural scan (checks both phase 0 and phase 1)
+    words = np.frombuffer(rom_data[:rom_len - (rom_len % 4)], dtype="<u4")
+    for phase in (0, 1):
+        sub = words[phase:]
+        pair_count = len(sub) // 2
+        if pair_count < 6:
             continue
 
-        j = i
-        while j < n_entries and valid_entry[j]:
-            j += 1
+        hdr_words = sub[:pair_count * 2:2]
+        grp_words = sub[1:pair_count * 2:2]
+        ms_words = grp_words & 0xFFFF
+        me_words = (grp_words >> 16) & 0xFFFF
 
-        run_len = j - i
-        if run_len >= 8:
-            unique_headers = set()
-            songs = []
-            valid_headers = 0
-            for k in range(run_len):
-                entry_idx = i + k
-                hdr_ptr = int(hdr_words[entry_idx])
-                grp_word = int(grp_words[entry_idx])
-                hdr_off = _ptr_to_off(hdr_ptr)
-                parsed_hdr = _validate_song_header(rom_data, hdr_off)
-                if parsed_hdr is None:
-                    break
-                valid_headers += 1
-                unique_headers.add(hdr_off)
-                songs.append({
-                    "song_id": k,
-                    "entry_offset": entry_idx * 8,
-                    "player_group": grp_word & 0xFF,
-                    **parsed_hdr,
-                })
+        valid_entry = (
+            (hdr_words >= 0x080000C0)
+            & (hdr_words < 0x08000000 + rom_len)
+            & ((hdr_words & 3) == 0)
+            & (ms_words < 32)
+            & (me_words < 32)
+        )
 
-            if valid_headers >= 8 and len(unique_headers) >= 4:
-                tables.append({
-                    "table_offset": i * 8,
-                    "songs": songs,
-                })
-                i = i + valid_headers
+        i = 0
+        while i < pair_count:
+            if not valid_entry[i]:
+                i += 1
                 continue
-        i = j
 
-    # Sort largest / richest table first
-    tables.sort(key=lambda t: len(t["songs"]), reverse=True)
-    return tables
+            j = i
+            while j < pair_count and valid_entry[j]:
+                j += 1
+
+            run_len = j - i
+            if run_len >= 4:
+                table_off = (phase + i * 2) * 4
+                if table_off not in seen_offsets:
+                    songs = _try_parse_song_table_at(rom_data, table_off, max_entries=max(run_len + 16, 512))
+                    if songs:
+                        seen_offsets.add(table_off)
+                        tables.append({"table_offset": table_off, "songs": songs})
+                        last_off = songs[-1]["entry_offset"]
+                        i = max(i + 1, ((last_off - phase * 4) // 8) + 1)
+                        continue
+            i += 1
+
+    # Remove strict sub-tables that start inside an already-captured larger table
+    tables.sort(key=lambda t: (len(t["songs"]), -t["table_offset"]), reverse=True)
+    filtered = []
+    covered_ranges = []
+    for t in tables:
+        start = t["table_offset"]
+        end = t["songs"][-1]["entry_offset"] + 8
+        if any(cs <= start < ce and end <= ce for cs, ce in covered_ranges):
+            continue
+        covered_ranges.append((start, end))
+        filtered.append(t)
+
+    return filtered
 
 
 # =============================================================================
 # M4A VOICEGROUP & SAMPLE DECODER
 # =============================================================================
+def _read_sound_sample(rom_data: bytes, smp_off: int) -> dict | None:
+    rom_len = len(rom_data)
+    if smp_off < 0 or smp_off + 16 > rom_len:
+        return None
+    smp_type, loop_flag, freq_q10, loop_start, num_samples = struct.unpack_from("<BBHIII", rom_data, smp_off) if False else (0, 0, 0, 0, 0)
+    w0, loop_flag, freq_q10, loop_start, num_samples = struct.unpack_from("<HHIII", rom_data, smp_off)
+
+    # Validate M4A WaveData header constraints
+    if (w0 & 0xFF) not in (0x00, 0x01):
+        return None
+    if loop_flag not in (0x0000, 0x4000):
+        return None
+    if num_samples < 8 or num_samples > 1_500_000:
+        return None
+    if freq_q10 == 0 or not (2000.0 <= (freq_q10 / 1024.0) <= 64000.0):
+        return None
+    if smp_off + 16 + num_samples > rom_len:
+        return None
+
+    sample_rate = float(freq_q10) / 1024.0
+    pcm_i8 = np.frombuffer(rom_data, dtype=np.int8, count=num_samples, offset=smp_off + 16)
+    is_loop = bool(loop_flag & 0x4000) and (loop_start < num_samples)
+
+    return {
+        "offset": smp_off,
+        "sample_rate": sample_rate,
+        "loop": is_loop,
+        "loop_start": int(loop_start) if is_loop else 0,
+        "loop_end": int(num_samples),
+        "pcm_i8": pcm_i8,
+    }
+
+
 def read_voicegroup(rom_data: bytes, vg_ptr: int, max_entries: int = 128, depth: int = 0) -> list:
     """Parses up to 128 12-byte instrument records from an M4A voicegroup."""
     rom_len = len(rom_data)
@@ -154,10 +293,16 @@ def read_voicegroup(rom_data: bytes, vg_ptr: int, max_entries: int = 128, depth:
             smp_off = _ptr_to_off(ptr1)
             smp_info = _read_sound_sample(rom_data, smp_off)
             if smp_info:
+                # In M4A, type 0x00 uses 60 (Middle C) as reference key;
+                # type 0x08 is fixed-frequency (no pitch scaling);
+                # inside drumkits (depth > 0), b1 specifies the percussion pitch key.
+                drum_pitch = (b1 & 0x7F) if (depth > 0 and (b1 & 0x7F) > 0) else 60
                 entries.append({
                     "program": idx,
                     "kind": "pcm",
-                    "base_key": b1 & 0x7F,
+                    "fixed_freq": (inst_type == 0x08),
+                    "base_key": 60,
+                    "drum_key": drum_pitch,
                     "pan": b3 & 0x7F,
                     "adsr": ptr2,
                     "sample": smp_info,
@@ -170,6 +315,7 @@ def read_voicegroup(rom_data: bytes, vg_ptr: int, max_entries: int = 128, depth:
                 "kind": "square",
                 "duty": ptr1 & 0x3,
                 "base_key": 60,
+                "drum_key": (b1 & 0x7F) if (depth > 0 and (b1 & 0x7F) > 0) else 60,
                 "adsr": ptr2,
             })
         elif inst_type in (0x03, 0x0B):  # PSG Wave
@@ -178,6 +324,7 @@ def read_voicegroup(rom_data: bytes, vg_ptr: int, max_entries: int = 128, depth:
                 "kind": "square",
                 "duty": 2,
                 "base_key": 60,
+                "drum_key": (b1 & 0x7F) if (depth > 0 and (b1 & 0x7F) > 0) else 60,
                 "adsr": ptr2,
             })
         elif inst_type in (0x04, 0x0C):  # PSG Noise
@@ -185,16 +332,25 @@ def read_voicegroup(rom_data: bytes, vg_ptr: int, max_entries: int = 128, depth:
                 "program": idx,
                 "kind": "noise",
                 "base_key": 60,
+                "drum_key": (b1 & 0x7F) if (depth > 0 and (b1 & 0x7F) > 0) else 60,
                 "adsr": ptr2,
             })
-        elif inst_type == 0x40 and depth == 0 and _is_rom_ptr(ptr1, rom_len):
-            # Keysplit instrument: resolve first available PCM sub-entry as representative sample
-            sub = read_voicegroup(rom_data, ptr1, max_entries=32, depth=1)
-            first_pcm = next((s for s in sub if s["kind"] == "pcm"), None)
-            if first_pcm:
-                entries.append({**first_pcm, "program": idx})
-        elif inst_type == 0x80 and depth == 0 and _is_rom_ptr(ptr1, rom_len):
+        elif inst_type == 0x40 and depth == 0 and _is_rom_ptr(ptr1, rom_len) and _is_rom_ptr(ptr2, rom_len):
+            # Keysplit instrument: ptr1 = sub-voicegroup, ptr2 = 128-byte note->voice map
             sub = read_voicegroup(rom_data, ptr1, max_entries=64, depth=1)
+            kt_off = _ptr_to_off(ptr2)
+            key_table = rom_data[kt_off:kt_off + 128] if kt_off + 128 <= rom_len else b""
+            first_pcm = next((s for s in sub if s["kind"] == "pcm"), None)
+            if first_pcm or sub:
+                entries.append({
+                    **(first_pcm or sub[0]),
+                    "program": idx,
+                    "kind": "keysplit",
+                    "sub_entries": sub,
+                    "key_table": key_table,
+                })
+        elif inst_type == 0x80 and depth == 0 and _is_rom_ptr(ptr1, rom_len):
+            sub = read_voicegroup(rom_data, ptr1, max_entries=128, depth=1)
             entries.append({
                 "program": idx,
                 "kind": "drumkit",
@@ -202,32 +358,6 @@ def read_voicegroup(rom_data: bytes, vg_ptr: int, max_entries: int = 128, depth:
             })
 
     return entries
-
-
-def _read_sound_sample(rom_data: bytes, smp_off: int) -> dict | None:
-    rom_len = len(rom_data)
-    if smp_off < 0 or smp_off + 16 > rom_len:
-        return None
-    _, loop_flag, freq_q10, loop_start, num_samples = struct.unpack_from("<HHIII", rom_data, smp_off)
-    if num_samples == 0 or num_samples > 2_000_000:
-        return None
-    if smp_off + 16 + num_samples > rom_len:
-        num_samples = max(0, rom_len - (smp_off + 16))
-        if num_samples == 0:
-            return None
-
-    sample_rate = max(4000.0, min(48000.0, freq_q10 / 1024.0)) if freq_q10 > 0 else 13379.0
-    pcm_i8 = np.frombuffer(rom_data, dtype=np.int8, count=num_samples, offset=smp_off + 16)
-    is_loop = bool(loop_flag & 0x4000) and (loop_start < num_samples)
-
-    return {
-        "offset": smp_off,
-        "sample_rate": sample_rate,
-        "loop": is_loop,
-        "loop_start": int(loop_start) if is_loop else 0,
-        "loop_end": int(num_samples),
-        "pcm_i8": pcm_i8,
-    }
 
 
 # =============================================================================
@@ -258,28 +388,27 @@ def parse_m4a_song(rom_data: bytes, song: dict, max_loops: int = 1) -> dict:
         vol = 100
         pan = 64
         key_shift = 0
-        bend = 0
         last_cmd = 0
         last_note = 60
         last_vel = 100
-        active_ties = {}  # note_key -> (start_tick, vel, voice)
+        active_ties = {}
 
         steps = 0
-        while 0 <= pos < rom_len and steps < 40000:
+        while 0 <= pos < rom_len and steps < 50000:
             steps += 1
             b = rom_data[pos]
             pos += 1
 
-            # Running status handling
+            # Running status only applies to note/tie/eot commands (>= 0xCE)
             if b < 0x80:
-                if last_cmd >= 0xCF:
+                if last_cmd >= 0xCE:
                     cmd = last_cmd
                     pos -= 1
                 else:
                     continue
             else:
                 cmd = b
-                if cmd >= 0xCF or (0x80 <= cmd <= 0xB0):
+                if cmd >= 0xCE:
                     last_cmd = cmd
 
             if 0x80 <= cmd <= 0xB0:
@@ -324,7 +453,10 @@ def parse_m4a_song(rom_data: bytes, song: dict, max_loops: int = 1) -> dict:
                 else:
                     rept_stack.pop(pos, None)
             elif cmd == 0xB9:  # MEMACC
-                pos += 3
+                if pos < rom_len and rom_data[pos] >= 6:
+                    pos += 7
+                else:
+                    pos += 3
             elif cmd == 0xBA:  # PRIO
                 pos += 1
             elif cmd == 0xBB:  # TEMPO
@@ -360,7 +492,10 @@ def parse_m4a_song(rom_data: bytes, song: dict, max_loops: int = 1) -> dict:
             elif cmd in (0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC8):
                 pos += 1
             elif cmd == 0xCD:  # XCMD
-                pos += 2
+                if pos < rom_len and rom_data[pos] == 0x08:
+                    pos += 5
+                else:
+                    pos += 2
             elif cmd == 0xCE:  # EOT [note]
                 note = last_note
                 if pos < rom_len and rom_data[pos] < 0x80:
@@ -412,7 +547,6 @@ def parse_m4a_song(rom_data: bytes, song: dict, max_loops: int = 1) -> dict:
                     "pan": pan, "vol": vol,
                 })
 
-        # Close any dangling tie
         for eff_note, (st_tick, st_vel, st_voice) in active_ties.items():
             dur = max(1, tick - st_tick)
             all_notes.append({
@@ -430,6 +564,90 @@ def parse_m4a_song(rom_data: bytes, song: dict, max_loops: int = 1) -> dict:
         "tempos": sorted(tempos, key=lambda x: x[0]),
         "total_ticks": max(24, max_tick),
     }
+
+
+# =============================================================================
+# UNIVERSAL ROM SAMPLE & SOUND EFFECT SCANNER (ANY GBA GAME)
+# =============================================================================
+def scan_universal_rom_samples(rom_data: bytes) -> list:
+    """
+    Scans ANY GBA ROM (M4A, GAX, or custom drivers) for audio assets:
+      1. M4A DirectSound WaveData headers (even if song_table is hidden/compressed)
+      2. Raw 8-bit signed PCM waveforms & voice/SFX clips via smoothness/energy heuristics
+    """
+    rom_len = len(rom_data)
+    if rom_len < 0x400:
+        return []
+
+    found = []
+    covered_ranges = []
+
+    def _is_covered(off: int) -> bool:
+        return any(s <= off < e for s, e in covered_ranges)
+
+    # 1. Scan 4-byte aligned M4A WaveData headers (Works for all M4A & partial M4A derivatives)
+    for off in range(0xC0, rom_len - 32, 4):
+        if _is_covered(off):
+            continue
+        if rom_data[off] in (0x00, 0x01) and rom_data[off + 1] == 0x00 and rom_data[off + 2] == 0x00 and rom_data[off + 3] in (0x00, 0x40):
+            smp = _read_sound_sample(rom_data, off)
+            if smp and smp["loop_end"] >= 64:
+                # Reject zero-filled or flat byte blocks
+                if int(np.ptp(smp["pcm_i8"])) >= 18:
+                    end_off = off + 16 + smp["loop_end"]
+                    covered_ranges.append((off, end_off))
+                    found.append({
+                        "kind": "M4A WaveData",
+                        "offset": off,
+                        "length": smp["loop_end"],
+                        "sample_rate": int(round(smp["sample_rate"])),
+                        "loop": smp["loop"],
+                        "signed": True,
+                        "pcm": smp["pcm_i8"],
+                    })
+
+    # 2. Universal Raw 8-bit PCM Heuristic Scanner (for Konami/Atlus/Capcom/GAX/Custom drivers)
+    # Looks for contiguous >= 512-byte audio regions with smooth waveform derivatives & non-zero AC energy
+    raw_i8 = np.frombuffer(rom_data, dtype=np.int8)
+    win = 256
+    n_wins = rom_len // win
+    if n_wins > 4:
+        blocks = raw_i8[:n_wins * win].reshape(n_wins, win).astype(np.int16)
+        diffs = np.abs(np.diff(blocks, axis=1)).mean(axis=1)
+        ptps = blocks.max(axis=1) - blocks.min(axis=1)
+        means = np.abs(blocks.mean(axis=1))
+        # Smooth audio: noticeable dynamic range, moderate sample-to-sample delta, centered around 0
+        is_audio = (ptps >= 40) & (diffs >= 2.0) & (diffs <= 36.0) & (means <= 28.0)
+
+        idx = 0
+        while idx < n_wins:
+            if not is_audio[idx]:
+                idx += 1
+                continue
+            j = idx
+            while j < n_wins and is_audio[j]:
+                j += 1
+            if (j - idx) >= 3:  # >= 768 bytes contiguous waveform
+                byte_start = idx * win
+                byte_end = min(rom_len, j * win)
+                if not _is_covered(byte_start):
+                    pcm_slice = raw_i8[byte_start:byte_end]
+                    covered_ranges.append((byte_start, byte_end))
+                    found.append({
+                        "kind": "Raw PCM8",
+                        "offset": byte_start,
+                        "length": len(pcm_slice),
+                        "sample_rate": 13379,
+                        "loop": False,
+                        "signed": True,
+                        "pcm": pcm_slice,
+                    })
+                    if len(found) >= 800:
+                        break
+            idx = j
+
+    found.sort(key=lambda item: item["offset"])
+    return found
 
 
 # =============================================================================
@@ -482,7 +700,7 @@ def export_song_to_midi(parsed_song: dict, track_count: int, out_path: str):
                 trk_bytes.extend(_write_vlq(delta))
                 trk_bytes.extend(bytes([0x80 | ch, ev["key"] & 0x7F, 0]))
 
-        trk_bytes.extend(b"\x00\xFF\x2F\x00")  # End of Track
+        trk_bytes.extend(b"\x00\xFF\x2F\x00")
         track_chunks.append(b"MTrk" + struct.pack(">I", len(trk_bytes)) + bytes(trk_bytes))
 
     mthd = b"MThd" + struct.pack(">IHHH", 6, 1, len(track_chunks), ppqn)
@@ -507,7 +725,11 @@ def _riff_list(list_type: bytes, body: bytes) -> bytes:
 
 def export_voicegroup_to_sf2(voicegroup: list, out_path: str, bank_name: str = "GBA M4A Soundbank"):
     """Writes a spec-compliant RIFF SoundFont 2.0 (.sf2) from parsed M4A PCM samples."""
-    pcm_insts = [v for v in voicegroup if v.get("kind") == "pcm" and v.get("sample")]
+    pcm_insts = []
+    for v in voicegroup:
+        if v.get("kind") in ("pcm", "keysplit") and v.get("sample"):
+            pcm_insts.append(v)
+
     if not pcm_insts:
         raise ValueError("Selected song's voicegroup contains no DirectSound PCM samples.")
 
@@ -529,7 +751,6 @@ def export_voicegroup_to_sf2(voicegroup: list, out_path: str, bank_name: str = "
 
         loop_start = start_sample + (smp["loop_start"] if smp["loop"] else 0)
         loop_end = start_sample + smp["loop_end"] if smp["loop"] else end_sample
-        # SF2 spec requires >= 46 zero samples after each sample
         smpl_buf.extend(b"\x00" * (46 * 2))
 
         smp_name = f"GBA_SMP_{v['program']:03d}".encode("ascii")[:20].ljust(20, b"\x00")
@@ -544,26 +765,20 @@ def export_voicegroup_to_sf2(voicegroup: list, out_path: str, bank_name: str = "
             v["base_key"] & 0x7F,
             0,
             0,
-            1,  # monoSample
+            1,
         ))
 
-        # Instrument & Bag
         inst_name = f"Voice_{v['program']:03d}".encode("ascii")[:20].ljust(20, b"\x00")
         inst_buf.extend(struct.pack("<20sH", inst_name, idx))
         ibag_buf.extend(struct.pack("<HH", idx * 2, 0))
-        # sampleModes (54): 1 = loop continuously, 0 = no loop
         igen_buf.extend(struct.pack("<HH", 54, 1 if smp["loop"] else 0))
-        # sampleID (53)
         igen_buf.extend(struct.pack("<HH", 53, idx))
 
-        # Preset & Bag
         preset_name = f"P_{v['program']:03d}".encode("ascii")[:20].ljust(20, b"\x00")
         phdr_buf.extend(struct.pack("<20sHHHIII", preset_name, v["program"] & 0x7F, 0, idx, 0, 0, 0))
         pbag_buf.extend(struct.pack("<HH", idx, 0))
-        # instrument (41)
         pgen_buf.extend(struct.pack("<HH", 41, idx))
 
-    # Terminal sentinel records required by SF2 spec
     n = len(pcm_insts)
     shdr_buf.extend(struct.pack("<20sIIIIIBbHH", b"EOS".ljust(20, b"\x00"), 0, 0, 0, 0, 0, 0, 0, 0, 0))
     inst_buf.extend(struct.pack("<20sH", b"EOI".ljust(20, b"\x00"), n))
@@ -600,10 +815,9 @@ def export_voicegroup_to_sf2(voicegroup: list, out_path: str, bank_name: str = "
 
 
 # =============================================================================
-# M4A POLYPHONIC WAVE SYNTHESIZER & LIVE PLAYER
+# M4A POLYPHONIC WAVE SYNTHESIZER & WAV EXPORT
 # =============================================================================
 def _tick_to_seconds_fn(tempos: list):
-    # Precompute piecewise-linear tick -> seconds map (24 PPQN)
     segments = []
     cur_t = 0
     cur_s = 0.0
@@ -650,9 +864,19 @@ def render_song_to_pcm(parsed_song: dict, voicegroup: list, sample_rate: int = 4
             continue
 
         inst = vg_map.get(n["voice"])
+        play_key = n["key"]
+
         if inst and inst.get("kind") == "drumkit":
             subs = {s["program"]: s for s in inst.get("sub_entries", [])}
             inst = subs.get(n["key"], next(iter(subs.values()), None))
+            if inst:
+                play_key = inst.get("drum_key", 60)
+        elif inst and inst.get("kind") == "keysplit":
+            kt = inst.get("key_table", b"")
+            subs = {s["program"]: s for s in inst.get("sub_entries", [])}
+            if kt and 0 <= n["key"] < len(kt):
+                sub_idx = kt[n["key"]]
+                inst = subs.get(sub_idx, inst)
 
         gain = (n["vel"] / 127.0) * (n["vol"] / 127.0) * 0.28
         pan_norm = n["pan"] / 127.0
@@ -663,7 +887,10 @@ def render_song_to_pcm(parsed_song: dict, voicegroup: list, sample_rate: int = 4
         if inst and inst.get("kind") == "pcm" and inst.get("sample"):
             smp = inst["sample"]
             pcm = smp["pcm_i8"].astype(np.float32) / 128.0
-            pitch_mult = 2.0 ** ((n["key"] - inst["base_key"]) / 12.0)
+            if inst.get("fixed_freq"):
+                pitch_mult = 1.0
+            else:
+                pitch_mult = 2.0 ** ((play_key - inst.get("base_key", 60)) / 12.0)
             step = (smp["sample_rate"] / sample_rate) * pitch_mult
             pos = t_arr * step
 
@@ -679,15 +906,13 @@ def render_song_to_pcm(parsed_song: dict, voicegroup: list, sample_rate: int = 4
             idx0 = np.clip(pos.astype(np.int32), 0, len(pcm) - 1)
             wave_mono = np.where(valid, pcm[idx0], 0.0)
         elif inst and inst.get("kind") == "noise":
-            rng = np.random.default_rng(seed=n["key"])
+            rng = np.random.default_rng(seed=play_key)
             wave_mono = rng.uniform(-0.5, 0.5, size=n_len).astype(np.float32)
         else:
-            # PSG Square fallback
-            freq = 440.0 * (2.0 ** ((n["key"] - 69) / 12.0))
+            freq = 440.0 * (2.0 ** ((play_key - 69) / 12.0))
             phase = (t_arr * freq / sample_rate) % 1.0
             wave_mono = np.where(phase < 0.5, 0.55, -0.55).astype(np.float32)
 
-        # Smooth release tail
         rel = min(int(0.06 * sample_rate), n_len)
         if rel > 0:
             wave_mono[-rel:] *= np.linspace(1.0, 0.0, rel, dtype=np.float32)
@@ -711,7 +936,7 @@ def export_song_to_wav(pcm_stereo: np.ndarray, out_path: str, sample_rate: int =
 
 
 class _SappyScanThread(QThread):
-    finished_tables = pyqtSignal(list)
+    finished_scan = pyqtSignal(list, list)
 
     def __init__(self, rom_bytes: bytes):
         super().__init__()
@@ -719,30 +944,44 @@ class _SappyScanThread(QThread):
 
     def run(self):
         tables = scan_sappy_song_tables(self.rom_bytes)
-        self.finished_tables.emit(tables)
+        samples = scan_universal_rom_samples(self.rom_bytes)
+        self.finished_scan.emit(tables, samples)
 
 
 class SappyExtractorDialog(QDialog):
-    """Sappy / M4A Soundbank & Music Extractor (Play, MIDI, WAV, SF2)."""
+    """Universal GBA Music, Soundbank & Live Hardware Audio Extractor."""
 
     def __init__(self, worker, config, parent=None):
         super().__init__(parent)
         self.worker = worker
         self.config = config
-        self.setWindowTitle("Audio Soundbank & Sappy (M4A) Music Extractor")
-        self.resize(780, 560)
+        self.setWindowTitle("GBA Music, Soundbank & Universal Audio Extractor")
+        self.resize(840, 620)
 
         self.rom_data = b""
         self.tables = []
         self.active_songs = []
+        self.universal_samples = []
         self._stop_play_evt = threading.Event()
         self._play_thread = None
+
+        self._rec_timer = QTimer(self)
+        self._rec_timer.setInterval(100)
+        self._rec_timer.timeout.connect(self._update_live_rec_status)
 
         self._init_ui()
         self.scan_rom()
 
     def _init_ui(self):
         root = QVBoxLayout(self)
+
+        self.tabs = QTabWidget()
+
+        # =====================================================================
+        # TAB 1: M4A / SAPPY SONG TABLE EXTRACTOR
+        # =====================================================================
+        tab_sappy = QWidget()
+        s_lay = QVBoxLayout(tab_sappy)
 
         top = QHBoxLayout()
         top.addWidget(QLabel("Detected Song Table:"))
@@ -763,11 +1002,11 @@ class SappyExtractorDialog(QDialog):
         btn_rescan = QPushButton("🔍 Rescan ROM")
         btn_rescan.clicked.connect(self.scan_rom)
         top.addWidget(btn_rescan)
-        root.addLayout(top)
+        s_lay.addLayout(top)
 
-        self.status_lbl = QLabel("Scanning ROM for M4A / Sappy song tables...")
+        self.status_lbl = QLabel("Scanning ROM...")
         self.status_lbl.setStyleSheet("color: #90CAF9; font-weight: bold;")
-        root.addWidget(self.status_lbl)
+        s_lay.addWidget(self.status_lbl)
 
         self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels([
@@ -775,7 +1014,7 @@ class SappyExtractorDialog(QDialog):
         ])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        root.addWidget(self.table)
+        s_lay.addWidget(self.table)
 
         ctrl = QHBoxLayout()
         ctrl.addWidget(QLabel("Loops:"))
@@ -784,7 +1023,7 @@ class SappyExtractorDialog(QDialog):
         self.loop_spin.setValue(1)
         ctrl.addWidget(self.loop_spin)
 
-        self.btn_play = QPushButton("▶ Play Sequence")
+        self.btn_play = QPushButton("▶ Play")
         self.btn_play.setStyleSheet("background-color: #2E7D32; color: white; font-weight: bold; padding: 6px 10px;")
         self.btn_play.clicked.connect(self.play_selected)
         ctrl.addWidget(self.btn_play)
@@ -809,8 +1048,121 @@ class SappyExtractorDialog(QDialog):
         self.btn_sf2.setStyleSheet("background-color: #6A1B9A; color: white; font-weight: bold; padding: 6px;")
         self.btn_sf2.clicked.connect(self.export_sf2)
         ctrl.addWidget(self.btn_sf2)
-        root.addLayout(ctrl)
 
+        self.btn_batch = QPushButton("📦 Export All (.WAV/.MID)")
+        self.btn_batch.setStyleSheet("background-color: #E65100; color: white; font-weight: bold; padding: 6px;")
+        self.btn_batch.clicked.connect(self.batch_export_songs)
+        ctrl.addWidget(self.btn_batch)
+        s_lay.addLayout(ctrl)
+
+        self.tabs.addTab(tab_sappy, "🎼 M4A / Sappy Sequences")
+
+        # =====================================================================
+        # TAB 2: UNIVERSAL ROM SOUND & SAMPLE RIPPER (ANY GBA ROM)
+        # =====================================================================
+        tab_samples = QWidget()
+        u_lay = QVBoxLayout(tab_samples)
+
+        u_info = QLabel(
+            "Scans the entire ROM for M4A WaveData headers and raw 8-bit PCM SFX/voice clips "
+            "(works even on games with non-standard or proprietary music engines)."
+        )
+        u_info.setWordWrap(True)
+        u_info.setStyleSheet("color: #B0BEC5; padding: 4px;")
+        u_lay.addWidget(u_info)
+
+        self.sample_table = QTableWidget(0, 5)
+        self.sample_table.setHorizontalHeaderLabels([
+            "Index", "Format", "ROM Offset", "Length (Samples)", "Rate (Hz)"
+        ])
+        self.sample_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.sample_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        u_lay.addWidget(self.sample_table)
+
+        u_ctrl = QHBoxLayout()
+        u_ctrl.addWidget(QLabel("Override Rate (Hz):"))
+        self.smp_rate_spin = QSpinBox()
+        self.smp_rate_spin.setRange(4000, 48000)
+        self.smp_rate_spin.setValue(0)
+        self.smp_rate_spin.setSpecialValueText("Auto")
+        u_ctrl.addWidget(self.smp_rate_spin)
+
+        self.cb_unsigned = QCheckBox("Unsigned 8-bit PCM")
+        u_ctrl.addWidget(self.cb_unsigned)
+
+        btn_play_smp = QPushButton("▶ Play Sample")
+        btn_play_smp.setStyleSheet("background-color: #2E7D32; color: white; font-weight: bold; padding: 6px 10px;")
+        btn_play_smp.clicked.connect(self.play_selected_sample)
+        u_ctrl.addWidget(btn_play_smp)
+
+        btn_stop_smp = QPushButton("⏹ Stop")
+        btn_stop_smp.clicked.connect(self.stop_playback)
+        u_ctrl.addWidget(btn_stop_smp)
+
+        u_ctrl.addStretch()
+
+        btn_exp_smp = QPushButton("Export Sample .WAV...")
+        btn_exp_smp.setStyleSheet("background-color: #00897B; color: white; font-weight: bold; padding: 6px;")
+        btn_exp_smp.clicked.connect(self.export_selected_sample)
+        u_ctrl.addWidget(btn_exp_smp)
+
+        btn_exp_all_smp = QPushButton("📦 Export All Samples...")
+        btn_exp_all_smp.setStyleSheet("background-color: #1976D2; color: white; font-weight: bold; padding: 6px;")
+        btn_exp_all_smp.clicked.connect(self.batch_export_samples)
+        u_ctrl.addWidget(btn_exp_all_smp)
+        u_lay.addLayout(u_ctrl)
+
+        self.tabs.addTab(tab_samples, "🔊 Universal ROM Samples / SFX")
+
+        # =====================================================================
+        # TAB 3: LIVE HARDWARE AUDIO RECORDER (100% OF GBA GAMES)
+        # =====================================================================
+        tab_live = QWidget()
+        l_lay = QVBoxLayout(tab_live)
+
+        l_desc = QLabel(
+            "<b>Universal Live GBA Audio Capture (Works on 100% of GBA Games &amp; Drivers)</b><br><br>"
+            "Captures raw, lossless stereo PCM directly from mGBA's emulated GBA audio hardware "
+            "(PSG channels 1–4 + DirectSound DMA A/B), bypassing mute/volume settings.<br>"
+            "<i>Tip: Open the game's Sound Test menu (or play the level whose track you want), "
+            "click Start Capture, then Save .WAV!</i>"
+        )
+        l_desc.setWordWrap(True)
+        l_desc.setStyleSheet("background: #161A22; color: #CFD8DC; padding: 12px; border-radius: 6px;")
+        l_lay.addWidget(l_desc)
+
+        self.cb_trim_silence = QCheckBox("Auto-trim leading & trailing silence on export")
+        self.cb_trim_silence.setChecked(True)
+        l_lay.addWidget(self.cb_trim_silence)
+
+        self.live_status_lbl = QLabel("Status: Idle (0.0s captured)")
+        self.live_status_lbl.setStyleSheet(
+            "font-family: monospace; font-size: 14px; font-weight: bold; "
+            "color: #80CBC4; background: #10131A; padding: 10px; border-radius: 6px;"
+        )
+        l_lay.addWidget(self.live_status_lbl)
+
+        l_btns = QHBoxLayout()
+        self.btn_live_start = QPushButton("🔴 Start Live Audio Capture")
+        self.btn_live_start.setStyleSheet("background-color: #C62828; color: white; font-weight: bold; padding: 10px;")
+        self.btn_live_start.clicked.connect(self.start_live_capture)
+        l_btns.addWidget(self.btn_live_start)
+
+        self.btn_live_stop = QPushButton("⏹ Stop & Save .WAV...")
+        self.btn_live_stop.setStyleSheet("background-color: #2E7D32; color: white; font-weight: bold; padding: 10px;")
+        self.btn_live_stop.setEnabled(False)
+        self.btn_live_stop.clicked.connect(self.stop_and_save_live_capture)
+        l_btns.addWidget(self.btn_live_stop)
+        l_lay.addLayout(l_btns)
+
+        l_lay.addStretch()
+        self.tabs.addTab(tab_live, "🎙️ Live Hardware Recorder (Any Game)")
+
+        root.addWidget(self.tabs)
+
+    # =========================================================================
+    # ROM SCANNING
+    # =========================================================================
     def scan_rom(self):
         if not self.worker or not self.worker.rom_path or not os.path.exists(self.worker.rom_path):
             self.status_lbl.setText("No ROM file loaded.")
@@ -818,27 +1170,45 @@ class SappyExtractorDialog(QDialog):
         with open(self.worker.rom_path, "rb") as f:
             self.rom_data = f.read()
 
-        self.status_lbl.setText("Scanning ROM for M4A / Sappy song tables...")
+        self.status_lbl.setText("Scanning ROM for M4A/Sappy tables and raw audio samples...")
         self._scanner = _SappyScanThread(self.rom_data)
-        self._scanner.finished_tables.connect(self._on_tables_found)
+        self._scanner.finished_scan.connect(self._on_scan_finished)
         self._scanner.start()
 
-    def _on_tables_found(self, tables: list):
+    def _on_scan_finished(self, tables: list, samples: list):
         self.tables = tables
+        self.universal_samples = samples
+
         self.table_combo.blockSignals(True)
         self.table_combo.clear()
         for t in tables:
             self.table_combo.addItem(
-                f"0x{t['table_offset']:06X} ({len(t['songs'])} entries)", t
+                f"0x{t['table_offset']:06X} ({len(t['songs'])} songs)", t
             )
         self.table_combo.blockSignals(False)
 
         if tables:
-            self.status_lbl.setText(f"Found {len(tables)} candidate Sappy/M4A song table(s).")
+            self.status_lbl.setText(
+                f"Found {len(tables)} M4A/Sappy table(s) and {len(samples)} raw audio sample(s)."
+            )
             self.on_table_changed(0)
         else:
-            self.status_lbl.setText("No standard Sappy/M4A song table detected (game may use a custom audio driver).")
+            self.status_lbl.setText(
+                f"No standard M4A song table found (custom driver). Found {len(samples)} ROM sample(s) — "
+                f"use Tab 2 (Samples) or Tab 3 (Live Hardware Recorder)!"
+            )
             self.table.setRowCount(0)
+
+        self._populate_sample_table(samples)
+
+    def _populate_sample_table(self, samples: list):
+        self.sample_table.setRowCount(len(samples))
+        for idx, s in enumerate(samples):
+            self.sample_table.setItem(idx, 0, QTableWidgetItem(f"{idx:03d}"))
+            self.sample_table.setItem(idx, 1, QTableWidgetItem(s["kind"]))
+            self.sample_table.setItem(idx, 2, QTableWidgetItem(f"0x{s['offset']:06X}"))
+            self.sample_table.setItem(idx, 3, QTableWidgetItem(f"{s['length']:,}"))
+            self.sample_table.setItem(idx, 4, QTableWidgetItem(str(s["sample_rate"])))
 
     def on_table_changed(self, idx: int):
         data = self.table_combo.itemData(idx)
@@ -857,25 +1227,7 @@ class SappyExtractorDialog(QDialog):
             QMessageBox.warning(self, "Invalid Offset", "Enter a valid hex offset (e.g. 0x454320).")
             return
 
-        songs = []
-        rom_len = len(self.rom_data)
-        for k in range(512):
-            pos = off + (k * 8)
-            if pos + 8 > rom_len:
-                break
-            hdr_ptr, grp_word = struct.unpack_from("<II", self.rom_data, pos)
-            if not _is_rom_ptr(hdr_ptr, rom_len) or (grp_word & 0xFFFF) >= 32:
-                break
-            parsed_hdr = _validate_song_header(self.rom_data, _ptr_to_off(hdr_ptr))
-            if not parsed_hdr:
-                break
-            songs.append({
-                "song_id": k,
-                "entry_offset": pos,
-                "player_group": grp_word & 0xFF,
-                **parsed_hdr,
-            })
-
+        songs = _try_parse_song_table_at(self.rom_data, off)
         if not songs:
             QMessageBox.information(self, "Not Found", "No valid M4A song table entries at that offset.")
             return
@@ -889,7 +1241,9 @@ class SappyExtractorDialog(QDialog):
             vg_ptr = s["voicegroup_ptr"]
             if vg_ptr not in vg_sample_cache:
                 vg = read_voicegroup(self.rom_data, vg_ptr)
-                vg_sample_cache[vg_ptr] = sum(1 for v in vg if v.get("kind") == "pcm")
+                vg_sample_cache[vg_ptr] = sum(
+                    1 for v in vg if v.get("kind") in ("pcm", "keysplit") and v.get("sample")
+                )
 
             self.table.setItem(row, 0, QTableWidgetItem(f"{s['song_id']:03d}"))
             self.table.setItem(row, 1, QTableWidgetItem(f"0x{s['header_offset']:06X}"))
@@ -898,6 +1252,9 @@ class SappyExtractorDialog(QDialog):
             self.table.setItem(row, 4, QTableWidgetItem(f"0x{vg_ptr:08X}"))
             self.table.setItem(row, 5, QTableWidgetItem(f"{vg_sample_cache[vg_ptr]} PCM"))
 
+    # =========================================================================
+    # TAB 1 ACTIONS (M4A / SAPPY)
+    # =========================================================================
     def _get_selected_song(self) -> dict | None:
         rows = self.table.selectionModel().selectedRows()
         if not rows:
@@ -911,33 +1268,34 @@ class SappyExtractorDialog(QDialog):
             self._play_thread.join(timeout=0.5)
         self._play_thread = None
 
-    def play_selected(self):
-        song = self._get_selected_song()
-        if not song:
-            return
+    def _play_pcm_async(self, pcm_stereo: np.ndarray, sample_rate: int):
         self.stop_playback()
-
-        parsed = parse_m4a_song(self.rom_data, song, max_loops=self.loop_spin.value())
-        vg = read_voicegroup(self.rom_data, song["voicegroup_ptr"])
-        pcm = render_song_to_pcm(parsed, vg, sample_rate=44100)
-
         self._stop_play_evt.clear()
-        self.status_lbl.setText(f"▶ Playing Song #{song['song_id']:03d} ({len(pcm)/44100:.1f}s)...")
 
         def _worker():
             try:
                 import sounddevice as sd
-                with sd.OutputStream(samplerate=44100, channels=2, dtype="int16", latency="low") as stream:
+                with sd.OutputStream(samplerate=sample_rate, channels=2, dtype="int16", latency="low") as stream:
                     chunk = 2048
-                    for idx in range(0, len(pcm), chunk):
+                    for idx in range(0, len(pcm_stereo), chunk):
                         if self._stop_play_evt.is_set():
                             break
-                        stream.write(pcm[idx:idx + chunk])
+                        stream.write(pcm_stereo[idx:idx + chunk])
             except Exception as e:
-                print(f"[Sappy Player Error] {e}")
+                print(f"[Audio Preview Error] {e}")
 
         self._play_thread = threading.Thread(target=_worker, daemon=True)
         self._play_thread.start()
+
+    def play_selected(self):
+        song = self._get_selected_song()
+        if not song:
+            return
+        parsed = parse_m4a_song(self.rom_data, song, max_loops=self.loop_spin.value())
+        vg = read_voicegroup(self.rom_data, song["voicegroup_ptr"])
+        pcm = render_song_to_pcm(parsed, vg, sample_rate=44100)
+        self.status_lbl.setText(f"▶ Playing Song #{song['song_id']:03d} ({len(pcm)/44100:.1f}s)...")
+        self._play_pcm_async(pcm, 44100)
 
     def export_midi(self):
         song = self._get_selected_song()
@@ -986,6 +1344,155 @@ class SappyExtractorDialog(QDialog):
         except Exception as e:
             QMessageBox.warning(self, "SF2 Export Error", str(e))
 
+    def batch_export_songs(self):
+        if not self.active_songs:
+            return
+        export_dir = self.config.get("paths", "exports") or "exports"
+        os.makedirs(export_dir, exist_ok=True)
+        out_dir = QFileDialog.getExistingDirectory(self, "Select Folder to Export All Songs", export_dir)
+        if not out_dir:
+            return
+
+        loops = self.loop_spin.value()
+        vg_cache = {}
+        exported = 0
+        for s in self.active_songs:
+            parsed = parse_m4a_song(self.rom_data, s, max_loops=loops)
+            if not parsed["notes"]:
+                continue
+            sid = s["song_id"]
+            export_song_to_midi(parsed, s["track_count"], os.path.join(out_dir, f"song_{sid:03d}.mid"))
+            vg_ptr = s["voicegroup_ptr"]
+            if vg_ptr not in vg_cache:
+                vg_cache[vg_ptr] = read_voicegroup(self.rom_data, vg_ptr)
+            pcm = render_song_to_pcm(parsed, vg_cache[vg_ptr], sample_rate=44100)
+            export_song_to_wav(pcm, os.path.join(out_dir, f"song_{sid:03d}.wav"), sample_rate=44100)
+            exported += 1
+
+        QMessageBox.information(self, "Batch Export Complete", f"Exported {exported} song(s) (.mid + .wav) to:\n{out_dir}")
+
+    # =========================================================================
+    # TAB 2 ACTIONS (UNIVERSAL ROM SAMPLES / SFX)
+    # =========================================================================
+    def _sample_to_stereo_pcm(self, smp: dict) -> tuple[np.ndarray, int]:
+        raw = smp["pcm"]
+        if self.cb_unsigned.isChecked():
+            u8 = raw.view(np.uint8).astype(np.int16) - 128
+            i16 = (u8 * 256).astype(np.int16)
+        else:
+            i16 = raw.astype(np.int16) * 256
+        stereo = np.column_stack((i16, i16))
+        sr = self.smp_rate_spin.value() or smp["sample_rate"]
+        return stereo, max(4000, min(48000, int(sr)))
+
+    def _get_selected_sample(self) -> dict | None:
+        rows = self.sample_table.selectionModel().selectedRows()
+        if not rows:
+            QMessageBox.information(self, "Notice", "Select a sample from the list first.")
+            return None
+        return self.universal_samples[rows[0].row()]
+
+    def play_selected_sample(self):
+        smp = self._get_selected_sample()
+        if not smp:
+            return
+        stereo, sr = self._sample_to_stereo_pcm(smp)
+        self._play_pcm_async(stereo, sr)
+
+    def export_selected_sample(self):
+        smp = self._get_selected_sample()
+        if not smp:
+            return
+        export_dir = self.config.get("paths", "exports") or "exports"
+        os.makedirs(export_dir, exist_ok=True)
+        default_path = os.path.join(export_dir, f"sample_0x{smp['offset']:06X}.wav")
+        path, _ = QFileDialog.getSaveFileName(self, "Export Sample WAV", default_path, "WAV Audio (*.wav)")
+        if not path:
+            return
+        stereo, sr = self._sample_to_stereo_pcm(smp)
+        export_song_to_wav(stereo, path, sample_rate=sr)
+        QMessageBox.information(self, "Exported", f"Saved WAV sample to:\n{path}")
+
+    def batch_export_samples(self):
+        if not self.universal_samples:
+            return
+        export_dir = self.config.get("paths", "exports") or "exports"
+        os.makedirs(export_dir, exist_ok=True)
+        out_dir = QFileDialog.getExistingDirectory(self, "Select Folder to Export All Samples", export_dir)
+        if not out_dir:
+            return
+        for idx, smp in enumerate(self.universal_samples):
+            stereo, sr = self._sample_to_stereo_pcm(smp)
+            out_path = os.path.join(out_dir, f"sfx_{idx:03d}_0x{smp['offset']:06X}.wav")
+            export_song_to_wav(stereo, out_path, sample_rate=sr)
+        QMessageBox.information(
+            self, "Batch Export Complete",
+            f"Exported {len(self.universal_samples)} WAV sample(s) to:\n{out_dir}"
+        )
+
+    # =========================================================================
+    # TAB 3 ACTIONS (LIVE HARDWARE AUDIO RECORDER)
+    # =========================================================================
+    def start_live_capture(self):
+        if not self.worker:
+            return
+        self.worker.start_audio_capture()
+        self.btn_live_start.setEnabled(False)
+        self.btn_live_stop.setEnabled(True)
+        self._rec_timer.start()
+        self._update_live_rec_status()
+
+    def _update_live_rec_status(self):
+        if not self.worker:
+            return
+        active, secs = self.worker.get_audio_capture_stats()
+        if active:
+            self.live_status_lbl.setText(f"● CAPTURING RAW GBA AUDIO: {secs:.1f}s")
+            self.live_status_lbl.setStyleSheet(
+                "font-family: monospace; font-size: 14px; font-weight: bold; "
+                "color: #FF5252; background: #1B1014; padding: 10px; border-radius: 6px;"
+            )
+
+    def stop_and_save_live_capture(self):
+        self._rec_timer.stop()
+        self.btn_live_start.setEnabled(True)
+        self.btn_live_stop.setEnabled(False)
+        self.live_status_lbl.setText("Status: Idle (0.0s captured)")
+        self.live_status_lbl.setStyleSheet(
+            "font-family: monospace; font-size: 14px; font-weight: bold; "
+            "color: #80CBC4; background: #10131A; padding: 10px; border-radius: 6px;"
+        )
+
+        if not self.worker:
+            return
+        pcm, sr = self.worker.stop_audio_capture()
+        if len(pcm) == 0:
+            QMessageBox.information(self, "Empty Capture", "No audio frames were captured (make sure emulation is unpaused).")
+            return
+
+        if self.cb_trim_silence.isChecked():
+            mag = np.max(np.abs(pcm), axis=1)
+            nz = np.where(mag > 24)[0]
+            if len(nz) > 0:
+                pcm = pcm[nz[0]:nz[-1] + 1]
+
+        export_dir = self.config.get("paths", "exports") or "exports"
+        os.makedirs(export_dir, exist_ok=True)
+        rom_base = os.path.splitext(os.path.basename(self.worker.rom_path or "gba"))[0]
+        default_path = os.path.join(export_dir, f"{rom_base}_capture.wav")
+        path, _ = QFileDialog.getSaveFileName(self, "Save Captured GBA Audio", default_path, "WAV Audio (*.wav)")
+        if path:
+            export_song_to_wav(pcm, path, sample_rate=sr)
+            QMessageBox.information(
+                self, "Saved",
+                f"Saved {len(pcm) / sr:.2f}s of lossless GBA audio ({sr} Hz) to:\n{path}"
+            )
+
     def closeEvent(self, event):
+        self._rec_timer.stop()
+        if self.worker:
+            active, _ = self.worker.get_audio_capture_stats()
+            if active:
+                self.worker.stop_audio_capture()
         self.stop_playback()
         event.accept()

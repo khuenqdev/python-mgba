@@ -3,6 +3,7 @@ import os
 import time
 import zlib
 import ctypes
+import threading
 from collections import deque
 import numpy as np
 
@@ -115,6 +116,13 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
         self.watch_engine = WatchTableAndWatchpointEngine(self)
         self.dsp = AudioDSP(self.config)
 
+        # Raw Hardware Audio Capture Tap (for universal sound/music recording)
+        self.audio_sample_rate = 44100
+        self._audio_capture_lock = threading.Lock()
+        self._audio_capturing = False
+        self._audio_capture_chunks = []
+        self._audio_capture_frames = 0
+
         self.recorder = SessionRecorder()
         self.replay_frame_counter = 0
 
@@ -156,6 +164,34 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
         self.game_title = "Unknown"
         self.rumble_type = "None"
         self._parse_rom_header()
+
+    # =========================================================================
+    # RAW HARDWARE AUDIO CAPTURE TAP
+    # =========================================================================
+    def start_audio_capture(self):
+        with self._audio_capture_lock:
+            self._audio_capture_chunks = []
+            self._audio_capture_frames = 0
+            self._audio_capturing = True
+
+    def stop_audio_capture(self) -> tuple[np.ndarray, int]:
+        with self._audio_capture_lock:
+            self._audio_capturing = False
+            chunks = self._audio_capture_chunks
+            self._audio_capture_chunks = []
+            self._audio_capture_frames = 0
+            sr = int(self.audio_sample_rate or 44100)
+
+        if not chunks:
+            return np.empty((0, 2), dtype=np.int16), sr
+        return np.concatenate(chunks, axis=0), sr
+
+    def get_audio_capture_stats(self) -> tuple[bool, float]:
+        with self._audio_capture_lock:
+            active = self._audio_capturing
+            sr = max(1, int(self.audio_sample_rate or 44100))
+            secs = float(self._audio_capture_frames) / float(sr)
+        return active, secs
 
     def is_ra_hardcore_active(self) -> bool:
         return bool(self.ra_manager and self.ra_manager.active and self.ra_manager.hardcore)
@@ -453,6 +489,7 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
         try:
             if hasattr(self.emu, "av_info"):
                 sample_rate = int(self.emu.av_info.sample_rate)
+            self.audio_sample_rate = sample_rate
             import sounddevice as sd
             stream = sd.OutputStream(samplerate=sample_rate, channels=2, dtype="int16", latency="low")
             stream.start()
@@ -728,6 +765,13 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
                     audio_arr = np.frombuffer(raw_audio, dtype=np.int16)
                     if len(audio_arr) % 2 == 0:
                         stereo_audio = audio_arr.reshape(-1, 2)
+
+                        if self._audio_capturing and not was_single_step:
+                            with self._audio_capture_lock:
+                                if self._audio_capturing and self._audio_capture_frames < (sample_rate * 600):
+                                    self._audio_capture_chunks.append(stereo_audio.copy())
+                                    self._audio_capture_frames += len(stereo_audio)
+
                         if stream and not was_single_step:
                             if is_ff:
                                 ff_audio = self.dsp.process_fast_forward(stereo_audio, ff_ratio)
