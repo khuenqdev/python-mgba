@@ -209,9 +209,24 @@ class MenuBuilderMixin:
 
         sim_rumble_menu = sensors_menu.addMenu("📳 Simulated Rumble (Non-Rumble Games)")
 
-        act_gen_profile = QAction("🛠 Generate / Edit Game SFX Rumble Profile...", self)
+        act_gen_profile = QAction("🛠 Generate / Edit Game SFX & RAM Rumble Profile...", self)
         act_gen_profile.triggered.connect(self.open_rumble_profile_dialog)
         sim_rumble_menu.addAction(act_gen_profile)
+
+        self.act_sim_use_profile = QAction("Use ROM SFX / RAM Profile (When Available)", self, checkable=True)
+        self.act_sim_use_profile.setChecked(bool(self.config.get("sensors", "sim_rumble_use_profile", True)))
+        self.act_sim_use_profile.triggered.connect(self.toggle_sim_use_profile)
+        sim_rumble_menu.addAction(self.act_sim_use_profile)
+
+        self.act_sim_disable_gfx_with_ram = QAction(
+            "Disable GFX/Audio Sim When RAM Profile Active", self, checkable=True
+        )
+        self.act_sim_disable_gfx_with_ram.setChecked(
+            bool(self.config.get("sensors", "sim_rumble_disable_gfx_with_ram", False))
+        )
+        self.act_sim_disable_gfx_with_ram.triggered.connect(self.toggle_sim_disable_gfx_with_ram)
+        sim_rumble_menu.addAction(self.act_sim_disable_gfx_with_ram)
+
         sim_rumble_menu.addSeparator()
 
         sim_mode_menu = sim_rumble_menu.addMenu("Activation Mode")

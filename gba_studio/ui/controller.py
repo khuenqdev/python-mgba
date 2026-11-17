@@ -3,14 +3,17 @@ import os
 import sys
 import time
 import ctypes
+import threading
+
 os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
-os.environ.setdefault("SDL_JOYSTICK_RAWINPUT", "0")
 os.environ.setdefault("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")
 import pygame
 
-from PyQt6.QtWidgets import (QDialog, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QLabel, QPushButton, QComboBox, QTableWidget, 
-                             QTableWidgetItem, QHeaderView, QMessageBox, QGroupBox)
+from PyQt6.QtWidgets import (
+    QDialog, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QPushButton, QComboBox, QTableWidget,
+    QTableWidgetItem, QHeaderView, QMessageBox, QGroupBox
+)
 from PyQt6.QtCore import Qt, QTimer, QObject, pyqtSlot
 
 GBA_BUTTON_NAMES = [
@@ -72,7 +75,7 @@ class XINPUT_VIBRATION(ctypes.Structure):
 
 
 class ControllerManager(QObject):
-    """Thread-safe QObject gamepad input & haptic motor manager running on the GUI thread."""
+    """Thread-safe gamepad input & dedicated-thread XInput 1.4 / SDL2-WGI haptic motor manager."""
 
     def __init__(self, config, parent=None):
         super().__init__(parent)
@@ -86,12 +89,18 @@ class ControllerManager(QObject):
         self._last_rumble_log_ts = 0.0
         self._last_warn_log_ts = 0.0
 
+        self._hw_cond = threading.Condition()
+        self._xinput_io_lock = threading.Lock()
+        self._hw_stop = False
         self._cur_low = 0.0
         self._cur_high = 0.0
         self._rumble_until = 0.0
+        self._manual_test_until = 0.0
+        self._pulse_gen = 0
+        self._xinput_motor_on = False
         self._using_sdl_active = False
 
-        # Test trace diagnostics
+        # Diagnostic trace
         self._trace_active = False
         self._trace_start_ts = 0.0
         self._trace_ticks = 0
@@ -99,18 +108,12 @@ class ControllerManager(QObject):
         self._init_subsystem()
         self._init_xinput()
 
-        self._rumble_stop_timer = QTimer(self)
-        self._rumble_stop_timer.setSingleShot(True)
-        self._rumble_stop_timer.timeout.connect(self.stop_rumble)
-
-        self._xinput_keepalive_timer = QTimer(self)
-        self._xinput_keepalive_timer.setInterval(16)
-        self._xinput_keepalive_timer.timeout.connect(self._tick_xinput_keepalive)
+        self._hw_thread = threading.Thread(target=self._xinput_worker_loop, daemon=True)
+        self._hw_thread.start()
 
     def _init_xinput(self):
         if sys.platform.startswith("win"):
-            # Prefer xinput9_1_0.dll / xinput1_3.dll over xinput1_4.dll to avoid Win10/11 focus muting
-            for name in ["xinput9_1_0.dll", "xinput1_3.dll", "xinput1_4.dll"]:
+            for name in ["xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"]:
                 try:
                     dll = ctypes.windll.LoadLibrary(name)
                     if hasattr(dll, "XInputSetState"):
@@ -135,6 +138,9 @@ class ControllerManager(QObject):
                 pygame.joystick.init()
             self.initialized = True
             devs = self.rescan_devices()
+            if not devs and sys.platform.startswith("win") and os.environ.get("SDL_JOYSTICK_RAWINPUT") != "0":
+                os.environ["SDL_JOYSTICK_RAWINPUT"] = "0"
+                devs = self.rescan_devices()
             print(f"[CONTROLLER DEBUG] Initialized SDL subsystem. Found {len(devs)} device(s): {devs}")
         except Exception as e:
             print(f"[CONTROLLER DEBUG] Initialization error: {e}")
@@ -145,8 +151,9 @@ class ControllerManager(QObject):
         pygame.joystick.quit()
         pygame.joystick.init()
         self.joysticks.clear()
-        self._active_xinput_slots = []
-        self._last_slot_probe_ts = 0.0
+        with self._xinput_io_lock:
+            self._active_xinput_slots = []
+            self._last_slot_probe_ts = 0.0
 
         count = pygame.joystick.get_count()
         devices = []
@@ -175,38 +182,72 @@ class ControllerManager(QObject):
         if not self._xinput_dll:
             return []
 
-        now = time.monotonic()
-        if not self._active_xinput_slots or (now - self._last_slot_probe_ts) >= 5.0:
-            slots_to_try = [0, 1, 2, 3]
-            self._last_slot_probe_ts = now
-        else:
-            slots_to_try = list(self._active_xinput_slots)
+        with self._xinput_io_lock:
+            now = time.monotonic()
+            if not self._active_xinput_slots or (now - self._last_slot_probe_ts) >= 5.0:
+                slots_to_try = [0, 1, 2, 3]
+                self._last_slot_probe_ts = now
+            else:
+                slots_to_try = list(self._active_xinput_slots)
 
-        vib = XINPUT_VIBRATION()
-        vib.wLeftMotorSpeed = int(low * 65535)
-        vib.wRightMotorSpeed = int(high * 65535)
-        xinput_slots_success = []
-        for user_idx in slots_to_try:
-            try:
-                if self._xinput_dll.XInputSetState(user_idx, ctypes.byref(vib)) == 0:
-                    xinput_slots_success.append(user_idx)
-            except Exception:
-                pass
+            vib = XINPUT_VIBRATION()
+            vib.wLeftMotorSpeed = int(max(0.0, min(1.0, low)) * 65535)
+            vib.wRightMotorSpeed = int(max(0.0, min(1.0, high)) * 65535)
 
-        self._active_xinput_slots = xinput_slots_success
-        return xinput_slots_success
+            xinput_slots_success = []
+            for user_idx in slots_to_try:
+                try:
+                    if self._xinput_dll.XInputSetState(user_idx, ctypes.byref(vib)) == 0:
+                        xinput_slots_success.append(user_idx)
+                except Exception:
+                    pass
 
-    def _tick_xinput_keepalive(self):
-        if time.monotonic() >= self._rumble_until:
-            self._xinput_keepalive_timer.stop()
-            return
-        self._trace_ticks += 1
-        self._send_xinput_rumble(self._cur_low, self._cur_high)
+            self._active_xinput_slots = xinput_slots_success
+            return xinput_slots_success
+
+    def _xinput_worker_loop(self):
+        """Dedicated ~70 Hz hardware keep-alive thread immune to Qt VSync / paintGL blocking."""
+        while True:
+            with self._hw_cond:
+                if self._hw_stop:
+                    break
+
+                if not self._xinput_motor_on:
+                    self._hw_cond.wait(timeout=0.25)
+                    continue
+
+                now = time.monotonic()
+                until = self._rumble_until
+                low = self._cur_low
+                high = self._cur_high
+                gen = self._pulse_gen
+
+            if now < until:
+                self._send_xinput_rumble(low, high)
+                with self._hw_cond:
+                    if self._trace_active:
+                        self._trace_ticks += 1
+                    self._hw_cond.wait(timeout=0.014)
+            else:
+                should_stop = False
+                with self._hw_cond:
+                    if self._xinput_motor_on and self._pulse_gen == gen and time.monotonic() >= self._rumble_until:
+                        self._xinput_motor_on = False
+                        self._cur_low = 0.0
+                        self._cur_high = 0.0
+                        should_stop = True
+                        if self._trace_active:
+                            elapsed_ms = int((time.monotonic() - self._trace_start_ts) * 1000)
+                            print(f"[RUMBLE TRACE] Stopped after {elapsed_ms}ms ({self._trace_ticks} keep-alive ticks)")
+                            self._trace_active = False
+
+                if should_stop:
+                    self._send_xinput_rumble(0.0, 0.0)
 
     def get_effective_driver(self, driver_override: str = None) -> str:
-        driver = str(driver_override or self.config.get("sensors", "rumble_driver", "xinput") or "xinput").lower()
+        driver = str(driver_override or self.config.get("sensors", "rumble_driver", "auto") or "auto").lower()
         if driver == "auto":
-            return "xinput" if self._xinput_dll is not None else "sdl2"
+            return "both" if self._xinput_dll is not None else "sdl2"
         return driver
 
     @pyqtSlot(float, float, int)
@@ -218,66 +259,88 @@ class ControllerManager(QObject):
         driver_override: str = None,
         force_log: bool = False,
     ):
-        """Sends vibration signals safely on the Main GUI thread (60 Hz XInput keep-alive on Windows)."""
+        """Sends vibration signals via XInput 1.4 70Hz keep-alive and/or SDL2/WGI."""
         if not self.config.get("sensors", "rumble_enabled"):
             if force_log:
                 print("[RUMBLE WARNING] Controller Motor Rumble is disabled in Sensors & Rumble menu.")
             return False
 
+        now = time.monotonic()
         if low_freq <= 0.0 and high_freq <= 0.0:
+            if now < self._manual_test_until:
+                return True
             self.stop_rumble()
             return True
 
         strength = float(self.config.get("sensors", "rumble_strength") or 1.0)
         low = max(0.0, min(1.0, low_freq * strength))
         high = max(0.0, min(1.0, high_freq * strength))
-        dur = max(120, int(duration_ms))
+        dur = max(140, int(duration_ms))
 
-        now = time.monotonic()
         new_until = now + (dur / 1000.0)
-        if driver_override is None and not force_log and now < self._rumble_until:
-            if (low + high) < (self._cur_low + self._cur_high) and new_until < self._rumble_until:
-                return True
-            new_until = max(new_until, self._rumble_until)
-            dur = max(dur, int((new_until - now) * 1000.0))
+        if force_log or driver_override is not None:
+            self._manual_test_until = new_until
+
+        with self._hw_cond:
+            if driver_override is None and not force_log and now < self._rumble_until:
+                if (low + high) < (self._cur_low + self._cur_high) and new_until < self._rumble_until:
+                    return True
+                new_until = max(new_until, self._rumble_until)
+                dur = max(dur, int((new_until - now) * 1000.0))
 
         driver = self.get_effective_driver(driver_override)
 
         if force_log:
-            self._trace_active = True
-            self._trace_start_ts = now
-            self._trace_ticks = 0
+            with self._hw_cond:
+                self._trace_active = True
+                self._trace_start_ts = now
+                self._trace_ticks = 0
 
         sdl_vibrated = []
         xinput_slots_success = []
 
         if driver == "sdl2":
-            self._xinput_keepalive_timer.stop()
+            with self._hw_cond:
+                self._xinput_motor_on = False
+                self._pulse_gen += 1
             self._using_sdl_active = True
             sdl_vibrated = self._send_sdl_rumble(low, high, dur)
             if sdl_vibrated:
-                self._cur_low = low
-                self._cur_high = high
-                self._rumble_until = new_until
-                self._rumble_stop_timer.start(dur)
-        else:
-            self._using_sdl_active = False
-            xinput_slots_success = self._send_xinput_rumble(low, high)
-            if xinput_slots_success:
-                self._cur_low = low
-                self._cur_high = high
-                self._rumble_until = new_until
-                if not self._xinput_keepalive_timer.isActive():
-                    self._xinput_keepalive_timer.start()
-                self._rumble_stop_timer.start(dur)
-            else:
-                sdl_vibrated = self._send_sdl_rumble(low, high, dur)
-                if sdl_vibrated:
-                    self._using_sdl_active = True
+                with self._hw_cond:
                     self._cur_low = low
                     self._cur_high = high
                     self._rumble_until = new_until
-                    self._rumble_stop_timer.start(dur)
+        elif driver == "xinput":
+            self._using_sdl_active = False
+            with self._hw_cond:
+                self._cur_low = low
+                self._cur_high = high
+                self._rumble_until = new_until
+                self._pulse_gen += 1
+                self._xinput_motor_on = True
+                self._hw_cond.notify_all()
+            xinput_slots_success = self._send_xinput_rumble(low, high)
+            if not xinput_slots_success:
+                with self._hw_cond:
+                    self._xinput_motor_on = False
+                sdl_vibrated = self._send_sdl_rumble(low, high, dur)
+                if sdl_vibrated:
+                    self._using_sdl_active = True
+        else:
+            sdl_vibrated = self._send_sdl_rumble(low, high, dur)
+            self._using_sdl_active = bool(sdl_vibrated)
+
+            with self._hw_cond:
+                self._cur_low = low
+                self._cur_high = high
+                self._rumble_until = new_until
+                self._pulse_gen += 1
+                self._xinput_motor_on = True
+                self._hw_cond.notify_all()
+            xinput_slots_success = self._send_xinput_rumble(low, high)
+            if not xinput_slots_success:
+                with self._hw_cond:
+                    self._xinput_motor_on = False
 
         vibrated = bool(sdl_vibrated or xinput_slots_success)
         if vibrated:
@@ -285,7 +348,7 @@ class ControllerManager(QObject):
                 self._last_rumble_log_ts = now
                 parts = []
                 if xinput_slots_success:
-                    parts.append(f"{self._xinput_dll_name} 60Hz slot(s) {xinput_slots_success}")
+                    parts.append(f"{self._xinput_dll_name} 70Hz thread slot(s) {xinput_slots_success}")
                 if sdl_vibrated:
                     parts.append(f"SDL2 {sdl_vibrated}")
                 print(f"[RUMBLE HARDWARE] Motor active -> Low: {low:.2f}, High: {high:.2f}, Dur: {dur}ms on {', '.join(parts)}")
@@ -297,25 +360,21 @@ class ControllerManager(QObject):
         return vibrated
 
     def stop_rumble(self):
-        if self._trace_active:
-            elapsed_ms = int((time.monotonic() - self._trace_start_ts) * 1000)
-            print(f"[RUMBLE TRACE] Stopped after {elapsed_ms}ms ({self._trace_ticks} keep-alive ticks)")
-            self._trace_active = False
-
-        self._xinput_keepalive_timer.stop()
-        self._rumble_stop_timer.stop()
-        self._rumble_until = 0.0
-        self._cur_low = 0.0
-        self._cur_high = 0.0
+        self._manual_test_until = 0.0
+        with self._hw_cond:
+            if self._trace_active:
+                elapsed_ms = int((time.monotonic() - self._trace_start_ts) * 1000)
+                print(f"[RUMBLE TRACE] Stopped after {elapsed_ms}ms ({self._trace_ticks} keep-alive ticks)")
+                self._trace_active = False
+            self._xinput_motor_on = False
+            self._rumble_until = 0.0
+            self._cur_low = 0.0
+            self._cur_high = 0.0
+            self._pulse_gen += 1
+            self._hw_cond.notify_all()
 
         if self._xinput_dll:
-            vib = XINPUT_VIBRATION(0, 0)
-            slots = self._active_xinput_slots if self._active_xinput_slots else [0]
-            for user_idx in slots:
-                try:
-                    self._xinput_dll.XInputSetState(user_idx, ctypes.byref(vib))
-                except Exception:
-                    pass
+            self._send_xinput_rumble(0.0, 0.0)
 
         if self._using_sdl_active:
             self._using_sdl_active = False
@@ -325,6 +384,14 @@ class ControllerManager(QObject):
                         js.stop_rumble()
                     except Exception:
                         pass
+
+    def shutdown(self):
+        self.stop_rumble()
+        with self._hw_cond:
+            self._hw_stop = True
+            self._hw_cond.notify_all()
+        if hasattr(self, "_hw_thread") and self._hw_thread.is_alive():
+            self._hw_thread.join(timeout=0.5)
 
     def _read_input_element(self, js, mapped_input, deadzone):
         if not mapped_input:
@@ -367,6 +434,7 @@ class ControllerManager(QObject):
         if not self.initialized or not worker:
             return
         pygame.event.pump()
+        pygame.event.clear()
 
         gamepad_cfg = self.config.get("input", "gamepad")
         if not gamepad_cfg or not gamepad_cfg.get("enabled", True):
@@ -529,10 +597,10 @@ class ControllerConfigDialog(QDialog):
 
         vib_layout.addWidget(QLabel("Driver:"))
         self.driver_combo = QComboBox()
-        self.driver_combo.addItem("Windows XInput (60Hz Keep-Alive)", "xinput")
-        self.driver_combo.addItem("SDL2 / WGI (Pygame Native)", "sdl2")
-        self.driver_combo.addItem("Auto (XInput on Win, else SDL2)", "auto")
-        cur_drv = str(self.config.get("sensors", "rumble_driver", "xinput") or "xinput").lower()
+        self.driver_combo.addItem("Auto (XInput 1.4 + SDL2/WGI)", "auto")
+        self.driver_combo.addItem("Windows XInput Only (70Hz Thread)", "xinput")
+        self.driver_combo.addItem("SDL2 / WGI Only (Pygame Native)", "sdl2")
+        cur_drv = str(self.config.get("sensors", "rumble_driver", "auto") or "auto").lower()
         d_idx = self.driver_combo.findData(cur_drv)
         if d_idx >= 0:
             self.driver_combo.setCurrentIndex(d_idx)
@@ -543,7 +611,7 @@ class ControllerConfigDialog(QDialog):
         btn_test_xinput.clicked.connect(lambda: self.test_rumble("xinput"))
         vib_layout.addWidget(btn_test_xinput)
 
-        btn_test_sdl = QPushButton("⚡ Test SDL2 (500ms)")
+        btn_test_sdl = QPushButton("⚡ Test SDL2/WGI (500ms)")
         btn_test_sdl.setStyleSheet("background-color: #1976D2; color: white; font-weight: bold; padding: 4px 8px;")
         btn_test_sdl.clicked.connect(lambda: self.test_rumble("sdl2"))
         vib_layout.addWidget(btn_test_sdl)

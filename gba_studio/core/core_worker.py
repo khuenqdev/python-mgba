@@ -287,6 +287,12 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
         if not self.config.get("sensors", "rumble_enabled"):
             return True
 
+        if self.rumble_sim.should_run(self.rumble_type) and strength == 0:
+            self._active_rumble_low = 0.0
+            self._active_rumble_high = 0.0
+            return True
+
+        prev_active = (self._active_rumble_low > 0.0 or self._active_rumble_high > 0.0)
         norm_val = min(1.0, max(0.0, float(strength) / 65535.0))
 
         if effect == 0:
@@ -294,8 +300,10 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
         else:
             self._active_rumble_high = norm_val
 
-        if self._active_rumble_low <= 0.0 and self._active_rumble_high <= 0.0:
-            self.rumble_triggered.emit(0.0, 0.0, 0)
+        now_active = (self._active_rumble_low > 0.0 or self._active_rumble_high > 0.0)
+        if not now_active:
+            if prev_active:
+                self.rumble_triggered.emit(0.0, 0.0, 0)
         else:
             self.rumble_triggered.emit(self._active_rumble_low, self._active_rumble_high, 120)
 
@@ -381,6 +389,17 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
             if mem and hasattr(mem, "data"):
                 arr = np.frombuffer(mem.data, dtype="<u4")
                 return arr.copy()
+        except Exception:
+            pass
+        return None
+
+    def _read_pram_u16_unlocked(self) -> np.ndarray | None:
+        if not self.emu:
+            return None
+        try:
+            mem = self.emu.get_memory(4)
+            if mem and hasattr(mem, "data") and len(mem.data) >= 1024:
+                return np.frombuffer(mem.data[:1024], dtype="<u2").copy()
         except Exception:
             pass
         return None
@@ -502,11 +521,13 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
             print(f"[ROM IDENTIFICATION] Title: {self.game_title} | Code: {self.game_code}")
             print(f"[ROM IDENTIFICATION] Hardware Profile: {self.rumble_type}")
             if self.rumble_sim.should_run(self.rumble_type):
-                sfx_cnt = len(self.rumble_sim.profile_store._active_entries)
+                sfx_cnt = len(self.rumble_sim.profile_store._active_entries) if self.rumble_sim.use_rom_profile else 0
+                evt_cnt = len(self.rumble_sim.profile_store._active_ram_events) if self.rumble_sim.use_rom_profile else 0
                 print(
                     f"[RUMBLE CONFIG] Simulated Rumble Active "
                     f"(Mode: {self.rumble_sim.mode}, Profile: {self.rumble_sim.profile}, "
-                    f"ROM SFX Rules: {sfx_cnt})"
+                    f"SFX Rules: {sfx_cnt}, RAM Events: {evt_cnt}"
+                    f"{' [Profile Disabled]' if not self.rumble_sim.use_rom_profile else ''})"
                 )
             else:
                 print("[RUMBLE CONFIG] Native Libretro Emulation Active")
@@ -609,6 +630,7 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
             wp_hit_info = None
             ra_ewram, ra_iwram = b"", b""
             sysram_u32 = None
+            pram_u16 = None
 
             with QMutexLocker(self.mutex):
                 if self.reset_requested and hasattr(self.emu, "reset"):
@@ -730,8 +752,10 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
                 if self.ra_manager and self.ra_manager.active:
                     ra_ewram, ra_iwram = self._read_ra_ram_unlocked()
 
-                if not self.fast_forward and not was_single_step and self.rumble_sim.has_rom_profile() and self.rumble_sim.should_run(self.rumble_type):
-                    sysram_u32 = self._read_sysram_u32_unlocked()
+                if not self.fast_forward and not was_single_step and self.rumble_sim.should_run(self.rumble_type):
+                    pram_u16 = self._read_pram_u16_unlocked()
+                    if self.rumble_sim.use_rom_profile and self.rumble_sim.has_rom_profile():
+                        sysram_u32 = self._read_sysram_u32_unlocked()
 
                 wp_hit_info = self.watch_engine.check_watchpoints_unlocked(current_frame_num)
                 if wp_hit_info is not None:
@@ -845,6 +869,7 @@ class EmulatorWorker(QThread, SensorControlsMixin, StateStorageMixin, ReplayCont
                         btn_mask,
                         current_frame_num,
                         system_ram_u32=sysram_u32,
+                        pram_u16=pram_u16,
                     )
                     if sim_out is not None:
                         self.rumble_triggered.emit(*sim_out)

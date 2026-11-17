@@ -79,6 +79,12 @@ class SettingsActionsMixin:
 
         if hasattr(self, "act_rumble"):
             self.act_rumble.setChecked(bool(self.config.get("sensors", "rumble_enabled", True)))
+        if hasattr(self, "act_sim_use_profile"):
+            self.act_sim_use_profile.setChecked(bool(self.config.get("sensors", "sim_rumble_use_profile", True)))
+        if hasattr(self, "act_sim_disable_gfx_with_ram"):
+            self.act_sim_disable_gfx_with_ram.setChecked(
+                bool(self.config.get("sensors", "sim_rumble_disable_gfx_with_ram", False))
+            )
         if hasattr(self, "sim_rumble_mode_actions"):
             sim_mode = str(self.config.get("sensors", "sim_rumble_mode", "auto") or "auto").lower()
             if sim_mode in self.sim_rumble_mode_actions:
@@ -118,6 +124,24 @@ class SettingsActionsMixin:
         from ..tools.rumble_profile_dialog import RumbleProfileDialog
         self.active_tool_window = RumbleProfileDialog(self, self)
         self.active_tool_window.show()
+
+    def toggle_sim_use_profile(self):
+        val = self.act_sim_use_profile.isChecked()
+        self.config.set("sensors", "sim_rumble_use_profile", val)
+        if self.worker:
+            self.worker.update_rumble_sim_settings()
+        self.video_widget.show_osd(
+            f"📳 ROM SFX / RAM Profile: {'ON' if val else 'OFF (Audio+Video Sim Only)'}"
+        )
+
+    def toggle_sim_disable_gfx_with_ram(self):
+        val = self.act_sim_disable_gfx_with_ram.isChecked()
+        self.config.set("sensors", "sim_rumble_disable_gfx_with_ram", val)
+        if self.worker:
+            self.worker.update_rumble_sim_settings()
+        self.video_widget.show_osd(
+            f"📳 GFX/Audio Sim w/ RAM Profile: {'DISABLED (RAM-Only)' if val else 'ENABLED (Hybrid)'}"
+        )
 
     def set_sim_rumble_mode(self, mode: str):
         self.config.set("sensors", "sim_rumble_mode", mode)

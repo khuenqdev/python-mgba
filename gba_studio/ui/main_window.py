@@ -626,6 +626,8 @@ class MainWindow(QMainWindow, MenuBuilderMixin, ApplicationActionsMixin, Setting
 
         if hasattr(self, "gamepad_timer"):
             self.gamepad_timer.stop()
+        if hasattr(self, "controller_manager"):
+            self.controller_manager.shutdown()
 
         if hasattr(self, "auto_trans_timer"):
             self.auto_trans_timer.stop()
