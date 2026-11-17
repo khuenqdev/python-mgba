@@ -6,13 +6,31 @@ from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
     QTableWidget, QTableWidgetItem, QHeaderView, QTabWidget, QWidget,
     QMessageBox, QFileDialog, QComboBox, QCheckBox, QDialogButtonBox,
-    QGroupBox, QSpinBox
+    QGroupBox, QSpinBox, QProgressBar, QSlider
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
 from .engines import LANG_NAMES
 from .glossary import GlossaryAndCacheStore
 from .auto_trigger import AutoTranslateDetector
+from .neural_inpaint import is_migan_available, download_migan_model
+
+
+class _MiganDownloadThread(QThread):
+    progress = pyqtSignal(int)
+    finished_ok = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def run(self):
+        try:
+            def _on_prog(done, total):
+                pct = max(0, min(100, int((done * 100) / max(1, total))))
+                self.progress.emit(pct)
+
+            path = download_migan_model(progress_cb=_on_prog)
+            self.finished_ok.emit(path)
+        except Exception as e:
+            self.failed.emit(str(e))
 
 
 class TranslationGlossaryDialog(QDialog):
@@ -47,7 +65,6 @@ class TranslationGlossaryDialog(QDialog):
 
         self.tabs = QTabWidget()
 
-        # TAB 1: PER-GAME GLOSSARY
         tab_glossary = QWidget()
         gl_layout = QVBoxLayout(tab_glossary)
 
@@ -91,7 +108,6 @@ class TranslationGlossaryDialog(QDialog):
         gl_layout.addLayout(gl_btns)
         self.tabs.addTab(tab_glossary, "📖 Per-Game Glossary")
 
-        # TAB 2: TRANSLATION CACHE
         tab_cache = QWidget()
         ca_layout = QVBoxLayout(tab_cache)
 
@@ -168,15 +184,12 @@ class TranslationGlossaryDialog(QDialog):
         tgt_item = self.gl_table.item(row, 1)
         if not src_item or not tgt_item:
             return
-
         old_src = src_item.data(Qt.ItemDataRole.UserRole)
         new_src = src_item.text().strip()
         new_tgt = tgt_item.text().strip()
-
         if not new_src or not new_tgt:
             self.refresh_glossary_table()
             return
-
         if old_src and old_src != new_src:
             self.store.delete_term(old_src, save_now=False)
         self.store.set_term(new_src, new_tgt, save_now=True)
@@ -349,15 +362,16 @@ class TranslationGlossaryDialog(QDialog):
 
 
 class AITranslationConfigDialog(QDialog):
-    """Configures AI translation languages, Groq API Key, in-place inpainting, and auto-trigger."""
+    """Configures AI translation languages, Groq API Key, MI-GAN neural inpainting, font scale & auto-trigger."""
 
     def __init__(self, config, parent=None, rom_path: str = "", game_code: str = ""):
         super().__init__(parent)
         self.config = config
         self.rom_path = rom_path
         self.game_code = game_code
+        self._dl_thread = None
         self.setWindowTitle("Configure AI Translation")
-        self.resize(470, 470)
+        self.resize(510, 580)
         self._init_ui()
 
     def _init_ui(self):
@@ -407,12 +421,61 @@ class AITranslationConfigDialog(QDialog):
         cred_lay.addWidget(self.btn_show_key)
         layout.addWidget(cred_grp)
 
-        disp_grp = QGroupBox("Display & Visual Replacement")
+        disp_grp = QGroupBox("Display & Neural Visual Inpainting")
         disp_lay = QVBoxLayout(disp_grp)
 
         self.inpaint_cb = QCheckBox("In-Place Visual Inpainting (Replace Text Directly in Textbox)")
         self.inpaint_cb.setChecked(bool(self.config.get("ai_translation", "inpaint_enabled", True)))
         disp_lay.addWidget(self.inpaint_cb)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Inpainting Engine:"))
+        self.inpaint_mode_combo = QComboBox()
+        self.inpaint_mode_combo.addItem("Auto (MI-GAN ONNX if available, else Fast)", "auto")
+        self.inpaint_mode_combo.addItem("MI-GAN Neural ONNX (Best for Baked Art & Textboxes)", "onnx")
+        self.inpaint_mode_combo.addItem("Fast Algorithmic (Zero-Model Stroke/Gradient)", "fast")
+        cur_mode = str(self.config.get("ai_translation", "inpaint_mode", "auto") or "auto")
+        m_idx = self.inpaint_mode_combo.findData(cur_mode)
+        if m_idx >= 0:
+            self.inpaint_mode_combo.setCurrentIndex(m_idx)
+        mode_row.addWidget(self.inpaint_mode_combo, 1)
+        disp_lay.addLayout(mode_row)
+
+        font_row = QHBoxLayout()
+        font_row.addWidget(QLabel("Inpainted Text Size:"))
+        self.font_slider = QSlider(Qt.Orientation.Horizontal)
+        self.font_slider.setRange(60, 160)
+        self.font_slider.setSingleStep(5)
+        self.font_spin = QSpinBox()
+        self.font_spin.setRange(60, 160)
+        self.font_spin.setSingleStep(5)
+        self.font_spin.setSuffix("%")
+
+        cur_fscale = int(round(float(self.config.get("ai_translation", "inpaint_font_scale", 1.0) or 1.0) * 100))
+        cur_fscale = max(60, min(160, cur_fscale))
+        self.font_slider.setValue(cur_fscale)
+        self.font_spin.setValue(cur_fscale)
+        self.font_slider.valueChanged.connect(self.font_spin.setValue)
+        self.font_spin.valueChanged.connect(self.font_slider.setValue)
+
+        font_row.addWidget(self.font_slider, 1)
+        font_row.addWidget(self.font_spin)
+        disp_lay.addLayout(font_row)
+
+        migan_row = QHBoxLayout()
+        self.migan_status_lbl = QLabel()
+        self.btn_dl_migan = QPushButton("⬇ Download MI-GAN ONNX (28 MB)")
+        self.btn_dl_migan.setStyleSheet("background-color: #1976D2; color: white; font-weight: bold; padding: 4px 8px;")
+        self.btn_dl_migan.clicked.connect(self._start_migan_download)
+        migan_row.addWidget(self.migan_status_lbl, 1)
+        migan_row.addWidget(self.btn_dl_migan)
+        disp_lay.addLayout(migan_row)
+
+        self.migan_prog = QProgressBar()
+        self.migan_prog.setRange(0, 100)
+        self.migan_prog.setVisible(False)
+        disp_lay.addWidget(self.migan_prog)
+        self._refresh_migan_status()
 
         self.inpaint_clear_cb = QCheckBox("Auto-Clear Inpainting When Textbox Closes")
         self.inpaint_clear_cb.setChecked(bool(self.config.get("ai_translation", "inpaint_auto_clear", True)))
@@ -473,6 +536,43 @@ class AITranslationConfigDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+    def _refresh_migan_status(self):
+        if is_migan_available():
+            self.migan_status_lbl.setText("✅ MI-GAN ONNX Ready (models/migan_pipeline_v2.onnx)")
+            self.migan_status_lbl.setStyleSheet("color: #81C784; font-size: 11px;")
+            self.btn_dl_migan.setText("Re-download MI-GAN")
+        else:
+            self.migan_status_lbl.setText("⚠ MI-GAN not downloaded (using Fast fallback)")
+            self.migan_status_lbl.setStyleSheet("color: #FFB74D; font-size: 11px;")
+            self.btn_dl_migan.setText("⬇ Download MI-GAN ONNX (28 MB)")
+
+    def _start_migan_download(self):
+        if self._dl_thread and self._dl_thread.isRunning():
+            return
+        self.btn_dl_migan.setEnabled(False)
+        self.migan_prog.setValue(0)
+        self.migan_prog.setVisible(True)
+        self.migan_status_lbl.setText("Downloading MI-GAN ONNX...")
+        self.migan_status_lbl.setStyleSheet("color: #4DD0E1; font-size: 11px;")
+
+        self._dl_thread = _MiganDownloadThread(self)
+        self._dl_thread.progress.connect(self.migan_prog.setValue)
+        self._dl_thread.finished_ok.connect(self._on_migan_downloaded)
+        self._dl_thread.failed.connect(self._on_migan_failed)
+        self._dl_thread.start()
+
+    def _on_migan_downloaded(self, path: str):
+        self.migan_prog.setVisible(False)
+        self.btn_dl_migan.setEnabled(True)
+        self._refresh_migan_status()
+        QMessageBox.information(self, "Download Complete", f"MI-GAN ONNX model saved to:\n{path}")
+
+    def _on_migan_failed(self, err: str):
+        self.migan_prog.setVisible(False)
+        self.btn_dl_migan.setEnabled(True)
+        self._refresh_migan_status()
+        QMessageBox.warning(self, "Download Error", f"Failed to download MI-GAN model:\n{err}")
+
     def _open_glossary(self):
         if not self.rom_path:
             return
@@ -484,6 +584,8 @@ class AITranslationConfigDialog(QDialog):
         self.config.set("ai_translation", "source_lang", self.src_combo.currentData())
         self.config.set("ai_translation", "target_lang", self.tgt_combo.currentData())
         self.config.set("ai_translation", "inpaint_enabled", self.inpaint_cb.isChecked())
+        self.config.set("ai_translation", "inpaint_mode", self.inpaint_mode_combo.currentData())
+        self.config.set("ai_translation", "inpaint_font_scale", round(self.font_spin.value() / 100.0, 2))
         self.config.set("ai_translation", "inpaint_auto_clear", self.inpaint_clear_cb.isChecked())
         self.config.set("ai_translation", "overlay_enabled", self.overlay_cb.isChecked())
         self.config.set("ai_translation", "auto_translate", self.auto_cb.isChecked())

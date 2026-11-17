@@ -436,6 +436,26 @@ class MenuBuilderMixin:
         self.act_trans_inpaint.triggered.connect(self.toggle_translation_inpaint)
         translation_menu.addAction(self.act_trans_inpaint)
 
+        font_size_menu = translation_menu.addMenu("Inpainted Text Size")
+        act_size_inc = QAction("Increase Text Size (+10%)", self)
+        act_size_inc.setShortcut(QKeySequence("Ctrl+Shift+="))
+        act_size_inc.triggered.connect(lambda: self.adjust_inpaint_font_scale(0.10))
+        font_size_menu.addAction(act_size_inc)
+
+        act_size_dec = QAction("Decrease Text Size (-10%)", self)
+        act_size_dec.setShortcut(QKeySequence("Ctrl+Shift+-"))
+        act_size_dec.triggered.connect(lambda: self.adjust_inpaint_font_scale(-0.10))
+        font_size_menu.addAction(act_size_dec)
+
+        act_size_reset = QAction("Reset Text Size (100%)", self)
+        act_size_reset.triggered.connect(lambda: self.set_inpaint_font_scale(1.0))
+        font_size_menu.addAction(act_size_reset)
+        font_size_menu.addSeparator()
+
+        for pct in (80, 100, 120, 140):
+            act_preset = font_size_menu.addAction(f"{pct}%" + (" (Default)" if pct == 100 else ""))
+            act_preset.triggered.connect(lambda _, p=pct: self.set_inpaint_font_scale(p / 100.0))
+
         self.act_trans_overlay = QAction("Fullscreen Floating Subtitle Overlay", self, checkable=True)
         self.act_trans_overlay.setShortcut(QKeySequence("Ctrl+Shift+O"))
         self.act_trans_overlay.setChecked(bool(self.config.get("ai_translation", "overlay_enabled", True)))

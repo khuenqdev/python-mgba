@@ -21,7 +21,7 @@ from .vision import TranslatedBox, get_or_create_game_criteria, run_groq_vision
 from .ocr import _clean_meiki_chars_furigana, _classify_and_group_ocr_lines
 from .local import LocalQwenTranslator
 from .glossary import GlossaryAndCacheStore
-from .inpaint import align_vision_boxes_with_ocr
+from .inpaint import align_vision_boxes_with_ocr, build_inpaint_patches
 
 
 def _normalize_ocr_signature(text: str) -> str:
@@ -69,6 +69,7 @@ class TranslationWorker(QThread):
         self.last_auto_ocr_sig = last_auto_ocr_sig or ""
         self.auto_ocr_cache = auto_ocr_cache if auto_ocr_cache is not None else {}
         self.result_ocr_sig = ""
+        self.result_patches = []
 
     def preprocess_image(self, img_array: np.ndarray, scale: int = 4) -> np.ndarray:
         height, width, _ = img_array.shape
@@ -142,6 +143,16 @@ class TranslationWorker(QThread):
         semantic_blocks = _classify_and_group_ocr_lines(lines_240)
         return lines_240, semantic_blocks
 
+    def _prepare_patches(self, boxes: list, models_dir: str):
+        inpaint_enabled = bool(self.config.get("ai_translation", "inpaint_enabled", True))
+        inpaint_mode = str(self.config.get("ai_translation", "inpaint_mode", "auto") or "auto")
+        if inpaint_enabled and boxes:
+            self.result_patches = build_inpaint_patches(
+                self.frame_data, boxes, mode=inpaint_mode, models_dir=models_dir
+            )
+        else:
+            self.result_patches = []
+
     def _apply_store_overrides(self, store: GlossaryAndCacheStore, boxes: list, src_lang: str, tgt_lang: str):
         for b in boxes:
             if b.speaker_orig:
@@ -200,6 +211,7 @@ class TranslationWorker(QThread):
                     has_box=not is_stub,
                 ))
             self.result_ocr_sig = _normalize_ocr_signature("".join(b.original for b in boxes))
+            self._prepare_patches(boxes, models_dir)
             self.finished.emit(boxes, f"Translated {len(boxes)} block(s) via Instant Cache [{store.game_id}]")
             return
 
@@ -234,6 +246,7 @@ class TranslationWorker(QThread):
                 if local_ocr_sig in self.auto_ocr_cache:
                     cached_boxes = self.auto_ocr_cache[local_ocr_sig]
                     self.result_ocr_sig = local_ocr_sig
+                    self._prepare_patches(cached_boxes, models_dir)
                     self.finished.emit(cached_boxes, f"Translated {len(cached_boxes)} block(s) via Text Cache [{store.game_id}]")
                     return
 
@@ -269,6 +282,7 @@ class TranslationWorker(QThread):
                 self.result_ocr_sig = local_ocr_sig or _normalize_ocr_signature(
                     "".join((b.speaker_orig + b.original) for b in vision_boxes)
                 )
+                self._prepare_patches(vision_boxes, models_dir)
                 status_msg = f"Translated {len(vision_boxes)} block(s) via Groq Vision [{vision_model}]"
                 self.finished.emit(vision_boxes, status_msg)
                 return
@@ -343,6 +357,7 @@ class TranslationWorker(QThread):
         self.result_ocr_sig = local_ocr_sig or _normalize_ocr_signature(
             "".join((b.speaker_orig + b.original) for b in translated_boxes)
         )
+        self._prepare_patches(translated_boxes, models_dir)
 
         if cache_hits == len(translated_boxes) and translated_boxes:
             backend_tag = f"Cache/Glossary [{store.game_id}]"
@@ -391,7 +406,6 @@ class TranslationWorker(QThread):
                     "boxes": [box]
                 })
 
-        # Split horizontally separated UI columns on the same Y-row
         final_boxes = []
         for line in lines:
             row_items = sorted(line["boxes"], key=lambda b: b["x1"])

@@ -82,6 +82,8 @@ DEFAULT_CONFIG = {
         "overlay_enabled": True,
         "inpaint_enabled": True,
         "inpaint_auto_clear": True,
+        "inpaint_mode": "auto",
+        "inpaint_font_scale": 1.0,
         "auto_translate": False,
         "auto_debounce_ms": 1200,
         "auto_cooldown_ms": 4000,

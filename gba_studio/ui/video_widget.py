@@ -1,5 +1,6 @@
 # video_widget.py
 import os
+import re
 import math
 import time
 from collections import deque
@@ -13,6 +14,7 @@ from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from ..tools.ai.inpaint import build_inpaint_patches, check_textbox_still_present
 
 
+# Matches HUD_BTN_BITS order in core_worker.py (bits 0..9)
 OVERLAY_BUTTON_LABELS = [
     (4, "▲"),
     (5, "▼"),
@@ -53,11 +55,13 @@ class VideoGLWidget(QOpenGLWidget):
         self.input_hud_mask = 0
         self.clip_rec_label = ""
 
+        # Translation & In-Place Inpainting State
         self.subtitle_boxes = []
         self.inpaint_patches = []
         self._inpaint_qimages = []
         self._inpaint_check_tick = 0
 
+        # RetroArch-Style Achievement Unlock Toast Queue
         self._ach_queue = deque()
         self._active_ach_toast = None
         self._ach_toast_start = 0.0
@@ -66,6 +70,7 @@ class VideoGLWidget(QOpenGLWidget):
         self._ach_anim_timer.setInterval(33)
         self._ach_anim_timer.timeout.connect(self._tick_ach_toast)
 
+        # Pixel Ruler State
         self.ruler_enabled = False
         self.hover_pos = None
         self.ruler_start = None
@@ -125,22 +130,37 @@ class VideoGLWidget(QOpenGLWidget):
         self.clip_rec_label = label
         self.update()
 
-    def set_translation_boxes(self, boxes: list, source_frame: np.ndarray | None = None):
+    def set_translation_boxes(
+        self,
+        boxes: list,
+        source_frame: np.ndarray | None = None,
+        precomputed_patches: list | None = None,
+    ):
         self.subtitle_boxes = list(boxes or [])
         self.inpaint_patches = []
         self._inpaint_qimages = []
 
         inpaint_on = bool(self.sm.config.get("ai_translation", "inpaint_enabled", True)) if self.sm and self.sm.config else True
+        inpaint_mode = str(self.sm.config.get("ai_translation", "inpaint_mode", "auto") or "auto") if self.sm and self.sm.config else "auto"
         ref_frame = source_frame if source_frame is not None else self.current_frame_data
 
-        if inpaint_on and ref_frame is not None and self.subtitle_boxes:
-            patches = build_inpaint_patches(ref_frame, self.subtitle_boxes)
+        if inpaint_on and self.subtitle_boxes:
+            if precomputed_patches is not None:
+                patches = list(precomputed_patches)
+            elif ref_frame is not None:
+                patches = build_inpaint_patches(ref_frame, self.subtitle_boxes, mode=inpaint_mode)
+            else:
+                patches = []
+
             self.inpaint_patches = patches
             for p in patches:
-                arr = p.patch_rgb
-                h, w, _ = arr.shape
-                qimg = QImage(arr.data, w, h, w * 3, QImage.Format.Format_RGB888).copy()
-                self._inpaint_qimages.append((p, qimg))
+                if getattr(p, "is_baked_graphic", False):
+                    self._inpaint_qimages.append((p, None))
+                else:
+                    arr = p.patch_rgb
+                    h, w, _ = arr.shape
+                    qimg = QImage(arr.data, w, h, w * 3, QImage.Format.Format_RGB888).copy()
+                    self._inpaint_qimages.append((p, qimg))
 
         self.update()
 
@@ -151,6 +171,9 @@ class VideoGLWidget(QOpenGLWidget):
             self._inpaint_qimages = []
             self.update()
 
+    # =========================================================================
+    # ADAPTIVE IN-PLACE TEXTBOX REPLACEMENT RENDERER
+    # =========================================================================
     def _draw_inpaint_overlays(self, painter: QPainter):
         if not self._inpaint_qimages:
             return
@@ -161,17 +184,22 @@ class VideoGLWidget(QOpenGLWidget):
         if scale <= 0.1:
             return
 
+        raw_fscale = self.sm.config.get("ai_translation", "inpaint_font_scale", 1.0) if self.sm and self.sm.config else 1.0
+        try:
+            user_font_scale = max(0.6, min(1.6, float(raw_fscale if raw_fscale is not None else 1.0)))
+        except (ValueError, TypeError):
+            user_font_scale = 1.0
+
         families = ["Segoe UI", "Arial", "Tahoma", "Sans Serif"]
-        flags_wrap = Qt.AlignmentFlag.AlignLeft.value | Qt.TextFlag.TextWordWrap.value
+        flags_wrap = Qt.AlignmentFlag.AlignLeft.value | Qt.AlignmentFlag.AlignTop.value | Qt.TextFlag.TextWordWrap.value
         flags_center = Qt.AlignmentFlag.AlignCenter.value
 
         for patch, qimg in self._inpaint_qimages:
             sx = int(round(ox + patch.gx * scale))
             sy = int(round(oy + patch.gy * scale))
-            sw = max(10, int(round(patch.gw * scale)))
-            sh = max(10, int(round(patch.gh * scale)))
+            sw = max(8, int(round(patch.gw * scale)))
+            sh = max(8, int(round(patch.gh * scale)))
             target_rect = QRect(sx, sy, sw, sh)
-            painter.drawImage(target_rect, qimg)
 
             b = patch.box
             trans = (getattr(b, "translated", "") or "").strip()
@@ -183,35 +211,97 @@ class VideoGLWidget(QOpenGLWidget):
             sp_trans = (getattr(b, "speaker_trans", "") or "").strip()
             speaker = sp_trans or sp_orig
 
-            pad_x = max(2, int(round((2.5 if cat == "dialogue" else 1.0) * scale)))
-            pad_y = max(1, int(round((1.5 if cat == "dialogue" else 0.5) * scale)))
+            if speaker:
+                trans = re.sub(
+                    rf"^\s*{re.escape(speaker)}\s*[:：\-]\s*",
+                    "",
+                    trans,
+                    flags=re.IGNORECASE,
+                ).strip() or trans
+
+            is_baked = getattr(patch, "is_baked_graphic", False)
+            painter.save()
+
+            # Case A: Complex baked art fallback when MI-GAN ONNX is unavailable
+            if is_baked or qimg is None:
+                badge_rect = target_rect.adjusted(-2, -2, 2, 2)
+                painter.setPen(QPen(QColor(255, 255, 255, 65), 1))
+                painter.setBrush(QColor(16, 20, 28, 225))
+                painter.drawRoundedRect(badge_rect, 4, 4)
+
+                min_px = max(8, int(round(4.0 * scale * user_font_scale)))
+                max_px = max(min_px, int(round(min(target_rect.height() * 0.80, 11.5 * scale * user_font_scale))))
+                best_px = min_px
+                low, high = min_px, max_px
+                while low <= high:
+                    mid = (low + high) // 2
+                    f = self._make_font(families, 10, QFont.Weight.Bold)
+                    f.setPixelSize(mid)
+                    fm = QFontMetrics(f)
+                    if fm.horizontalAdvance(trans) <= target_rect.width() and fm.height() <= target_rect.height() + 2:
+                        best_px = mid
+                        low = mid + 1
+                    else:
+                        high = mid - 1
+
+                chosen_font = self._make_font(families, 10, QFont.Weight.Bold)
+                chosen_font.setPixelSize(best_px)
+                adv = QFontMetrics(chosen_font).horizontalAdvance(trans)
+                if adv > target_rect.width() and adv > 0:
+                    chosen_font.setStretch(max(65, int((target_rect.width() / float(adv)) * 96)))
+
+                painter.setFont(chosen_font)
+                painter.setPen(QColor(0, 0, 0, 200))
+                painter.drawText(target_rect.translated(1, 1), flags_center, trans)
+                painter.setPen(QColor(255, 255, 255))
+                painter.drawText(target_rect, flags_center, trans)
+                painter.restore()
+                continue
+
+            # Case B: Draw MI-GAN / Algorithmic clean reconstructed background patch
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            painter.drawImage(target_rect, qimg)
+
+            is_button = (cat in ("menu", "label")) or (patch.gh <= 24)
+            pad_x = max(2, int(round((1.5 if is_button else 4.0) * scale)))
+            pad_y = max(1, int(round((1.0 if is_button else 3.0) * scale)))
             text_rect = target_rect.adjusted(pad_x, pad_y, -pad_x, -pad_y)
-            if text_rect.width() <= 6 or text_rect.height() <= 6:
+            if text_rect.width() <= 4 or text_rect.height() <= 4:
+                painter.restore()
                 continue
 
             if patch.is_dark_bg:
-                ink_col, sp_col, shadow_col = QColor(244, 248, 255), QColor(255, 213, 79), QColor(0, 0, 0, 175)
+                ink_col = QColor(245, 248, 255)
+                sp_col = QColor(255, 215, 64)
+                shadow_col = QColor(0, 0, 0, 185)
             else:
-                ink_col, sp_col, shadow_col = QColor(20, 24, 34), QColor(15, 76, 145), None
+                ink_col = QColor(18, 22, 32)
+                sp_col = QColor(14, 72, 136)
+                shadow_col = QColor(255, 255, 255, 120) if patch.bg_luma > 200 else None
 
-            painter.save()
             painter.setClipRect(target_rect)
 
-            if cat in ("menu", "label") and patch.gh <= 22:
-                max_pt = max(6, min(22, int(round(min(3.5 * scale, text_rect.height() * 0.62)))))
-                min_pt = max(5, int(round(2.4 * scale)))
-                chosen_font = None
-                for pt in range(max_pt, min_pt - 1, -1):
-                    f = self._make_font(families, pt, QFont.Weight.Bold)
+            if is_button:
+                min_px = max(8, int(round(4.0 * scale * user_font_scale)))
+                max_px = max(min_px, int(round(min(text_rect.height() * 0.80, 11.5 * scale * user_font_scale))))
+                best_px = min_px
+                low, high = min_px, max_px
+                while low <= high:
+                    mid = (low + high) // 2
+                    f = self._make_font(families, 10, QFont.Weight.Bold)
+                    f.setPixelSize(mid)
                     fm = QFontMetrics(f)
                     if fm.horizontalAdvance(trans) <= text_rect.width() and fm.height() <= text_rect.height() + 2:
-                        chosen_font = f
-                        break
-                if chosen_font is None:
-                    chosen_font = self._make_font(families, min_pt, QFont.Weight.Bold)
-                    adv = max(1, QFontMetrics(chosen_font).horizontalAdvance(trans))
-                    if adv > text_rect.width():
-                        chosen_font.setStretch(max(68, int((text_rect.width() * 98) / adv)))
+                        best_px = mid
+                        low = mid + 1
+                    else:
+                        high = mid - 1
+
+                chosen_font = self._make_font(families, 10, QFont.Weight.Bold)
+                chosen_font.setPixelSize(best_px)
+                adv = QFontMetrics(chosen_font).horizontalAdvance(trans)
+                if adv > text_rect.width() and adv > 0:
+                    chosen_font.setStretch(max(65, int((text_rect.width() / float(adv)) * 96)))
 
                 painter.setFont(chosen_font)
                 if shadow_col:
@@ -220,37 +310,53 @@ class VideoGLWidget(QOpenGLWidget):
                 painter.setPen(ink_col)
                 painter.drawText(text_rect, flags_center, trans)
             else:
-                base_pt = max(6, min(26, int(round(3.9 * scale))))
-                sp_label = f"{speaker}:" if (cat == "dialogue" and speaker) else ""
-                chosen_font = None
-                chosen_sp_h = 0
-                for pt in range(base_pt, 4, -1):
-                    f = self._make_font(families, pt, QFont.Weight.DemiBold)
-                    fm = QFontMetrics(f)
+                # Dialogue font scales natively to match 10-12px GBA bitmap glyphs
+                sp_label = f"{speaker}:" if speaker else ""
+                min_px = max(9, int(round(5.0 * scale * user_font_scale)))
+                max_px = max(min_px, int(round(10.5 * scale * user_font_scale)))
+
+                best_px = min_px
+                best_sp_h = 0
+                low, high = min_px, max_px
+                while low <= high:
+                    mid = (low + high) // 2
+                    f_body = self._make_font(families, 10, QFont.Weight.DemiBold)
+                    f_body.setPixelSize(mid)
+                    fm_body = QFontMetrics(f_body)
+
                     sp_h = 0
                     if sp_label:
-                        sp_h = fm.boundingRect(QRect(0, 0, text_rect.width(), 500), flags_wrap, sp_label).height() + max(1, int(scale * 0.5))
-                    avail_h = text_rect.height() - sp_h
-                    body_r = fm.boundingRect(QRect(0, 0, text_rect.width(), 1000), flags_wrap, trans)
-                    if avail_h > 0 and body_r.height() <= avail_h + 2 and body_r.width() <= text_rect.width() + 2:
-                        chosen_font, chosen_sp_h = f, sp_h
-                        break
-                if chosen_font is None:
-                    chosen_font = self._make_font(families, 5, QFont.Weight.DemiBold)
-                    if sp_label:
-                        chosen_sp_h = QFontMetrics(chosen_font).boundingRect(QRect(0, 0, text_rect.width(), 200), flags_wrap, sp_label).height()
+                        f_sp = self._make_font(families, 10, QFont.Weight.Bold)
+                        f_sp.setPixelSize(mid)
+                        fm_sp = QFontMetrics(f_sp)
+                        sp_r = fm_sp.boundingRect(QRect(0, 0, text_rect.width(), 500), flags_wrap, sp_label)
+                        sp_h = sp_r.height() + max(2, int(round(scale * 0.8)))
 
+                    avail_h = text_rect.height() - sp_h
+                    if avail_h > 0:
+                        body_r = fm_body.boundingRect(QRect(0, 0, text_rect.width(), 2000), flags_wrap, trans)
+                        if body_r.height() <= avail_h + 3 and body_r.width() <= text_rect.width() + 2:
+                            best_px = mid
+                            best_sp_h = sp_h
+                            low = mid + 1
+                            continue
+                    high = mid - 1
+
+                chosen_font = self._make_font(families, 10, QFont.Weight.DemiBold)
+                chosen_font.setPixelSize(best_px)
                 body_rect = QRect(text_rect)
-                if sp_label and chosen_sp_h > 0:
-                    sp_font = self._make_font(families, chosen_font.pointSize(), QFont.Weight.Bold)
+
+                if sp_label and best_sp_h > 0:
+                    sp_font = self._make_font(families, 10, QFont.Weight.Bold)
+                    sp_font.setPixelSize(best_px)
                     painter.setFont(sp_font)
-                    sp_rect = QRect(text_rect.x(), text_rect.y(), text_rect.width(), chosen_sp_h)
+                    sp_rect = QRect(text_rect.x(), text_rect.y(), text_rect.width(), best_sp_h)
                     if shadow_col:
                         painter.setPen(shadow_col)
                         painter.drawText(sp_rect.translated(1, 1), flags_wrap, sp_label)
                     painter.setPen(sp_col)
                     painter.drawText(sp_rect, flags_wrap, sp_label)
-                    body_rect.setTop(text_rect.y() + chosen_sp_h)
+                    body_rect.setTop(text_rect.y() + best_sp_h)
 
                 painter.setFont(chosen_font)
                 if shadow_col:
@@ -261,6 +367,9 @@ class VideoGLWidget(QOpenGLWidget):
 
             painter.restore()
 
+    # =========================================================================
+    # RETROARCH-STYLE ACHIEVEMENT UNLOCK TOAST
+    # =========================================================================
     def show_achievement_popup(self, payload: dict):
         if self.sm and self.sm.config:
             if not bool(self.sm.config.get("retroachievements", "popup_notifications", True)):
@@ -644,7 +753,6 @@ class VideoGLWidget(QOpenGLWidget):
         self._draw_subtitle_overlay(painter)
         self._draw_achievement_toast(painter)
 
-        # Global OSD Message (Top-Right)
         if self.osd_text:
             painter.setPen(QPen(QColor(0, 255, 0)))
             painter.setFont(QFont("Arial", 14, QFont.Weight.Bold))
@@ -668,7 +776,6 @@ class VideoGLWidget(QOpenGLWidget):
     def get_gba_coords(self, pos) -> tuple:
         img_w, img_h = 240, 160
         scale, offset_x, offset_y = self._get_viewport_transform()
-
         gba_x = int((pos.x() - offset_x) / scale)
         gba_y = int((pos.y() - offset_y) / scale)
         return max(0, min(img_w - 1, gba_x)), max(0, min(img_h - 1, gba_y))

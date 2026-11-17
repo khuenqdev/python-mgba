@@ -45,6 +45,19 @@ class ApplicationActionsMixin:
             self.video_widget.update()
         self.video_widget.show_osd(f"🎨 In-Place Textbox Inpainting: {'ON' if val else 'OFF'}")
 
+    def adjust_inpaint_font_scale(self, delta: float):
+        cur = float(self.config.get("ai_translation", "inpaint_font_scale", 1.0) or 1.0)
+        new_val = max(0.60, min(1.60, round(cur + delta, 2)))
+        self.config.set("ai_translation", "inpaint_font_scale", new_val)
+        self.video_widget.update()
+        self.video_widget.show_osd(f"🎨 Inpainted Text Size: {int(round(new_val * 100))}%", 1500)
+
+    def set_inpaint_font_scale(self, val: float):
+        new_val = max(0.60, min(1.60, round(val, 2)))
+        self.config.set("ai_translation", "inpaint_font_scale", new_val)
+        self.video_widget.update()
+        self.video_widget.show_osd(f"🎨 Inpainted Text Size: {int(round(new_val * 100))}%", 1500)
+
     def toggle_auto_translate(self):
         val = self.act_auto_translate.isChecked()
         self.config.set("ai_translation", "auto_translate", val)
@@ -562,7 +575,12 @@ class ApplicationActionsMixin:
 
     def on_ai_translation_finished(self, boxes: list, msg: str):
         src_frame = getattr(self, "_last_trans_frame", None)
-        self.video_widget.set_translation_boxes(boxes or [], source_frame=src_frame)
+        pre_patches = getattr(self.trans_worker, "result_patches", None) if self.trans_worker else None
+        self.video_widget.set_translation_boxes(
+            boxes or [],
+            source_frame=src_frame,
+            precomputed_patches=pre_patches,
+        )
 
         roi_mode = str(self.config.get("ai_translation", "auto_roi_mode", "auto") or "auto")
         if src_frame is not None:
