@@ -10,6 +10,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from ...paths import PROJECT_ROOT
 
 from .engines import (
+    DEFAULT_HF_SPACE_ID,
     get_meiki_reader,
     get_paddle_reader,
     get_easy_reader,
@@ -17,7 +18,7 @@ from .engines import (
     find_best_llm_model,
     get_llama_instance,
 )
-from .vision import TranslatedBox, get_or_create_game_criteria, run_groq_vision
+from .vision import TranslatedBox, get_or_create_game_criteria, run_hf_vision, run_groq_vision
 from .ocr import _clean_meiki_chars_furigana, _classify_and_group_ocr_lines
 from .local import LocalQwenTranslator
 from .glossary import GlossaryAndCacheStore
@@ -253,43 +254,79 @@ class TranslationWorker(QThread):
         game_name = os.path.splitext(os.path.basename(self.rom_path))[0]
         csv_path = os.path.join(trans_dir, f"{game_name}_translations.csv")
 
+        hf_enabled = bool(self.config.get("ai_translation", "hf_space_enabled", True))
+        hf_space_id = str(
+            self.config.get("ai_translation", "hf_space_id", DEFAULT_HF_SPACE_ID) or DEFAULT_HF_SPACE_ID
+        ).strip()
+        hf_token = str(self.config.get("credentials", "hf_token") or "").strip()
+
         groq_api_key = str(self.config.get("credentials", "groq_api_key") or "").strip()
         if not groq_api_key:
             groq_api_key = os.environ.get("GROQ_API_KEY", "").strip()
 
-        criteria = get_or_create_game_criteria(self.rom_path, src_lang, tgt_lang, groq_api_key, trans_dir)
+        criteria = get_or_create_game_criteria(
+            self.rom_path,
+            src_lang,
+            tgt_lang,
+            groq_api_key,
+            trans_dir,
+            hf_enabled=hf_enabled,
+            hf_space_id=hf_space_id,
+            hf_token=hf_token,
+        )
         glossary_prompt = store.format_glossary_prompt()
 
-        # 2. Primary: Groq Multimodal Vision
-        if groq_api_key:
+        # 2. Primary Multimodal Vision: Hugging Face Space FIRST, Groq Vision SECOND
+        vision_boxes, vision_model = None, None
+        vision_source = ""
+
+        if hf_enabled and hf_space_id:
+            vision_boxes, vision_model = run_hf_vision(
+                self.frame_data,
+                src_lang,
+                tgt_lang,
+                criteria,
+                glossary_text=glossary_prompt,
+                space_id=hf_space_id,
+                hf_token=hf_token,
+            )
+            if vision_boxes:
+                vision_source = "Hugging Face Space"
+            else:
+                print("[AI Translator] Hugging Face Space unavailable or returned no items. Falling back to Groq Vision...")
+
+        if not vision_boxes and groq_api_key:
             vision_boxes, vision_model = run_groq_vision(
                 self.frame_data, src_lang, tgt_lang, groq_api_key, criteria, glossary_text=glossary_prompt
             )
             if vision_boxes:
-                if inpaint_enabled:
-                    if precomputed_ocr is None:
-                        if img_np is None:
-                            img_np = self.preprocess_image(self.frame_data, scale=SCALE)
-                        precomputed_ocr, precomputed_engine = self._run_local_ocr_raw(img_np, src_lang, models_dir)
-                    if precomputed_ocr:
-                        lines_240, semantic_blocks = self._raw_ocr_to_240(precomputed_ocr, SCALE)
-                        align_vision_boxes_with_ocr(vision_boxes, lines_240, semantic_blocks)
-
-                self._apply_store_overrides(store, vision_boxes, src_lang, tgt_lang)
-                store.save_frame_layout(frame_hash, vision_boxes)
-                store.save_cache()
-                self._export_csv_mirror(csv_path, store)
-                self.result_ocr_sig = local_ocr_sig or _normalize_ocr_signature(
-                    "".join((b.speaker_orig + b.original) for b in vision_boxes)
-                )
-                self._prepare_patches(vision_boxes, models_dir)
-                status_msg = f"Translated {len(vision_boxes)} block(s) via Groq Vision [{vision_model}]"
-                self.finished.emit(vision_boxes, status_msg)
-                return
+                vision_source = "Groq Vision"
             else:
                 print("[AI Translator] Groq Vision rate limited or unavailable. Falling back to local OCR...")
 
-        # 3. Offline Fallback
+        if vision_boxes:
+            if inpaint_enabled:
+                if precomputed_ocr is None:
+                    if img_np is None:
+                        img_np = self.preprocess_image(self.frame_data, scale=SCALE)
+                    precomputed_ocr, precomputed_engine = self._run_local_ocr_raw(img_np, src_lang, models_dir)
+                if precomputed_ocr:
+                    lines_240, semantic_blocks = self._raw_ocr_to_240(precomputed_ocr, SCALE)
+                    align_vision_boxes_with_ocr(vision_boxes, lines_240, semantic_blocks)
+
+            self._apply_store_overrides(store, vision_boxes, src_lang, tgt_lang)
+            store.save_frame_layout(frame_hash, vision_boxes)
+            store.save_cache()
+            self._export_csv_mirror(csv_path, store)
+            self.result_ocr_sig = local_ocr_sig or _normalize_ocr_signature(
+                "".join((b.speaker_orig + b.original) for b in vision_boxes)
+            )
+            self._prepare_patches(vision_boxes, models_dir)
+            status_msg = f"Translated {len(vision_boxes)} block(s) via {vision_source} [{vision_model}]"
+            self.finished.emit(vision_boxes, status_msg)
+            return
+
+        # 3. Offline OCR + LLM / HF Space / Groq Text Fallback
         if precomputed_ocr is not None and precomputed_engine != "None":
             results, ocr_engine_name = precomputed_ocr, precomputed_engine
         else:
@@ -331,8 +368,18 @@ class TranslationWorker(QThread):
                 cache_hits += 1
             else:
                 speaker_trans, translated_text = LocalQwenTranslator.translate_block(
-                    llm_model_path, orig, cat, speaker_orig, src_lang, tgt_lang,
-                    criteria, groq_api_key, glossary_text=glossary_prompt
+                    llm_model_path,
+                    orig,
+                    cat,
+                    speaker_orig,
+                    src_lang,
+                    tgt_lang,
+                    criteria,
+                    groq_api_key,
+                    glossary_text=glossary_prompt,
+                    hf_enabled=hf_enabled,
+                    hf_space_id=hf_space_id,
+                    hf_token=hf_token,
                 )
                 if gl_speaker:
                     speaker_trans = gl_speaker
@@ -361,8 +408,12 @@ class TranslationWorker(QThread):
 
         if cache_hits == len(translated_boxes) and translated_boxes:
             backend_tag = f"Cache/Glossary [{store.game_id}]"
+        elif using_local_llm:
+            backend_tag = os.path.basename(llm_model_path).replace(".gguf", "")
+        elif hf_enabled and hf_space_id:
+            backend_tag = f"HF:{hf_space_id.split('/')[-1]}"
         else:
-            backend_tag = os.path.basename(llm_model_path).replace(".gguf", "") if using_local_llm else "Cloud Text API"
+            backend_tag = "Cloud Text API"
 
         status_msg = f"Translated {len(translated_boxes)} block(s) via {ocr_engine_name} & {backend_tag}"
         self.finished.emit(translated_boxes, status_msg)

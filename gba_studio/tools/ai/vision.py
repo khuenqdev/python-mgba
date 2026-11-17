@@ -5,6 +5,7 @@ import re
 import io
 import time
 import base64
+import tempfile
 import urllib.request
 import urllib.error
 import numpy as np
@@ -12,9 +13,12 @@ from PIL import Image
 
 from .engines import (
     LANG_NAMES,
+    DEFAULT_HF_SPACE_ID,
     _GAME_CRITERIA_CACHE,
     UNIVERSAL_GBA_CRITERIA,
     _has_meaningful_text,
+    call_hf_respond,
+    extract_hf_text,
 )
 
 _LAST_GROQ_CALL_TIME = 0.0
@@ -37,8 +41,17 @@ class TranslatedBox:
         self.has_box = bool(has_box)
 
 
-def get_or_create_game_criteria(rom_path: str, src_lang: str, tgt_lang: str, api_key: str, trans_dir: str) -> str:
-    """Generates and caches localization criteria once per game ROM."""
+def get_or_create_game_criteria(
+    rom_path: str,
+    src_lang: str,
+    tgt_lang: str,
+    api_key: str,
+    trans_dir: str,
+    hf_enabled: bool = True,
+    hf_space_id: str = DEFAULT_HF_SPACE_ID,
+    hf_token: str = "",
+) -> str:
+    """Generates and caches localization criteria once per game ROM (HF Space first, Groq fallback)."""
     raw_name = os.path.splitext(os.path.basename(rom_path))[0]
     clean_title = re.sub(r'[\(\[\{].*?[\)\]\}]', '', raw_name)
     clean_title = re.sub(r'[_\-]+(VI|EN|stage\d+|patched).*$', '', clean_title, flags=re.IGNORECASE).strip() or raw_name
@@ -61,10 +74,6 @@ def get_or_create_game_criteria(rom_path: str, src_lang: str, tgt_lang: str, api
         except Exception:
             pass
 
-    if not api_key:
-        _GAME_CRITERIA_CACHE[cache_key] = UNIVERSAL_GBA_CRITERIA
-        return UNIVERSAL_GBA_CRITERIA
-
     src_name = LANG_NAMES.get(src_lang, src_lang)
     tgt_name = LANG_NAMES.get(tgt_lang, tgt_lang)
     prompt = (
@@ -74,39 +83,61 @@ def get_or_create_game_criteria(rom_path: str, src_lang: str, tgt_lang: str, api
         f"Provide ONLY bullet points starting with '- ', no intro or commentary."
     )
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0"
-    }
+    # Priority 1: Hugging Face Space
+    if hf_enabled and hf_space_id:
+        hf_res = call_hf_respond(
+            text=prompt,
+            image_path=None,
+            space_id=hf_space_id,
+            hf_token=hf_token,
+            reasoning="off",
+            temperature=0.2,
+        )
+        content = extract_hf_text(hf_res)
+        if content and "-" in content:
+            try:
+                with open(criteria_file, "w", encoding="utf-8") as f:
+                    f.write(content)
+            except Exception:
+                pass
+            _GAME_CRITERIA_CACHE[cache_key] = content
+            return content
 
-    for model_id in ["openai/gpt-oss-120b", "qwen/qwen3.8-27b"]:
-        try:
-            payload = {
-                "model": model_id,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.2,
-                "max_completion_tokens": 220
-            }
-            if "qwen" in model_id:
-                payload["reasoning_effort"] = "none"
+    # Priority 2: Groq API Fallback
+    if api_key:
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0"
+        }
 
-            req = urllib.request.Request(
-                "https://api.groq.com/openai/v1/chat/completions",
-                data=json.dumps(payload).encode("utf-8"),
-                headers=headers
-            )
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                content = data["choices"][0]["message"]["content"]
-                content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
-                if content and "-" in content:
-                    with open(criteria_file, "w", encoding="utf-8") as f:
-                        f.write(content)
-                    _GAME_CRITERIA_CACHE[cache_key] = content
-                    return content
-        except Exception:
-            continue
+        for model_id in ["openai/gpt-oss-120b", "qwen/qwen3.8-27b"]:
+            try:
+                payload = {
+                    "model": model_id,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.2,
+                    "max_completion_tokens": 220
+                }
+                if "qwen" in model_id:
+                    payload["reasoning_effort"] = "none"
+
+                req = urllib.request.Request(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers=headers
+                )
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    content = data["choices"][0]["message"]["content"]
+                    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+                    if content and "-" in content:
+                        with open(criteria_file, "w", encoding="utf-8") as f:
+                            f.write(content)
+                        _GAME_CRITERIA_CACHE[cache_key] = content
+                        return content
+            except Exception:
+                continue
 
     _GAME_CRITERIA_CACHE[cache_key] = UNIVERSAL_GBA_CRITERIA
     return UNIVERSAL_GBA_CRITERIA
@@ -208,9 +239,110 @@ def _parse_structured_items(content: str) -> list:
     return boxes
 
 
+def _parse_hf_structured_result(result) -> list:
+    """Parses Gradio /respond JSON/dict/list/str output into TranslatedBox items."""
+    if result is None:
+        return []
+    if isinstance(result, dict):
+        if isinstance(result.get("items"), list):
+            boxes = _items_to_boxes(result["items"])
+            if boxes:
+                return boxes
+        for key in ("response", "text", "content", "output", "answer", "reply", "message"):
+            if key in result and result[key] is not None:
+                boxes = _parse_hf_structured_result(result[key])
+                if boxes:
+                    return boxes
+        return _parse_structured_items(json.dumps(result, ensure_ascii=False))
+    if isinstance(result, list):
+        if result and all(isinstance(x, dict) for x in result):
+            boxes = _items_to_boxes(result)
+            if boxes:
+                return boxes
+        text = extract_hf_text(result)
+        return _parse_structured_items(text)
+    return _parse_structured_items(extract_hf_text(result))
+
+
+def _build_vision_prompt(src_lang: str, tgt_lang: str, criteria: str, glossary_text: str = "") -> str:
+    src_name = LANG_NAMES.get(src_lang, src_lang)
+    tgt_name = LANG_NAMES.get(tgt_lang, tgt_lang)
+    glossary_section = f"\n\n{glossary_text}" if glossary_text else ""
+
+    return (
+        f"Analyze the ENTIRE GBA game screen (240x160 native pixels) from top to bottom and localize EVERY meaningful {src_name} or UI text block into {tgt_name}.\n"
+        "IMPORTANT: Include ALL panels on screen — main menus, dimmed/grayed-out options, AND bottom 'Information' / help / description boxes!\n\n"
+        "Classify each element into ONE of 3 types:\n"
+        "1. \"dialogue\": Speech boxes, story narration scrolls, OR help/information/description panels.\n"
+        "   - UNWRAP AND MERGE multi-line sentences inside the same box into ONE complete sentence before translating.\n"
+        "   - If a speaker nameplate appears above/beside a quote, strip its furigana reading into \"speaker\", put the translated name in \"speaker_tr\", and do NOT output the speaker as a separate item.\n"
+        "   - Strip inline furigana readings attached to Kanji in \"ja\".\n"
+        "2. \"menu\": Selectable menu choices, setting options, or command lists (including grayed-out options).\n"
+        "   - Keep each option as a SEPARATE item in top-to-bottom order.\n"
+        "3. \"label\": Panel headers, chapter banners, map locations, or HUD/button tags. Ignore decorative dot bubbles like \"....\".\n\n"
+        "For EVERY item, also include \"box\": [x, y, w, h] giving its approximate pixel bounding box in native 240x160 GBA coordinates (including speaker nameplate if inside the same dialogue box).\n\n"
+        f"STYLE CRITERIA:\n{criteria}{glossary_section}\n\n"
+        "Return ONLY a valid JSON object (no markdown fences, no extra commentary) with key \"items\":\n"
+        "{\"items\": [{\"type\": \"dialogue|menu|label\", \"speaker\": \"\", \"speaker_tr\": \"\", \"ja\": \"...\", \"tr\": \"...\", \"box\": [x, y, w, h]}]}"
+    )
+
+
+def run_hf_vision(
+    frame_data: np.ndarray,
+    src_lang: str,
+    tgt_lang: str,
+    criteria: str,
+    glossary_text: str = "",
+    space_id: str = DEFAULT_HF_SPACE_ID,
+    hf_token: str = "",
+):
+    """Primary multimodal vision recognition & translation via Hugging Face Gradio Space."""
+    space_id = (space_id or "").strip()
+    if not space_id:
+        return None, None
+
+    pil_img = Image.fromarray(frame_data, "RGB")
+    if pil_img.width <= 320:
+        pil_img = pil_img.resize((pil_img.width * 3, pil_img.height * 3), Image.Resampling.NEAREST)
+
+    prompt = _build_vision_prompt(src_lang, tgt_lang, criteria, glossary_text=glossary_text)
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
+            tmp_path = tf.name
+        pil_img.save(tmp_path, format="PNG", optimize=True)
+
+        result = call_hf_respond(
+            text=prompt,
+            image_path=tmp_path,
+            space_id=space_id,
+            hf_token=hf_token,
+            reasoning="off",
+            temperature=0.1,
+            top_p=0.95,
+            top_k=20,
+        )
+        if result is not None:
+            boxes = _parse_hf_structured_result(result)
+            if boxes:
+                short_name = space_id.split("/")[-1]
+                return boxes, f"HF:{short_name}"
+    except Exception as e:
+        print(f"[HF Vision on {space_id}] {e}")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    return None, None
+
+
 def run_groq_vision(frame_data: np.ndarray, src_lang: str, tgt_lang: str, api_key: str,
                     criteria: str, glossary_text: str = ""):
-    """Executes single-call vision recognition and translation with Groq Vision."""
+    """Fallback multimodal vision recognition and translation with Groq Vision."""
     global _LAST_GROQ_CALL_TIME
     if not api_key:
         return None, None
@@ -229,27 +361,7 @@ def run_groq_vision(frame_data: np.ndarray, src_lang: str, tgt_lang: str, api_ke
     b64_img = base64.b64encode(buffered.getvalue()).decode("utf-8")
     data_url = f"data:image/png;base64,{b64_img}"
 
-    src_name = LANG_NAMES.get(src_lang, src_lang)
-    tgt_name = LANG_NAMES.get(tgt_lang, tgt_lang)
-
-    glossary_section = f"\n\n{glossary_text}" if glossary_text else ""
-
-    prompt = (
-        f"Analyze the ENTIRE GBA game screen (240x160 native pixels) from top to bottom and localize EVERY meaningful {src_name} or UI text block into {tgt_name}.\n"
-        "IMPORTANT: Include ALL panels on screen — main menus, dimmed/grayed-out options, AND bottom 'Information' / help / description boxes!\n\n"
-        "Classify each element into ONE of 3 types:\n"
-        "1. \"dialogue\": Speech boxes, story narration scrolls, OR help/information/description panels.\n"
-        "   - UNWRAP AND MERGE multi-line sentences inside the same box into ONE complete sentence before translating.\n"
-        "   - If a speaker nameplate appears above/beside a quote, strip its furigana reading into \"speaker\", put the translated name in \"speaker_tr\", and do NOT output the speaker as a separate item.\n"
-        "   - Strip inline furigana readings attached to Kanji in \"ja\".\n"
-        "2. \"menu\": Selectable menu choices, setting options, or command lists (including grayed-out options).\n"
-        "   - Keep each option as a SEPARATE item in top-to-bottom order.\n"
-        "3. \"label\": Panel headers, chapter banners, map locations, or HUD/button tags. Ignore decorative dot bubbles like \"....\".\n\n"
-        "For EVERY item, also include \"box\": [x, y, w, h] giving its approximate pixel bounding box in native 240x160 GBA coordinates (including speaker nameplate if inside the same dialogue box).\n\n"
-        f"STYLE CRITERIA:\n{criteria}{glossary_section}\n\n"
-        "Return a JSON object with key \"items\":\n"
-        "{\"items\": [{\"type\": \"dialogue|menu|label\", \"speaker\": \"\", \"speaker_tr\": \"\", \"ja\": \"...\", \"tr\": \"...\", \"box\": [x, y, w, h]}]}"
-    )
+    prompt = _build_vision_prompt(src_lang, tgt_lang, criteria, glossary_text=glossary_text)
 
     headers = {
         "Authorization": f"Bearer {api_key}",

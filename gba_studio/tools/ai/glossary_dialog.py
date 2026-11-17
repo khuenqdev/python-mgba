@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
-from .engines import LANG_NAMES
+from .engines import LANG_NAMES, DEFAULT_HF_SPACE_ID, reset_hf_client
 from .glossary import GlossaryAndCacheStore
 from .auto_trigger import AutoTranslateDetector
 from .neural_inpaint import is_migan_available, download_migan_model
@@ -362,7 +362,7 @@ class TranslationGlossaryDialog(QDialog):
 
 
 class AITranslationConfigDialog(QDialog):
-    """Configures AI translation languages, Groq API Key, MI-GAN neural inpainting, font scale & auto-trigger."""
+    """Configures AI translation languages, HF Space (primary), Groq fallback, MI-GAN inpainting & auto-trigger."""
 
     def __init__(self, config, parent=None, rom_path: str = "", game_code: str = ""):
         super().__init__(parent)
@@ -371,7 +371,7 @@ class AITranslationConfigDialog(QDialog):
         self.game_code = game_code
         self._dl_thread = None
         self.setWindowTitle("Configure AI Translation")
-        self.resize(510, 580)
+        self.resize(540, 680)
         self._init_ui()
 
     def _init_ui(self):
@@ -401,7 +401,46 @@ class AITranslationConfigDialog(QDialog):
         tgt_row.addWidget(self.tgt_combo)
         layout.addLayout(tgt_row)
 
-        cred_grp = QGroupBox("API Credentials (Saved in mgba_config.json)")
+        # Primary Cloud Engine: Hugging Face Space
+        hf_grp = QGroupBox("Primary Cloud Engine: Hugging Face Space (Priority #1)")
+        hf_lay = QVBoxLayout(hf_grp)
+
+        self.hf_enabled_cb = QCheckBox("Use Hugging Face Space before Groq API")
+        self.hf_enabled_cb.setChecked(bool(self.config.get("ai_translation", "hf_space_enabled", True)))
+        hf_lay.addWidget(self.hf_enabled_cb)
+
+        space_row = QHBoxLayout()
+        space_row.addWidget(QLabel("Space ID:"))
+        self.hf_space_edit = QLineEdit()
+        self.hf_space_edit.setPlaceholderText(DEFAULT_HF_SPACE_ID)
+        self.hf_space_edit.setText(
+            str(self.config.get("ai_translation", "hf_space_id", DEFAULT_HF_SPACE_ID) or DEFAULT_HF_SPACE_ID)
+        )
+        space_row.addWidget(self.hf_space_edit, 1)
+        hf_lay.addLayout(space_row)
+
+        hf_tok_row = QHBoxLayout()
+        hf_tok_row.addWidget(QLabel("HF Token (Optional):"))
+        self.hf_token_edit = QLineEdit()
+        self.hf_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.hf_token_edit.setPlaceholderText("hf_... (only needed for private spaces)")
+        self.hf_token_edit.setText(str(self.config.get("credentials", "hf_token", "") or ""))
+        hf_tok_row.addWidget(self.hf_token_edit, 1)
+
+        self.btn_show_hf = QPushButton("👁")
+        self.btn_show_hf.setCheckable(True)
+        self.btn_show_hf.setFixedWidth(32)
+        self.btn_show_hf.toggled.connect(
+            lambda ch: self.hf_token_edit.setEchoMode(
+                QLineEdit.EchoMode.Normal if ch else QLineEdit.EchoMode.Password
+            )
+        )
+        hf_tok_row.addWidget(self.btn_show_hf)
+        hf_lay.addLayout(hf_tok_row)
+        layout.addWidget(hf_grp)
+
+        # Fallback Cloud Engine: Groq
+        cred_grp = QGroupBox("Fallback Cloud Engine: Groq API (Priority #2)")
         cred_lay = QHBoxLayout(cred_grp)
         cred_lay.addWidget(QLabel("Groq API Key:"))
         self.groq_key_edit = QLineEdit()
@@ -580,7 +619,12 @@ class AITranslationConfigDialog(QDialog):
         dlg.exec()
 
     def _save(self):
+        self.config.set("ai_translation", "hf_space_enabled", self.hf_enabled_cb.isChecked())
+        self.config.set("ai_translation", "hf_space_id", self.hf_space_edit.text().strip() or DEFAULT_HF_SPACE_ID)
+        self.config.set("credentials", "hf_token", self.hf_token_edit.text().strip())
         self.config.set("credentials", "groq_api_key", self.groq_key_edit.text().strip())
+        reset_hf_client()
+
         self.config.set("ai_translation", "source_lang", self.src_combo.currentData())
         self.config.set("ai_translation", "target_lang", self.tgt_combo.currentData())
         self.config.set("ai_translation", "inpaint_enabled", self.inpaint_cb.isChecked())

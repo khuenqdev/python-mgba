@@ -4,14 +4,32 @@ import re
 import urllib.request
 import urllib.parse
 
-from .engines import LANG_NAMES, get_llama_instance
+from .engines import (
+    LANG_NAMES,
+    DEFAULT_HF_SPACE_ID,
+    get_llama_instance,
+    call_hf_respond,
+    extract_hf_text,
+)
 
 
 class LocalQwenTranslator:
     @classmethod
-    def translate_block(cls, model_path: str, text: str, category: str, speaker: str,
-                        src_lang: str, tgt_lang: str, criteria: str, api_key: str,
-                        glossary_text: str = "") -> tuple:
+    def translate_block(
+        cls,
+        model_path: str,
+        text: str,
+        category: str,
+        speaker: str,
+        src_lang: str,
+        tgt_lang: str,
+        criteria: str,
+        api_key: str,
+        glossary_text: str = "",
+        hf_enabled: bool = True,
+        hf_space_id: str = DEFAULT_HF_SPACE_ID,
+        hf_token: str = "",
+    ) -> tuple:
         """Translates a categorized block ('dialogue', 'menu', or 'label') and optional speaker."""
         src_name = LANG_NAMES.get(src_lang, src_lang)
         tgt_name = LANG_NAMES.get(tgt_lang, tgt_lang)
@@ -41,6 +59,8 @@ class LocalQwenTranslator:
         )
 
         raw_out = ""
+
+        # 1. Local GGUF LLM (if installed)
         llm = get_llama_instance(model_path)
         if llm is not None:
             try:
@@ -56,6 +76,19 @@ class LocalQwenTranslator:
             except Exception as e:
                 print(f"[Local LLM Error] {e}")
 
+        # 2. Cloud Priority 1: Hugging Face Space
+        if not raw_out and hf_enabled and hf_space_id:
+            hf_res = call_hf_respond(
+                text=f"{sys_prompt}\n\n{user_prompt}",
+                image_path=None,
+                space_id=hf_space_id,
+                hf_token=hf_token,
+                reasoning="off",
+                temperature=0.1,
+            )
+            raw_out = extract_hf_text(hf_res)
+
+        # 3. Cloud Priority 2 (Fallback): Groq API
         if not raw_out and api_key:
             for model_id in ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]:
                 try:
@@ -86,6 +119,7 @@ class LocalQwenTranslator:
                 except Exception:
                     continue
 
+        # 4. Last-resort Google Translate fallback
         if not raw_out:
             raw_out = _google_translate_fallback(text, src_lang, tgt_lang)
             sp_tr = _google_translate_fallback(speaker, src_lang, tgt_lang) if speaker else ""

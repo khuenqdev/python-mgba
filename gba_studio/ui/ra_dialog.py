@@ -1,13 +1,14 @@
 # ra_dialog.py
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QLineEdit, QCheckBox, QGroupBox, QDialogButtonBox, QMessageBox
+    QLineEdit, QCheckBox, QGroupBox, QDialogButtonBox
 )
-from PyQt6.QtCore import Qt
+
+from ..tools.ai.engines import DEFAULT_HF_SPACE_ID, reset_hf_client
 
 
 class RetroAchievementsSettingsDialog(QDialog):
-    """Configures RetroAchievements & API credentials stored directly in mgba_config.json."""
+    """Configures RetroAchievements & AI API credentials stored directly in mgba_config.json."""
 
     def __init__(self, main_window, parent=None):
         super().__init__(parent or main_window)
@@ -16,7 +17,7 @@ class RetroAchievementsSettingsDialog(QDialog):
         self.ra = main_window.ra_manager
 
         self.setWindowTitle("RetroAchievements & Credentials Settings")
-        self.resize(480, 470)
+        self.resize(500, 560)
         self._init_ui()
         self.ra.login_tested.connect(self._on_login_tested)
 
@@ -98,14 +99,42 @@ class RetroAchievementsSettingsDialog(QDialog):
 
         root.addWidget(opt_grp)
 
-        # 3. Groq AI Translation Credential
-        ai_grp = QGroupBox("AI Translation Credential")
-        ai_lay = QHBoxLayout(ai_grp)
-        ai_lay.addWidget(QLabel("Groq API Key:"))
+        # 3. AI Translation Credentials (HF Space Priority #1, Groq Fallback)
+        ai_grp = QGroupBox("AI Translation Credentials (HF Space Primary, Groq Fallback)")
+        ai_lay = QVBoxLayout(ai_grp)
+
+        hf_row = QHBoxLayout()
+        hf_row.addWidget(QLabel("HF Space ID:"))
+        self.hf_space_edit = QLineEdit(
+            str(self.config.get("ai_translation", "hf_space_id", DEFAULT_HF_SPACE_ID) or DEFAULT_HF_SPACE_ID)
+        )
+        hf_row.addWidget(self.hf_space_edit, 1)
+        ai_lay.addLayout(hf_row)
+
+        hf_tok_row = QHBoxLayout()
+        hf_tok_row.addWidget(QLabel("HF Token (Optional):"))
+        self.hf_tok_edit = QLineEdit(str(self.config.get("credentials", "hf_token", "") or ""))
+        self.hf_tok_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.hf_tok_edit.setPlaceholderText("hf_... (optional)")
+        hf_tok_row.addWidget(self.hf_tok_edit, 1)
+
+        btn_eye_hf = QPushButton("👁")
+        btn_eye_hf.setCheckable(True)
+        btn_eye_hf.setFixedWidth(32)
+        btn_eye_hf.toggled.connect(
+            lambda ch: self.hf_tok_edit.setEchoMode(
+                QLineEdit.EchoMode.Normal if ch else QLineEdit.EchoMode.Password
+            )
+        )
+        hf_tok_row.addWidget(btn_eye_hf)
+        ai_lay.addLayout(hf_tok_row)
+
+        groq_row = QHBoxLayout()
+        groq_row.addWidget(QLabel("Groq API Key:"))
         self.groq_edit = QLineEdit(str(self.config.get("credentials", "groq_api_key", "") or ""))
         self.groq_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.groq_edit.setPlaceholderText("gsk_...")
-        ai_lay.addWidget(self.groq_edit, 1)
+        groq_row.addWidget(self.groq_edit, 1)
 
         btn_eye = QPushButton("👁")
         btn_eye.setCheckable(True)
@@ -115,7 +144,9 @@ class RetroAchievementsSettingsDialog(QDialog):
                 QLineEdit.EchoMode.Normal if ch else QLineEdit.EchoMode.Password
             )
         )
-        ai_lay.addWidget(btn_eye)
+        groq_row.addWidget(btn_eye)
+        ai_lay.addLayout(groq_row)
+
         root.addWidget(ai_grp)
 
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
@@ -149,7 +180,10 @@ class RetroAchievementsSettingsDialog(QDialog):
         self.config.set("credentials", "ra_password", self.ra_pass_edit.text())
         self.config.set("credentials", "ra_token", self.ra_token_edit.text().strip())
         self.config.set("credentials", "ra_web_api_key", self.ra_web_edit.text().strip())
+        self.config.set("credentials", "hf_token", self.hf_tok_edit.text().strip())
         self.config.set("credentials", "groq_api_key", self.groq_edit.text().strip())
+        self.config.set("ai_translation", "hf_space_id", self.hf_space_edit.text().strip() or DEFAULT_HF_SPACE_ID)
+        reset_hf_client()
 
         self.config.set("retroachievements", "enabled", self.cb_enabled.isChecked())
         self.config.set("retroachievements", "hardcore", self.cb_hardcore.isChecked())

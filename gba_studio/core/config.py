@@ -20,6 +20,7 @@ PER_GAME_SECTIONS = ("audio", "emulation", "sensors", "video", "shaders", "ai_tr
 
 DEFAULT_CONFIG = {
     "credentials": {
+        "hf_token": "",
         "groq_api_key": "",
         "ra_username": "",
         "ra_password": "",
@@ -79,6 +80,8 @@ DEFAULT_CONFIG = {
     "ai_translation": {
         "source_lang": "ja",
         "target_lang": "vi",
+        "hf_space_enabled": True,
+        "hf_space_id": "brianknight144/Qwen3.8-27B-Uncensored-Demo",
         "overlay_enabled": True,
         "inpaint_enabled": True,
         "inpaint_auto_clear": True,
@@ -185,6 +188,11 @@ class EmulatorConfig:
             env_key = os.environ.get("GROQ_API_KEY", "").strip()
             if env_key:
                 self.global_settings.setdefault("credentials", {})["groq_api_key"] = env_key
+
+        if not str(self.global_settings.get("credentials", {}).get("hf_token", "")).strip():
+            env_hf = os.environ.get("HF_TOKEN", "").strip()
+            if env_hf:
+                self.global_settings.setdefault("credentials", {})["hf_token"] = env_hf
 
         self._rebuild_effective_settings()
         self.save()
